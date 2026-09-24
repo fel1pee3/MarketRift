@@ -76,7 +76,7 @@ Na pasta `apps/intelligence`, instale o pacote Python:
 .venv/Scripts/python.exe -m pip install -e ".[dev]"
 ```
 
-De volta à raiz, aplique as cinco migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
+De volta à raiz, aplique as seis migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
 
 ```powershell
 npm run db:setup
@@ -142,9 +142,25 @@ npm run eval:quality -- --dataset evalsets/review-quality.synthetic.v1.json --ma
 
 O padrão é o provedor controlado e custa **USD 0** em API. Para rodar em textos reais, primeiro obtenha permissão de uso/envio ao provedor e rótulos humanos. Depois informe `--provider openai --model`, `--allow-paid`, `--max-examples`, `--budget-usd` e taxas de entrada/saída verificadas por você. O comando limita a saída, desliga retries e compara uma reserva estimada de tokens ao orçamento antes de cada chamada; a reserva não substitui a fatura do provedor. Veja [o guia de rotulagem e execução](evalsets/README.md) e [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md). Resultados perfeitos no conjunto sintético demonstram que o avaliador funciona, não que a IA seja confiável em dados reais.
 
+### Primeira fonte real: Issues públicas do GitHub
+
+Cadastre um produto ou concorrente e, na seção **Issues públicos do GitHub**, informe `owner/repo` ou `https://github.com/owner/repo`. Apenas repositórios públicos na API oficial são aceitos. `owner` e `admin` cadastram fontes; `owner`, `admin` e `analyst` podem pedir coleta manual. O formulário sugere **até 20 Issues em duas páginas**; os limites absolutos da API são 1–50 itens e 1–3 páginas por execução. O worker deve estar ligado. A interface atualiza estado, novas/atualizadas, páginas, Pull Requests ignorados, última coleta e links para as Issues. Em erro de rate limit, aguarde o horário exibido antes de tentar novamente.
+
+O job `sync-github-issues.v1` contém somente IDs, versão e chave de idempotência; não transporta conteúdo nem credencial. O worker consulta `api.github.com`, descarta Pull Requests, conserva título, corpo, URL, repositório, datas e estado, e atualiza Issues alteradas sem duplicar por tenant/fonte/ID externo. A primeira coleta limitada pega itens recentes; não constitui cópia histórica completa. As execuções seguintes consultam atualizações a partir do cursor da última execução bem-sucedida com um minuto de sobreposição. O limite público não autenticado é compartilhado por IP; não há token GitHub configurado nesta etapa. A coleta não chama OpenAI e seu custo de API de IA é **USD 0**.
+
+**Uma Issue pública não é avaliação de cliente.** Ela pode ser bug, pedido de funcionalidade ou discussão de mantenedores. Não a trate como reclamação comprovada nem como amostra representativa do mercado. O extrator atual foi projetado para reviews; Issues ficam disponíveis para revisão humana, sem classificação, insight automático ou estatística de avaliações. Para testar localmente, use um repositório público apropriado e faça uma coleta curta; confira que o link abre a Issue, que uma segunda coleta não duplica documentos e que uma edição na origem atualiza o mesmo documento. Para medir qualidade depois, selecione manualmente uma amostra diversa com URLs e datas, rotule categorias e trechos **antes de ver previsões**, crie um conjunto versionado específico para Issues e use um extrator/avaliador próprio. O avaliador de reviews em `evalsets/` não mede a qualidade em Issues nem em reviews reais por si só. Veja [ADR 0006](docs/adr/0006-github-issues-publicas.md).
+
+Em banco existente, preserve o volume e aplique a migração aditiva:
+
+```powershell
+npm run db:migrate:github
+```
+
+Em banco vazio, `npm run db:setup` aplica as seis migrações. Depois, inicie `npm run dev:api`, `npm run dev:web` e `npm run dev:worker` em terminais separados. O FastAPI de health não participa da coleta.
+
 ### Migrações
 
-São **cinco migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação. `db:setup` aplica 001 a 005 em banco novo e cria os logins limitados. `db:migrate:account` e `db:migrate:analysis` aplicam somente as migrações respectivas sobre um banco existente.
+São **seis migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação; `006_github_issues.sql` acrescenta fonte, documentos e estado de coleta de Issues. `db:setup` aplica 001 a 006 em banco novo e cria os logins limitados. `db:migrate:account`, `db:migrate:analysis` e `db:migrate:github` aplicam somente a migração respectiva sobre um banco existente.
 
 ## Ordem de construção
 
@@ -156,6 +172,6 @@ O código, a documentação e as fixtures sintéticas deste repositório são di
 
 ## Estado atual
 
-Em 2026-09-24, `001` a `005` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, ausência de reclamação, falha do provedor e mudança de versão. O E2E de serviços passou no caminho API → BullMQ → Python → PostgreSQL → API com provedor controlado de teste, além de verificar que a página web é servida. A avaliação de qualidade com provedor controlado pontuou os seis casos sintéticos sem chamada paga; veja [ADR 0004](docs/adr/0004-analise-de-avaliacoes.md) e [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md) para decisões e limites. Os resultados finais de lint, build e testes desta entrega são registrados na resposta de encerramento.
+Em 2026-09-24, `001` a `006` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, ausência de reclamação, falha do provedor, mudança de versão, repetição e atualização de Issues. O E2E de serviços passou anteriormente no caminho API → BullMQ → Python → PostgreSQL → API com provedor controlado de teste, além de verificar que a página web é servida. A avaliação de qualidade com provedor controlado pontuou os seis casos sintéticos sem chamada paga; veja [ADR 0004](docs/adr/0004-analise-de-avaliacoes.md), [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md) e [ADR 0006](docs/adr/0006-github-issues-publicas.md) para decisões e limites. Os resultados atuais de lint, build e testes são registrados na resposta de encerramento.
 
-Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é conectar uma primeira fonte real de avaliações com proveniência e coleta permitida; depois, rotular uma amostra legítima e medir erros por categoria e evidência antes de usar os insights em tendências.
+Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é rotular e medir a qualidade em uma amostra legítima de Issues públicas com contrato próprio; depois, conectar uma fonte permitida de **avaliações de clientes** e medir também a qualidade nesses dados antes de usar insights em tendências.

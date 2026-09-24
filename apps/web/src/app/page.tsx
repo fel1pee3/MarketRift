@@ -7,10 +7,11 @@ type Tenant = { tenant_id: string; name: string; role: Role };
 type Session = { user_id: string; email: string; display_name: string; tenant_id: string; role: Role; tenants: Tenant[]; csrf_token: string };
 type Member = { user_id: string; email: string; display_name: string; role: Role };
 type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
-type Source = { id: string; product_id: string; source_type: string; url: string };
+type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null };
+type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
-type Document = { id: string; source_id: string; external_key: string; source_url: string; body: string; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
+type Document = { id: string; source_id: string; document_type: 'review' | 'github_issue'; external_key: string; source_url: string; body: string; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const categoryNames: Record<string, string> = {
   support: 'Suporte', price: 'Preço', billing: 'Cobrança', performance: 'Desempenho',
@@ -54,18 +55,20 @@ export default function Home() {
   const [busy, setBusy] = useState(false);
   const [products, setProducts] = useState<Product[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
+  const [sourceRuns, setSourceRuns] = useState<SourceRun[]>([]);
   const [imports, setImports] = useState<Import[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
   const [members, setMembers] = useState<Member[]>([]);
 
   const refresh = useCallback(async (current: Session) => {
-    const [nextProducts, nextSources, nextImports, nextDocuments, nextMembers] = await Promise.all([
+    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers] = await Promise.all([
       api<Product[]>('products', current), api<Source[]>('sources', current),
+      api<SourceRun[]>('source-runs', current),
       api<Import[]>('imports', current), api<Document[]>('documents', current),
       api<Member[]>('members', current),
     ]);
     if (sessionKey.current !== current.csrf_token) return;
-    setProducts(nextProducts); setSources(nextSources); setImports(nextImports);
+    setProducts(nextProducts); setSources(nextSources); setSourceRuns(nextRuns); setImports(nextImports);
     setDocuments(nextDocuments); setMembers(nextMembers);
   }, []);
 
@@ -100,7 +103,7 @@ export default function Home() {
     finally { setBusy(false); }
   }
   function clearTenantData(): void {
-    setProducts([]); setSources([]); setImports([]); setDocuments([]); setMembers([]); setIssuedInvite('');
+    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setDocuments([]); setMembers([]); setIssuedInvite('');
   }
   async function switchTo(current: Session, tenantId: string): Promise<void> {
     const next = await api<Session>('auth/switch-tenant', current, {
@@ -176,9 +179,39 @@ export default function Home() {
           })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
             <label>URL da fonte<input name="url" type="url" required /></label>
             <button disabled={busy || !canManage || !products.length}>Adicionar fonte</button></form>
-          <ul>{sources.map(source => <li key={source.id}>{isExampleAddress(source.url) ?
+          <ul>{sources.filter(source => source.source_type === 'manual_review').map(source => <li key={source.id}>{isExampleAddress(source.url) ?
             <span>{source.url} <small>(endereço fictício, sem página)</small></span> :
             <a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>}</li>)}</ul>
+        </section>
+        <section className="card wide"><h2>Issues públicos do GitHub</h2>
+          <p>Discussões públicas que podem incluir bugs e pedidos de funcionalidades. Issues não são avaliações de clientes nem representam todo o mercado. A coleta não envia textos para a OpenAI.</p>
+          <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('sources/github-issues', session, { method: 'POST', body: JSON.stringify({
+              product_id: data.get('product_id'), repository: data.get('repository'),
+            }) });
+            form.reset(); await refresh(session);
+          })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>Repositório público (owner/repo ou URL)<input name="repository" placeholder="owner/repo" required /></label>
+            <button disabled={busy || !canManage || !products.length}>Adicionar fonte GitHub Issues</button></form>
+          <ul>{sources.filter(source => source.source_type === 'github_issues').map(source => {
+            const latest = sourceRuns.find(item => item.source_id === source.id);
+            return <li key={source.id}><a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>
+              <p>Última coleta: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'}</p>
+              {latest && <p>Estado: {latest.status}; Issues consultadas: {latest.documents_seen}; novas: {latest.documents_new}; atualizadas: {latest.documents_updated}; páginas: {latest.pages_fetched}; Pull Requests ignorados: {latest.pull_requests_skipped}.
+                {latest.error_code && <> Falha: {latest.error_code}.</>}
+                {latest.retry_after_at && <> Tente após {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+              {session.role !== 'viewer' && <form onSubmit={event => void run(async () => {
+                const data = formValues(event);
+                await api(`sources/${source.id}/sync`, session, { method: 'POST', body: JSON.stringify({
+                  max_pages: Number(data.get('max_pages')), max_items: Number(data.get('max_items')),
+                }) });
+                await refresh(session);
+              })}><label>Páginas (1–3)<input name="max_pages" type="number" min="1" max="3" defaultValue="2" required /></label>
+                <label>Issues (1–50)<input name="max_items" type="number" min="1" max="50" defaultValue="20" required /></label>
+                <button className="small" disabled={busy || latest?.status === 'running'}>Coletar Issues</button></form>}
+            </li>;
+          })}</ul>
         </section>
         <section className="card"><h2>Importar CSV</h2><p>Até 100 linhas. Colunas: external_key, source_url, published_at, body, synthetic.</p>
           <p>No campo Arquivo CSV, escolha <code>fixtures/reviews.example.csv</code> na pasta do projeto.</p>
@@ -186,9 +219,9 @@ export default function Home() {
             const data = formValues(event); const form = event.currentTarget;
             await api('imports/reviews', session, { method: 'POST', body: data });
             form.reset(); await refresh(session);
-          })}><label>Fonte<select name="source_id" required>{sources.map(source => <option key={source.id} value={source.id}>{source.url}</option>)}</select></label>
+          })}><label>Fonte<select name="source_id" required>{sources.filter(source => source.source_type === 'manual_review').map(source => <option key={source.id} value={source.id}>{source.url}</option>)}</select></label>
             <label>Arquivo CSV<input type="file" name="file" accept=".csv,text/csv" required /></label>
-            <button disabled={busy || session.role === 'viewer' || !sources.length}>Enviar avaliações</button></form>
+            <button disabled={busy || session.role === 'viewer' || !sources.some(source => source.source_type === 'manual_review')}>Enviar avaliações</button></form>
         </section>
         <section className="card"><h2>Importações</h2><p>O estado é atualizado automaticamente.</p>
           {imports.length ? <ul>{imports.map(item => <li key={item.id}><strong>{item.status}</strong> · {item.processed_rows}/{item.total_rows} linhas
@@ -197,14 +230,14 @@ export default function Home() {
               await api(`imports/${item.id}/requeue`, session, { method: 'POST' }); await refresh(session);
             })}>Reenfileirar</button>}</li>)}</ul> : <p className="empty">Nenhuma importação ainda.</p>}
         </section>
-        <section className="card wide"><h2>Documentos e problemas</h2><p>Texto original, data, origem e trechos que sustentam cada problema. Dados sintéticos não contam como avaliações reais.</p>
+        <section className="card wide"><h2>Documentos</h2><p>Avaliações mostram problemas com evidência; Issues públicas do GitHub mostram título, corpo, estado, data e origem para revisão humana. Dados sintéticos não contam como avaliações reais.</p>
           {documents.length ? <div className="documents">{documents.map(document => <article key={document.id}>
-            <div className="meta">{document.synthetic && <span className="badge">SINTÉTICO</span>}
+            <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.synthetic && <span className="badge">SINTÉTICO</span>}
               {document.published_at && <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time>}<code>{document.external_key}</code></div>
-            <p>{document.body}</p>{isExampleAddress(document.source_url) ?
+            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <p>{document.body}</p>}{isExampleAddress(document.source_url) ?
               <small>URL fictícia, sem página: {document.source_url}</small> :
               <a href={document.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a>}
-            <div className="analysis">
+            {document.document_type === 'review' && <div className="analysis">
               <h3>Problemas extraídos</h3>
               {document.analysis_model === 'controlled-test-fixture-v1' && <p className="test-label">Resultado controlado de teste; não é uma análise feita por IA.</p>}
               {document.analysis_status === 'completed' ? document.issues.length ?
@@ -219,7 +252,7 @@ export default function Home() {
                 <button className="small" disabled={busy} onClick={() => void run(async () => {
                   await api(`documents/${document.id}/analyze`, session, { method: 'POST' }); await refresh(session);
                 })}>Reenfileirar análise</button>}
-            </div></article>)}</div> :
+            </div>}</article>)}</div> :
             <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}
         </section>
         <section className="card wide"><h2>Membros e convites</h2>

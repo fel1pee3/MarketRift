@@ -2,6 +2,7 @@ import { Injectable, OnModuleDestroy } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import { IngestReviewJobV1 } from './job';
 import { AnalyzeDocumentJobV1 } from './analysis-job';
+import { SyncGitHubIssuesJobV1 } from './github-job';
 
 @Injectable()
 export class Jobs implements OnModuleDestroy {
@@ -19,6 +20,9 @@ export class Jobs implements OnModuleDestroy {
     connection: this.connection,
   });
   private readonly analysisQueue = new Queue<AnalyzeDocumentJobV1>('review-analysis', {
+    connection: this.connection,
+  });
+  private readonly githubQueue = new Queue<SyncGitHubIssuesJobV1>('github-issues', {
     connection: this.connection,
   });
 
@@ -48,5 +52,14 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close()]); }
+  async publishGitHub(job: SyncGitHubIssuesJobV1): Promise<void> {
+    await this.githubQueue.add('sync-github-issues.v1', job, {
+      jobId: job.idempotency_key,
+      attempts: 1,
+      removeOnComplete: true,
+      removeOnFail: true,
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close()]); }
 }
