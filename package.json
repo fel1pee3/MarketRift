@@ -1,0 +1,19 @@
+{
+  "name": "marketrift",
+  "private": true,
+  "workspaces": ["apps/api", "apps/web"],
+  "scripts": {
+    "dev:api": "npm run dev -w @marketrift/api",
+    "dev:web": "npm run dev -w @marketrift/web",
+    "dev:worker": "node --env-file=.env scripts/run-python.mjs worker",
+    "dev:intelligence-http": "node --env-file=.env scripts/run-python.mjs http",
+    "build": "npm run build -w @marketrift/api && npm run build -w @marketrift/web",
+    "lint": "npm run lint -w @marketrift/api && npm run lint -w @marketrift/web",
+    "test": "npm run test -w @marketrift/api",
+    "test:db": "node --env-file=.env scripts/test-db.mjs",
+    "pretest:e2e": "npm run build",
+    "test:e2e": "node --env-file=.env scripts/e2e.mjs",
+    "db:setup": "node --env-file=.env scripts/setup-db.mjs"
+  },
+  "dependencies": { "pg": "^8.16.3" }
+}

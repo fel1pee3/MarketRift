@@ -1,0 +1,13 @@
+.env
+node_modules/
+.next/
+dist/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+.tmp/
+*.tsbuildinfo
+*.egg-info/
+pytest-cache-files-*/
