@@ -94,3 +94,9 @@ def test_two_tenants_rls_and_repeated_jobs(request):
     with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as runtime:
         runtime.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_b,))
         assert runtime.execute("SELECT count(*) FROM marketrift.documents").fetchone()[0] == 0
+
+    # Browser credentials and invitation hashes are outside the worker/runtime role.
+    for private_table in ("browser_sessions", "member_invitations"):
+        with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as runtime:
+            with pytest.raises(psycopg.errors.InsufficientPrivilege):
+                runtime.execute(f"SELECT count(*) FROM marketrift.{private_table}")

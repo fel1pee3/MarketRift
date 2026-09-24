@@ -10,3 +10,5 @@
 - O script `db:setup` foi desenhado para **banco vazio**. Depois de uma instalação com dados, futuras mudanças devem vir por novas migrações e um controle de versão de migrações.
 
 O destino do produto permanece definido em `docs/00-escopo-completo.md` e `docs/08-criterios-produto-completo.md`.
+
+As decisões de sessão e membros desta primeira fatia foram substituídas pela [ADR 0003](0003-sessoes-e-membros.md). Este registro permanece como histórico da implementação inicial.

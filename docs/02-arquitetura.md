@@ -56,7 +56,7 @@ O job_id pode ser derivado da chave de idempotencia. O banco ainda precisa de re
 | GET /v1/documents/:id | Texto, origem e insight |
 | POST /v1/questions | Fase RAG, com evidencias |
 
-O tenant nao e escolhido por um header arbitrario. A API resolve o tenant ativo por sessao/JWT e membership; cada recurso consultado pertence a ele.
+O tenant nao e escolhido por um header arbitrario. A API resolve o tenant ativo pela sessao revogavel e membership; cada recurso consultado pertence a ele.
 
 ## Observabilidade minima
 

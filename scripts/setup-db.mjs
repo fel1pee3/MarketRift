@@ -7,7 +7,7 @@ for (const name of required) if (!process.env[name]) throw new Error(`Missing ${
 const client = new Client({ connectionString: process.env.DATABASE_ADMIN_URL });
 await client.connect();
 try {
-  for (const name of ['001_initial.sql', '002_full_product.sql', '003_first_slice.sql']) {
+  for (const name of ['001_initial.sql', '002_full_product.sql', '003_first_slice.sql', '004_account_security.sql']) {
     const sql = readFileSync(new URL(`../db/migrations/${name}`, import.meta.url), 'utf8');
     await client.query(sql);
     console.log(`Applied ${name}`);

@@ -12,6 +12,8 @@ Gerar Next.js, NestJS e serviço Python. Implementar autenticação, tenant, mem
 
 ## Marco 2 — extração inteligente
 
+As sessões por cookie, os convites manuais, os papéis e a troca de tenant foram antecipados para a continuação do Marco 1 em 2026-09-23. O Marco 2 continua sendo a próxima entrega de código.
+
 Saída estruturada com Pydantic, versão de modelo/prompt, evidência literal, tratamento de falha e avaliação rotulada. Agregados SQL e dashboard de sentimentos/temas. **Entrega:** métricas de qualidade publicadas e cada classificação auditável.
 
 ## Marco 3 — conectores contínuos
@@ -28,7 +30,7 @@ Criar recomendações estratégicas com status de revisão, alegações a verifi
 
 ## Marco 6 — operação de produto
 
-Assinatura e quotas, convites, auditoria, observabilidade, custos, proteção de dados, backups, CI/CD, deploy e demo pública com dados sintéticos. Exercitar incidentes e restauração. **Entrega:** checklist de produto completo aprovado.
+Assinatura e quotas, entrega automática de convites, auditoria, observabilidade, custos, proteção de dados, backups, CI/CD, deploy e demo pública com dados sintéticos. Exercitar incidentes e restauração. **Entrega:** checklist de produto completo aprovado.
 
 ## Primeira tarefa de implementação
 

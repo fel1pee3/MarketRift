@@ -14,7 +14,8 @@
     "test:db": "node --env-file=.env scripts/test-db.mjs",
     "pretest:e2e": "npm run build",
     "test:e2e": "node --env-file=.env scripts/e2e.mjs",
-    "db:setup": "node --env-file=.env scripts/setup-db.mjs"
+    "db:setup": "node --env-file=.env scripts/setup-db.mjs",
+    "db:migrate:account": "node --env-file=.env scripts/migrate-account.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }

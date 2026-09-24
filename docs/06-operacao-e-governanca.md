@@ -10,7 +10,7 @@ Job pequeno com IDs e versao. Retry exponencial para falha transitoria com limit
 
 ## Seguranca
 
-JWT e membership validados pela API; workers conferem tenant e source_id no banco. RLS, chaves compostas, roles sem BYPASSRLS, segredos fora do repositorio, conexoes internas autenticadas. Testes entre tenants em leitura, escrita, joins, chat, jobs, alertas e exportacao. Credenciais de fontes, quando houver, ficam em cofre de segredos com referencia no banco.
+Sessao revogavel em cookie HttpOnly, protecao CSRF e membership validadas pela API; workers conferem tenant e source_id no banco. RLS, chaves compostas, roles sem BYPASSRLS, segredos fora do repositorio, conexoes internas autenticadas. Testes entre tenants em leitura, escrita, joins, chat, jobs, alertas e exportacao. Credenciais de fontes, quando houver, ficam em cofre de segredos com referencia no banco.
 
 ## Privacidade e proveniencia
 

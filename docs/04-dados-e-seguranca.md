@@ -1,6 +1,6 @@
 # Banco, isolamento e por que existe o schema SQL
 
-Um schema e o contrato de persistencia: define o que pode ser gravado, quais dados se relacionam e o que o banco recusa. `db/migrations/001_initial.sql` cria as entidades fundamentais; `002_full_product.sql` amplia o modelo para coleta continua, sinais, recomendacoes, alertas, chat, uso e auditoria; `003_first_slice.sql` acrescenta login por senha, fonte manual e marcacao de dados sinteticos. Migracoes sao versionadas com o codigo e aplicadas em ordem em cada ambiente.
+Um schema e o contrato de persistencia: define o que pode ser gravado, quais dados se relacionam e o que o banco recusa. `db/migrations/001_initial.sql` cria as entidades fundamentais; `002_full_product.sql` amplia o modelo para coleta continua, sinais, recomendacoes, alertas, chat, uso e auditoria; `003_first_slice.sql` acrescenta login por senha, fonte manual e marcacao de dados sinteticos; `004_account_security.sql` acrescenta sessoes revogaveis e convites. Migracoes sao versionadas com o codigo e aplicadas em ordem em cada ambiente.
 
 ## Exemplos concretos
 
@@ -17,7 +17,7 @@ Um schema e o contrato de persistencia: define o que pode ser gravado, quais dad
 
 ## Isolamento
 
-A coluna tenant_id acompanha produtos, fontes, documentos, insights, vetores e precos. Chaves estrangeiras (tenant_id, id) impedem ligar uma fonte de A a um produto de B. RLS restringe linhas visiveis e gravaveis ao contexto da transacao. A API valida JWT e membership antes de definir app.tenant_id; o worker revalida fonte e tenant. O login de runtime nao pode ser superuser, BYPASSRLS nem dono das tabelas.
+A coluna tenant_id acompanha produtos, fontes, documentos, insights, vetores e precos. Chaves estrangeiras (tenant_id, id) impedem ligar uma fonte de A a um produto de B. RLS restringe linhas visiveis e gravaveis ao contexto da transacao. A API resolve a sessao revogavel, confirma membership e papel antes de definir app.tenant_id; o worker revalida fonte e tenant. O login de runtime nao pode ser superuser, BYPASSRLS nem dono das tabelas.
 
 O parametro customizado app.tenant_id e um contexto de aplicacao, nao autenticacao criptografica. Nao exponha SQL arbitrario ao cliente; use consultas parametrizadas. Em conexoes reaproveitadas, defina o contexto em cada transacao e encerre-a; nao use SET de sessao persistente. Teste rotas, jobs, joins e buscas com dois tenants.
 
@@ -27,4 +27,4 @@ A migracao escolhe vector(1536) como placeholder de um modelo a definir. Se o mo
 
 ## Ajustes antes de producao
 
-As tres migracoes foram aplicadas em PostgreSQL 16 com pgvector no ambiente local em 2026-09-23; testes com dois tenants exerceram RLS em leitura e escrita. A implementacao ainda tera de escolher modelo de embedding, politicas de retencao, armazenamento de capturas e provedor de assinatura. Depois de uma instalacao publica, mudancas devem entrar por novas migracoes. Revisar URLs externas, retencao de texto, licencas/termos da fonte e dados pessoais antes de ativar coleta automatica.
+As migracoes 001 a 004 foram aplicadas em PostgreSQL 16 com pgvector no ambiente local em 2026-09-23; testes com dois tenants exerceram RLS em leitura e escrita. A implementacao ainda tera de escolher modelo de embedding, politicas de retencao, armazenamento de capturas e provedor de assinatura. Depois de uma instalacao publica, mudancas devem entrar por novas migracoes. Revisar URLs externas, retencao de texto, licencas/termos da fonte e dados pessoais antes de ativar coleta automatica.
