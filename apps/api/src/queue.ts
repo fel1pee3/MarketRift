@@ -3,6 +3,7 @@ import { Queue } from 'bullmq';
 import { IngestReviewJobV1 } from './job';
 import { AnalyzeDocumentJobV1 } from './analysis-job';
 import { SyncGitHubIssuesJobV1 } from './github-job';
+import { SyncSteamReviewsJobV1 } from './steam-job';
 
 @Injectable()
 export class Jobs implements OnModuleDestroy {
@@ -23,6 +24,9 @@ export class Jobs implements OnModuleDestroy {
     connection: this.connection,
   });
   private readonly githubQueue = new Queue<SyncGitHubIssuesJobV1>('github-issues', {
+    connection: this.connection,
+  });
+  private readonly steamQueue = new Queue<SyncSteamReviewsJobV1>('steam-reviews', {
     connection: this.connection,
   });
 
@@ -61,5 +65,12 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close()]); }
+  async publishSteam(job: SyncSteamReviewsJobV1): Promise<void> {
+    await this.steamQueue.add('sync-steam-reviews.v1', job, {
+      jobId: job.idempotency_key, attempts: 1,
+      removeOnComplete: true, removeOnFail: true,
+    });
+  }
+
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.steamQueue.close()]); }
 }

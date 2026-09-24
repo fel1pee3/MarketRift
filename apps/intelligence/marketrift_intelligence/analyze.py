@@ -30,7 +30,7 @@ async def analyze(payload: object) -> dict[str, Any]:
                     "FROM marketrift.document_analyses a "
                     "JOIN marketrift.documents d ON d.tenant_id = a.tenant_id AND d.id = a.document_id "
                     "WHERE a.tenant_id = %s AND a.document_id = %s AND a.extractor_version = %s "
-                    "AND d.document_type = 'review' FOR UPDATE OF a",
+                    "AND d.document_type IN ('review', 'steam_review') FOR UPDATE OF a",
                     (job["tenant_id"], job["document_id"], job["extractor_version"]),
                 )
             ).fetchone()

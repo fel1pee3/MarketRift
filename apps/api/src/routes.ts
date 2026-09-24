@@ -12,19 +12,22 @@ import { activeExtractorVersion, makeAnalysisJob } from './analysis-job';
 import { Accounts, Principal, Role } from './accounts';
 import { canonicalGitHubRepository } from './github-source';
 import { makeGitHubJob } from './github-job';
+import { steamAppId, steamSourceUrl } from './steam-source';
+import { makeSteamJob } from './steam-job';
 
 const uuid = z.uuid();
 const httpUrl = z.url().refine(value => /^https?:\/\//i.test(value), 'HTTP(S) URL required');
 const productInput = z.object({ name: z.string().trim().min(1).max(120), kind: z.enum(['own', 'competitor']), website_url: httpUrl.optional() }).strict();
 const sourceInput = z.object({ product_id: uuid, url: httpUrl }).strict();
 const githubSourceInput = z.object({ product_id: uuid, repository: z.string().trim().min(3).max(250) }).strict();
+const steamSourceInput = z.object({ product_id: uuid, app: z.string().trim().min(1).max(300) }).strict();
 const githubSyncInput = z.object({ max_pages: z.number().int().min(1).max(3), max_items: z.number().int().min(1).max(50) }).strict();
 const csvRow = z.object({ external_key: z.string().trim().min(1).max(200), source_url: httpUrl, published_at: z.iso.datetime({ offset: true }), body: z.string().trim().min(1).max(10000), synthetic: z.enum(['true', 'false', '']).optional() }).strict();
 type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
-type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: 'manual_review' | 'github_issues'; url: string; last_checked_at?: Date | null };
-type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
+type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: 'manual_review' | 'github_issues' | 'steam_reviews'; url: string; last_checked_at?: Date | null };
+type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
 type ImportRow = QueryResultRow & { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: Date; finished_at: Date | null };
-type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; document_type: 'review' | 'github_issue'; external_key: string; source_url: string; body: string; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
+type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
 
 function input<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -103,16 +106,35 @@ export class ApiController {
     } catch (error) { return conflict(error); }
   }
 
+  @Post('sources/steam-reviews')
+  async createSteamSource(@Req() request: Request, @Body() body: unknown): Promise<SourceRow> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const data = input(steamSourceInput, body);
+    const url = steamSourceUrl(steamAppId(data.app));
+    try {
+      return await this.db.tenant(principal.tenantId, async client => {
+        const rows = await this.db.rows<SourceRow>(client,
+          "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url) "
+          + "SELECT $1, id, 'steam_reviews', $3 FROM marketrift.products WHERE id = $2 "
+          + "RETURNING id, product_id, source_type, url, last_checked_at",
+          [principal.tenantId, data.product_id, url]);
+        if (!rows[0]) throw new NotFoundException('Product not found');
+        return rows[0];
+      });
+    } catch (error) { return conflict(error); }
+  }
+
   @Post('sources/:id/sync')
   @HttpCode(200)
-  async syncGitHubSource(@Req() request: Request, @Param('id') idValue: string, @Body() body: unknown): Promise<{ id: string; status: string }> {
+  async syncSource(@Req() request: Request, @Param('id') idValue: string, @Body() body: unknown): Promise<{ id: string; status: string }> {
     const principal = await this.principal(request, ['owner', 'admin', 'analyst']);
     const sourceId = input(uuid, idValue);
     const limits = input(githubSyncInput, body);
-    const run = await this.db.tenant(principal.tenantId, async client => {
-      const source = await this.db.rows<{ id: string }>(client,
-        "SELECT id FROM marketrift.sources WHERE id = $1 AND source_type = 'github_issues' AND enabled = true FOR UPDATE", [sourceId]);
-      if (!source[0]) throw new NotFoundException('GitHub Issues source not found');
+    const created = await this.db.tenant(principal.tenantId, async client => {
+      const source = await this.db.rows<{ id: string; source_type: 'github_issues' | 'steam_reviews' }>(client,
+        "SELECT id, source_type FROM marketrift.sources WHERE id = $1 "
+        + "AND source_type IN ('github_issues', 'steam_reviews') AND enabled = true FOR UPDATE", [sourceId]);
+      if (!source[0]) throw new NotFoundException('Collectible source not found');
       await client.query("UPDATE marketrift.source_runs SET status = 'failed', error_code = 'worker_timeout', finished_at = now() "
         + "WHERE source_id = $1 AND max_pages IS NOT NULL AND status = 'running' "
         + "AND started_at < now() - interval '10 minutes'", [sourceId]);
@@ -120,28 +142,31 @@ export class ApiController {
         "SELECT id, status FROM marketrift.source_runs WHERE source_id = $1 AND max_pages IS NOT NULL AND status IN ('pending', 'running') ORDER BY started_at DESC LIMIT 1", [sourceId]);
       if (active[0]) {
         if (active[0].status === 'running') throw new ConflictException('Sync already running');
-        return active[0];
+        return { run: active[0], sourceType: source[0].source_type };
       }
       const blocked = await this.db.rows<{ retry_after_at: Date }>(client,
         'SELECT retry_after_at FROM marketrift.source_runs WHERE source_id = $1 AND retry_after_at > now() ORDER BY retry_after_at DESC LIMIT 1', [sourceId]);
-      if (blocked[0]) throw new ConflictException(`GitHub rate limit; retry after ${blocked[0].retry_after_at.toISOString()}`);
+      if (blocked[0]) throw new ConflictException(`Source rate limit; retry after ${blocked[0].retry_after_at.toISOString()}`);
       const previous = await this.db.rows<{ cursor_after: string | null }>(client,
         "SELECT cursor_after FROM marketrift.source_runs WHERE source_id = $1 AND status = 'succeeded' AND max_pages IS NOT NULL ORDER BY finished_at DESC LIMIT 1", [sourceId]);
       const rows = await this.db.rows<{ id: string; status: string }>(client,
         "INSERT INTO marketrift.source_runs (tenant_id, source_id, status, cursor_before, max_pages, max_items) VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id, status",
         [principal.tenantId, sourceId, previous[0]?.cursor_after ?? null, limits.max_pages, limits.max_items]);
-      return rows[0]!;
+      return { run: rows[0]!, sourceType: source[0].source_type };
     });
-    try { await this.jobs.publishGitHub(makeGitHubJob(principal.tenantId, sourceId, run.id)); }
+    try {
+      if (created.sourceType === 'steam_reviews') await this.jobs.publishSteam(makeSteamJob(principal.tenantId, sourceId, created.run.id));
+      else await this.jobs.publishGitHub(makeGitHubJob(principal.tenantId, sourceId, created.run.id));
+    }
     catch { /* Pending run can be retried with the same endpoint and job ID. */ }
-    return run;
+    return created.run;
   }
 
   @Get('source-runs')
   async sourceRuns(@Req() request: Request): Promise<SourceRunRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRunRow>(client,
-      "SELECT r.id, r.source_id, r.status, r.documents_seen, r.documents_new, r.documents_updated, r.pages_fetched, r.pull_requests_skipped, r.error_code, r.retry_after_at, r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id WHERE s.source_type = 'github_issues' ORDER BY r.started_at DESC LIMIT 50"));
+      "SELECT r.id, r.source_id, r.status, r.documents_seen, r.documents_new, r.documents_updated, r.documents_ignored, r.scan_complete, r.pages_fetched, r.pull_requests_skipped, r.error_code, r.retry_after_at, r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id WHERE s.source_type IN ('github_issues', 'steam_reviews') ORDER BY r.started_at DESC LIMIT 50"));
   }
 
   @Post('imports/reviews')
@@ -211,7 +236,8 @@ export class ApiController {
   async documents(@Req() request: Request): Promise<DocumentRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<DocumentRow>(client,
-      `SELECT d.id, d.source_id, s.product_id, d.document_type, d.external_key, d.source_url, d.body,
+      `SELECT d.id, d.source_id, s.product_id, p.name AS product_name, d.document_type, d.external_key,
+        d.source_url, d.source_url_kind, d.body, d.steam_app_id, d.review_language, d.review_voted_up,
         d.source_title, d.source_body, d.source_state, d.source_repository, d.source_created_at, d.source_updated_at,
         d.published_at, d.collected_at, d.synthetic, a.status AS analysis_status,
         a.model_id AS analysis_model, a.last_error AS analysis_error,
@@ -222,6 +248,7 @@ export class ApiController {
           AND a.status = 'completed'), '[]'::json) AS issues
         FROM marketrift.documents d
         JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id
+        JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
         LEFT JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id
           AND a.document_id = d.id AND a.extractor_version = $1
         ORDER BY d.collected_at DESC, d.id LIMIT 100`, [activeExtractorVersion]));
@@ -234,7 +261,7 @@ export class ApiController {
     const id = input(uuid, idValue);
     const status = await this.db.tenant(principal.tenantId, async client => {
       const document = await this.db.rows<{ id: string }>(client,
-        "SELECT id FROM marketrift.documents WHERE id = $1 AND document_type = 'review'", [id]);
+        "SELECT id FROM marketrift.documents WHERE id = $1 AND document_type IN ('review', 'steam_review')", [id]);
       if (!document[0]) throw new NotFoundException('Review not found');
       await client.query(
         'INSERT INTO marketrift.document_analyses (tenant_id, document_id, extractor_version) '

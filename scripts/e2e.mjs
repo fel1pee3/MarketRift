@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
+import { createServer } from 'node:http';
 import { join } from 'node:path';
 import pg from 'pg';
 
@@ -12,12 +13,34 @@ const apiBase = `http://localhost:${apiPort}/v1`;
 // cannot consume E2E jobs with a different analysis provider.
 const e2eRedisUrl = new URL(process.env.E2E_REDIS_URL ?? process.env.REDIS_URL);
 if (!process.env.E2E_REDIS_URL) e2eRedisUrl.pathname = '/15';
+let steamBody = 'O suporte demorou três dias e o preço aumentou sem aviso.';
+let steamUpdated = 1780000000;
+let steamVotedUp = false;
+const steamRequests = [];
+const steamMock = createServer((request, response) => {
+  const url = new URL(request.url, 'http://127.0.0.1');
+  steamRequests.push(url);
+  response.setHeader('Content-Type', 'application/json');
+  if (url.pathname !== '/appreviews/620') {
+    response.writeHead(404);
+    response.end(JSON.stringify({ success: 0 }));
+    return;
+  }
+  response.end(JSON.stringify({ success: 1, cursor: 'next-page', reviews: [{
+    recommendationid: '901001', review: steamBody, language: 'english',
+    timestamp_created: 1779000000, timestamp_updated: steamUpdated,
+    voted_up: steamVotedUp, author: { steamid: 'must-not-be-stored' },
+  }] }));
+});
+await new Promise(resolve => steamMock.listen(0, '127.0.0.1', resolve));
+const steamPort = steamMock.address().port;
 const childEnv = { ...process.env, API_PORT: String(apiPort), WEB_ORIGIN: webOrigin,
   REDIS_URL: e2eRedisUrl.toString() };
 const apiProcess = spawn(process.execPath, ['apps/api/dist/main.js'], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
-  env: { ...childEnv, ANALYSIS_PROVIDER: 'test', MARKETRIFT_TEST_MODE: '1' },
+  env: { ...childEnv, ANALYSIS_PROVIDER: 'test', MARKETRIFT_TEST_MODE: '1',
+    STEAM_REVIEW_TEST_BASE_URL: `http://127.0.0.1:${steamPort}` },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const webProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', 'apps/web', '-p', String(webPort)], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -75,6 +98,16 @@ async function waitForAnalysis(browser, documentId) {
     await delay(200);
   }
   throw new Error(`Analysis did not complete: ${errors}`);
+}
+async function waitForSourceRun(browser, id) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = await browser.call('source-runs');
+    const run = result.body.find(item => item.id === id);
+    if (run?.status === 'succeeded') return run;
+    if (run?.status === 'failed') throw new Error(`Source sync failed: ${JSON.stringify(run)}`);
+    await delay(200);
+  }
+  throw new Error(`Source sync did not complete: ${errors}`);
 }
 
 try {
@@ -150,6 +183,64 @@ try {
   assert.equal((await viewer.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await analyst.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await admin.call('sources', { method: 'POST', body: JSON.stringify({ product_id: competitor.body.id, url: 'https://example.invalid/other' }) })).status, 201);
+
+  const steamSource = await a.call('sources/steam-reviews', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, app: '620' }) });
+  assert.equal(steamSource.status, 201, JSON.stringify(steamSource.body));
+  assert.equal(steamSource.body.url, 'https://store.steampowered.com/app/620/');
+  assert.equal((await b.call('sources/steam-reviews', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, app: '620' }) })).status, 404);
+  assert.equal((await analyst.call('sources/steam-reviews', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, app: '620' }) })).status, 403);
+  assert.equal((await viewer.call(`sources/${steamSource.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 1 }) })).status, 403);
+  assert.equal((await b.call(`sources/${steamSource.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 1 }) })).status, 404);
+  async function syncSteam() {
+    const queued = await analyst.call(`sources/${steamSource.body.id}/sync`, { method: 'POST',
+      body: JSON.stringify({ max_pages: 1, max_items: 1 }) });
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    return waitForSourceRun(analyst, queued.body.id);
+  }
+  const steamFirst = await syncSteam();
+  assert.equal(steamFirst.documents_seen, 1);
+  assert.equal(steamFirst.documents_new, 1);
+  assert.equal(steamFirst.documents_updated, 0);
+  const steamDocuments = (await a.call('documents')).body.filter(item => item.document_type === 'steam_review');
+  assert.equal(steamDocuments.length, 1);
+  assert.equal(steamDocuments[0].product_name, 'Competitor');
+  assert.equal(steamDocuments[0].external_key, '901001');
+  assert.equal(steamDocuments[0].review_voted_up, false);
+  assert.equal(steamDocuments[0].synthetic, false);
+  assert.equal(steamDocuments[0].source_url_kind, 'product_reviews');
+  assert.equal(steamDocuments[0].analysis_status, null);
+  assert.equal(JSON.stringify(steamDocuments[0]).includes('must-not-be-stored'), false);
+  assert.equal((await b.call('documents')).body.length, 0);
+  const steamSecond = await syncSteam();
+  assert.equal(steamSecond.documents_new, 0);
+  assert.equal(steamSecond.documents_updated, 0);
+  assert.equal((await a.call('documents')).body.filter(item => item.document_type === 'steam_review').length, 1);
+  steamBody = 'Gostei muito da facilidade de uso.';
+  steamUpdated += 3600;
+  steamVotedUp = true;
+  const steamThird = await syncSteam();
+  assert.equal(steamThird.documents_new, 0);
+  assert.equal(steamThird.documents_updated, 1);
+  const steamChanged = (await a.call('documents')).body.find(item => item.id === steamDocuments[0].id);
+  assert.equal(steamChanged.body, steamBody);
+  assert.equal(steamChanged.review_voted_up, true);
+  assert.equal(steamChanged.analysis_status, null);
+  assert.equal(steamRequests.length, 3);
+  assert.equal(steamRequests[0].searchParams.get('filter'), 'recent');
+  assert.equal(steamRequests[1].searchParams.get('filter'), 'updated');
+  assert.equal(steamRequests[2].searchParams.get('filter'), 'updated');
+  assert.equal(steamRequests.every(url => url.searchParams.get('num_per_page') === '1'), true);
+  assert.equal((await b.call(`documents/${steamChanged.id}/analyze`, { method: 'POST' })).status, 404);
+  assert.equal((await viewer.call(`documents/${steamChanged.id}/analyze`, { method: 'POST' })).status, 403);
+  assert.equal((await analyst.call(`documents/${steamChanged.id}/analyze`, { method: 'POST' })).body.status, 'queued');
+  const steamAnalyzed = await waitForAnalysis(a, steamChanged.id);
+  assert.deepEqual(steamAnalyzed.issues, []);
+  assert.equal(steamAnalyzed.analysis_model, 'controlled-test-fixture-v1');
 
   const externalKey = `synthetic-${suffix}`;
   const positiveKey = `positive-${suffix}`;
@@ -229,12 +320,13 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV ingest, queued analysis, literal evidence, replay and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, CSV ingest, controlled analysis, Steam source queue/worker/storage, sync replay/update and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
 } finally {
   for (const child of children) child.kill();
+  steamMock.close();
   if (cleanupTenants.length) {
     const admin = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
     try {
@@ -243,7 +335,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['insights', 'document_analyses', 'import_rows', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['insights', 'document_analyses', 'import_rows', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

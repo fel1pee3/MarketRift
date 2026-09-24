@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marketrift.local/contracts/sync-steam-reviews-job.v1.schema.json",
+  "title": "SyncSteamReviewsJobV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tenant_id", "source_id", "run_id", "idempotency_key"],
+  "properties": {
+    "version": { "const": 1 },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "source_id": { "type": "string", "format": "uuid" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "idempotency_key": { "type": "string", "pattern": "^steam-reviews-[0-9a-f-]{36}-v1$" }
+  }
+}

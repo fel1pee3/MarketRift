@@ -8,10 +8,10 @@ type Session = { user_id: string; email: string; display_name: string; tenant_id
 type Member = { user_id: string; email: string; display_name: string; role: Role };
 type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null };
-type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
+type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
-type Document = { id: string; source_id: string; document_type: 'review' | 'github_issue'; external_key: string; source_url: string; body: string; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
+type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const categoryNames: Record<string, string> = {
   support: 'Suporte', price: 'Preço', billing: 'Cobrança', performance: 'Desempenho',
@@ -213,6 +213,40 @@ export default function Home() {
             </li>;
           })}</ul>
         </section>
+        <section className="card wide"><h2>Avaliações de usuários do Steam</h2>
+          <p>Piloto para produtos publicados no Steam. A coleta é manual e limitada. Recomendação positiva ou negativa é um dado da plataforma; a extração de problemas por IA exige escolher uma review depois.</p>
+          <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('sources/steam-reviews', session, { method: 'POST', body: JSON.stringify({
+              product_id: data.get('product_id'), app: data.get('app'),
+            }) });
+            form.reset(); await refresh(session);
+          })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>Steam App ID ou URL do produto<input name="app" placeholder="620 ou https://store.steampowered.com/app/620/" required /></label>
+            <button disabled={busy || !canManage || !products.length}>Adicionar fonte Steam</button></form>
+          <ul>{sources.filter(source => source.source_type === 'steam_reviews').map(source => {
+            const latest = sourceRuns.find(item => item.source_id === source.id);
+            const product = products.find(item => item.id === source.product_id);
+            const duplicatedApp = sources.some(item => item.id !== source.id && item.source_type === 'steam_reviews' && item.url === source.url);
+            return <li key={source.id}><strong>{product?.name ?? 'Produto não encontrado'}</strong> · <a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>
+              {duplicatedApp && <p>Este App ID também está associado a outro produto deste tenant. Os mesmos relatos não devem ser somados duas vezes numa comparação futura.</p>}
+              <p>Última coleta: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'}</p>
+              {latest && <p>Estado: {latest.status}; recebidas: {latest.documents_seen}; novas: {latest.documents_new}; atualizadas: {latest.documents_updated}; ignoradas: {latest.documents_ignored}; páginas: {latest.pages_fetched}.
+                {latest.scan_complete === false && <> Janela não percorrida até o fim por causa do limite configurado.</>}
+                {latest.error_code && <> Falha: {latest.error_code}.</>}
+                {latest.retry_after_at && <> Tente após {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+              {session.role !== 'viewer' && <form onSubmit={event => void run(async () => {
+                const data = formValues(event);
+                await api(`sources/${source.id}/sync`, session, { method: 'POST', body: JSON.stringify({
+                  max_pages: Number(data.get('max_pages')), max_items: Number(data.get('max_items')),
+                }) });
+                await refresh(session);
+              })}><label>Páginas (1–3)<input name="max_pages" type="number" min="1" max="3" defaultValue="1" required /></label>
+                <label>Reviews (1–50)<input name="max_items" type="number" min="1" max="50" defaultValue="5" required /></label>
+                <button className="small" disabled={busy || latest?.status === 'running'}>Coletar reviews</button></form>}
+            </li>;
+          })}</ul>
+        </section>
         <section className="card"><h2>Importar CSV</h2><p>Até 100 linhas. Colunas: external_key, source_url, published_at, body, synthetic.</p>
           <p>No campo Arquivo CSV, escolha <code>fixtures/reviews.example.csv</code> na pasta do projeto.</p>
           <form onSubmit={event => void run(async () => {
@@ -230,28 +264,32 @@ export default function Home() {
               await api(`imports/${item.id}/requeue`, session, { method: 'POST' }); await refresh(session);
             })}>Reenfileirar</button>}</li>)}</ul> : <p className="empty">Nenhuma importação ainda.</p>}
         </section>
-        <section className="card wide"><h2>Documentos</h2><p>Avaliações mostram problemas com evidência; Issues públicas do GitHub mostram título, corpo, estado, data e origem para revisão humana. Dados sintéticos não contam como avaliações reais.</p>
+        <section className="card wide"><h2>Documentos</h2><p>Reviews Steam e avaliações CSV são distintas de Issues públicas do GitHub. A análise de reviews Steam só começa após você selecionar uma review. Dados sintéticos não contam como avaliações reais.</p>
           {documents.length ? <div className="documents">{documents.map(document => <article key={document.id}>
-            <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.synthetic && <span className="badge">SINTÉTICO</span>}
+            <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.document_type === 'steam_review' && <span className="badge">Avaliação de usuário do Steam</span>}{document.synthetic && <span className="badge">SINTÉTICO</span>}
               {document.published_at && <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time>}<code>{document.external_key}</code></div>
-            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <p>{document.body}</p>}{isExampleAddress(document.source_url) ?
+            <p><strong>Produto associado:</strong> {document.product_name}</p>
+            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <><p>{document.body}</p>{document.document_type === 'steam_review' && <p>App ID: {document.steam_app_id} · Idioma: {document.review_language} · Recomendação no Steam: {document.review_voted_up ? 'positiva' : 'negativa'} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecida'}</p>}</>}{isExampleAddress(document.source_url) ?
               <small>URL fictícia, sem página: {document.source_url}</small> :
-              <a href={document.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a>}
-            {document.document_type === 'review' && <div className="analysis">
+              <a href={document.source_url} target="_blank" rel="noreferrer">{document.source_url_kind === 'product_reviews' ? 'Abrir página de avaliações do produto (não é link individual) ↗' : 'Abrir origem ↗'}</a>}
+            {['review', 'steam_review'].includes(document.document_type) && <div className="analysis">
               <h3>Problemas extraídos</h3>
               {document.analysis_model === 'controlled-test-fixture-v1' && <p className="test-label">Resultado controlado de teste; não é uma análise feita por IA.</p>}
               {document.analysis_status === 'completed' ? document.issues.length ?
                 <ul className="issue-list">{document.issues.map((issue, index) => <li key={`${document.id}-${index}`}>
                   <strong>{categoryNames[issue.category] ?? issue.category}</strong> · gravidade {severityNames[issue.severity] ?? issue.severity}
                   <p>{issue.description}</p><blockquote>“{issue.evidence_quote}”</blockquote>
-                </li>)}</ul> : <p>Nenhum problema identificado nesta avaliação.</p> :
+                </li>)}</ul> : <p>{document.document_type === 'steam_review' ?
+                  'Nenhum problema nas categorias atuais. Isso não comprova ausência de reclamação no texto.' :
+                  'Nenhum problema identificado nesta avaliação.'}</p> :
                 <p>{document.analysis_status === 'unavailable' ? 'Análise indisponível: configure um provedor real para processar esta avaliação.' :
                   document.analysis_status === 'failed' ? `Análise falhou (${document.analysis_error ?? 'erro desconhecido'}).` :
-                    document.analysis_status === 'processing' ? 'Análise em andamento…' : 'Análise aguardando processamento.'}</p>}
+                    document.analysis_status === 'processing' ? 'Análise em andamento…' :
+                      document.document_type === 'steam_review' && document.analysis_status === null ? 'Análise não solicitada.' : 'Análise aguardando processamento.'}</p>}
               {session.role !== 'viewer' && ['pending', 'failed', 'unavailable', null].includes(document.analysis_status) &&
                 <button className="small" disabled={busy} onClick={() => void run(async () => {
                   await api(`documents/${document.id}/analyze`, session, { method: 'POST' }); await refresh(session);
-                })}>Reenfileirar análise</button>}
+                })}>{document.document_type === 'steam_review' ? 'Analisar esta review (1 item)' : 'Reenfileirar análise'}</button>}
             </div>}</article>)}</div> :
             <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}
         </section>
