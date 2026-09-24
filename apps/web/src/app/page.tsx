@@ -9,6 +9,11 @@ type Document = { id: string; source_id: string; external_key: string; source_ur
 type Session = { token: string; tenant_id: string };
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 
+function isExampleAddress(value: string): boolean {
+  try { return new URL(value).hostname.endsWith('.invalid'); }
+  catch { return false; }
+}
+
 async function api<T>(path: string, token: string | null, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
   if (token) headers.set('Authorization', `Bearer ${token}`);
@@ -73,18 +78,18 @@ export default function Home() {
         await api('products', session.token, { method: 'POST', body: JSON.stringify({ name: data.get('name'), kind: data.get('kind'), website_url: data.get('website_url') || undefined }) });
         form.reset(); await refresh(session.token);
       })}><label>Nome<input name="name" required /></label><label>Tipo<select name="kind"><option value="own">Produto próprio</option><option value="competitor">Concorrente</option></select></label><label>Site (opcional)<input name="website_url" type="url" /></label><button disabled={busy}>Adicionar produto</button></form><ul>{products.map(product => <li key={product.id}><strong>{product.name}</strong> <small>{product.kind === 'own' ? 'Próprio' : 'Concorrente'}</small></li>)}</ul></section>
-      <section className="card"><h2>Fontes</h2><p>A importação manual exige URL por avaliação. Confirme que você pode usar os dados enviados.</p><form onSubmit={event => void run(async () => {
+      <section className="card"><h2>Fontes</h2><p>A importação manual exige URL por avaliação. Confirme que você pode usar os dados enviados.</p><p>Para testar, use <code>https://example.invalid/reviews</code>. Esse endereço fictício não abre uma página.</p><form onSubmit={event => void run(async () => {
         const data = values(event); const form = event.currentTarget;
         await api('sources', session.token, { method: 'POST', body: JSON.stringify({ product_id: data.get('product_id'), url: data.get('url') }) });
         form.reset(); await refresh(session.token);
-      })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label><label>URL da fonte<input name="url" type="url" required /></label><button disabled={busy || !products.length}>Adicionar fonte</button></form><ul>{sources.map(source => <li key={source.id}><a href={source.url} target="_blank" rel="noreferrer">{source.url}</a></li>)}</ul></section>
-      <section className="card"><h2>Importar CSV</h2><p>Até 100 linhas. Colunas: external_key, source_url, published_at, body, synthetic.</p><form onSubmit={event => void run(async () => {
+      })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label><label>URL da fonte<input name="url" type="url" required /></label><button disabled={busy || !products.length}>Adicionar fonte</button></form><ul>{sources.map(source => <li key={source.id}>{isExampleAddress(source.url) ? <span>{source.url} <small>(endereço fictício, sem página)</small></span> : <a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>}</li>)}</ul></section>
+      <section className="card"><h2>Importar CSV</h2><p>Até 100 linhas. Colunas: external_key, source_url, published_at, body, synthetic.</p><p>No campo Arquivo CSV, escolha <code>fixtures/reviews.example.csv</code> na pasta do projeto.</p><form onSubmit={event => void run(async () => {
         const data = values(event); const form = event.currentTarget;
         await api('imports/reviews', session.token, { method: 'POST', body: data });
         form.reset(); await refresh(session.token);
       })}><label>Fonte<select name="source_id" required>{sources.map(source => <option key={source.id} value={source.id}>{source.url}</option>)}</select></label><label>Arquivo CSV<input type="file" name="file" accept=".csv,text/csv" required /></label><button disabled={busy || !sources.length}>Enviar avaliações</button></form></section>
       <section className="card"><h2>Importações</h2><p>O estado é atualizado automaticamente.</p>{imports.length ? <ul>{imports.map(item => <li key={item.id}><strong>{item.status}</strong> · {item.processed_rows}/{item.total_rows} linhas {item.last_error && <small>{item.last_error}</small>}{item.status === 'pending' && <button className="small" onClick={() => void run(async () => { await api(`imports/${item.id}/requeue`, session.token, { method: 'POST' }); await refresh(session.token); })}>Reenfileirar</button>}</li>)}</ul> : <p className="empty">Nenhuma importação ainda.</p>}</section>
-      <section className="card wide"><h2>Documentos</h2><p>Texto original, data e link da origem. Dados sintéticos aparecem identificados.</p>{documents.length ? <div className="documents">{documents.map(document => <article key={document.id}><div className="meta">{document.synthetic && <span className="badge">SINTÉTICO</span>}<time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time><code>{document.external_key}</code></div><p>{document.body}</p><a href={document.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a></article>)}</div> : <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}</section>
+      <section className="card wide"><h2>Documentos</h2><p>Texto original, data e link da origem. Dados sintéticos aparecem identificados.</p>{documents.length ? <div className="documents">{documents.map(document => <article key={document.id}><div className="meta">{document.synthetic && <span className="badge">SINTÉTICO</span>}<time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time><code>{document.external_key}</code></div><p>{document.body}</p>{isExampleAddress(document.source_url) ? <small>URL fictícia, sem página: {document.source_url}</small> : <a href={document.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a>}</article>)}</div> : <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}</section>
     </div>}
   </main>;
 }

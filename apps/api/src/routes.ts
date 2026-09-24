@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Controller, ForbiddenException, Get, Headers, HttpCode, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors, UnauthorizedException } from '@nestjs/common';
+import { BadRequestException, ConflictException, Controller, ForbiddenException, Get, Headers, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors, UnauthorizedException } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { Request } from 'express';
@@ -48,7 +48,7 @@ function conflict(error: unknown): never {
 
 @Controller('v1')
 export class ApiController {
-  constructor(private readonly db: Db, private readonly jobs: Jobs) {}
+  constructor(@Inject(Db) private readonly db: Db, @Inject(Jobs) private readonly jobs: Jobs) {}
 
   private async principal(request: Request, allowed: Role[] = ['owner', 'admin', 'analyst', 'viewer']): Promise<Principal> {
     const match = /^Bearer (\S+)$/i.exec(request.headers.authorization ?? '');

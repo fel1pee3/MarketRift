@@ -96,7 +96,9 @@ npm run dev:worker
 npm run dev:intelligence-http
 ```
 
-Abra `http://localhost:3000`. Crie uma empresa, cadastre produto próprio e concorrente, associe uma fonte manual ao concorrente e envie `fixtures/reviews.example.csv`. As duas linhas do exemplo são sintéticas, com URLs `.invalid` e marcação `synthetic=true`. A lista de importações mostra o estado; os documentos exibem texto, data e URL de origem. O FastAPI atual expõe apenas `/health` em `127.0.0.1:8000`.
+O worker pode ficar sem novas mensagens no terminal enquanto espera jobs. O servidor FastAPI expõe somente `/health` nesta fase e não é necessário para o fluxo de importação. O Next.js grava o servidor de desenvolvimento em `apps/web/.next-dev` e o build de produção em `apps/web/.next`, para que os dois comandos não sobrescrevam os mesmos arquivos. Se o navegador avisar sobre hidratação e mostrar atributos como `bis_skin_checked`, `bis_register` ou `cz-shortcut-listen`, teste a página com as extensões desativadas: esses atributos são inseridos no HTML antes da hidratação do React.
+
+Abra `http://localhost:3000`. Crie uma empresa, cadastre produto próprio e concorrente e associe ao concorrente uma fonte com URL `https://example.invalid/reviews`. Na seção **Importar CSV**, selecione essa fonte; no campo **Arquivo CSV**, use o seletor de arquivos para escolher `fixtures/reviews.example.csv` dentro da pasta do projeto e clique em **Enviar avaliações**. Abrir o CSV no editor apenas mostra seu conteúdo; não o importa. As duas linhas do exemplo são sintéticas, com URLs `.invalid` que não levam a páginas reais e marcação `synthetic=true`. A lista de importações mostra o estado; os documentos exibem texto, data e URL de origem. O FastAPI atual expõe apenas `/health` em `127.0.0.1:8000`.
 
 ### Migrações
 
