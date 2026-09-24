@@ -6,4 +6,4 @@ Antes de propor um coletor: confirme as condicoes de uso da fonte, limites de ac
 
 Para uma mudanca de extracao: registrar versao de prompt/modelo, exemplos rotulados e comparacao com baseline. Para uma mudanca de RAG: demonstrar citacoes e comportamento sem evidencia. Para uma nova rota: teste de autorizacao e isolamento A/B.
 
-Licenca open source, codigo de conduta e politica de contribuicao externa serao definidos antes da publicacao publica do repositorio.
+O projeto usa a Apache License 2.0. Ao propor uma contribuicao, identifique trechos de terceiros e suas licencas; contribuicoes aceitas serao distribuidas sob a licenca do projeto. Codigo de conduta e politica detalhada de contribuicao externa ainda serao definidos.

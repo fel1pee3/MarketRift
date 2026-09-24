@@ -1,6 +1,7 @@
 {
   "name": "marketrift",
   "private": true,
+  "license": "Apache-2.0",
   "workspaces": ["apps/api", "apps/web"],
   "scripts": {
     "dev:api": "npm run dev -w @marketrift/api",

@@ -106,6 +106,10 @@ São **três migrações do mesmo banco PostgreSQL**, não bancos alternativos. 
 
 Siga [03-plano-de-implementacao.md](docs/03-plano-de-implementacao.md) até todos os critérios de aceite do produto estarem satisfeitos. A primeira entrega vertical usa CSV para validar o caminho de dados; depois entram conectores contínuos, preço, lançamentos, sinais, alertas, recomendações, chat e operação SaaS. CSV é um degrau de engenharia, não o destino do projeto.
 
+## Licença
+
+O código, a documentação e as fixtures sintéticas deste repositório são disponibilizados sob a [Apache License 2.0](LICENSE). Ela permite uso, modificação e distribuição, inclusive comercial, nos termos da licença. Também permite hospedar uma versão modificada sem publicar essas modificações. Dependências de terceiros conservam suas próprias licenças. Veja [NOTICE](NOTICE) para a atribuição do projeto.
+
 ## Estado atual
 
 Em 2026-09-23, `001`, `002` e `003` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. `npm run test:db` passou com dois tenants, RLS e repetição de jobs; `npm run test:e2e` passou no caminho web → API → BullMQ → Python → PostgreSQL → API. `npm run lint`, `npm run build`, `npm run test` e o lint/testes Python passaram. Veja [ADR 0002](docs/adr/0002-primeira-fatia.md) para decisões e limites.
