@@ -9,8 +9,14 @@ type Member = { user_id: string; email: string; display_name: string; role: Role
 type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type Source = { id: string; product_id: string; source_type: string; url: string };
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
-type Document = { id: string; source_id: string; external_key: string; source_url: string; body: string; published_at: string; synthetic: boolean };
+type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
+type Document = { id: string; source_id: string; external_key: string; source_url: string; body: string; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
+const categoryNames: Record<string, string> = {
+  support: 'Suporte', price: 'Preço', billing: 'Cobrança', performance: 'Desempenho',
+  usability: 'Usabilidade', features: 'Funcionalidades',
+};
+const severityNames: Record<string, string> = { low: 'baixa', medium: 'média', high: 'alta' };
 
 class ApiError extends Error {
   constructor(message: string, readonly status: number) { super(message); }
@@ -111,7 +117,7 @@ export default function Home() {
   return <main>
     <header>
       <div><span className="eyebrow">INTELIGÊNCIA COMPETITIVA</span><h1>MarketRift</h1>
-        <p>Primeira fatia: portfólio, fontes e avaliações com origem verificável.</p></div>
+        <p>Portfólio, avaliações com origem e problemas extraídos com evidências.</p></div>
       {session && <button className="ghost" disabled={busy} onClick={() => void run(async () => {
         await api('auth/logout', session, { method: 'POST' });
         sessionKey.current = null; clearTenantData(); setSession(null);
@@ -191,13 +197,29 @@ export default function Home() {
               await api(`imports/${item.id}/requeue`, session, { method: 'POST' }); await refresh(session);
             })}>Reenfileirar</button>}</li>)}</ul> : <p className="empty">Nenhuma importação ainda.</p>}
         </section>
-        <section className="card wide"><h2>Documentos</h2><p>Texto original, data e link da origem. Dados sintéticos aparecem identificados.</p>
+        <section className="card wide"><h2>Documentos e problemas</h2><p>Texto original, data, origem e trechos que sustentam cada problema. Dados sintéticos não contam como avaliações reais.</p>
           {documents.length ? <div className="documents">{documents.map(document => <article key={document.id}>
             <div className="meta">{document.synthetic && <span className="badge">SINTÉTICO</span>}
-              <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time><code>{document.external_key}</code></div>
+              {document.published_at && <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time>}<code>{document.external_key}</code></div>
             <p>{document.body}</p>{isExampleAddress(document.source_url) ?
               <small>URL fictícia, sem página: {document.source_url}</small> :
-              <a href={document.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a>}</article>)}</div> :
+              <a href={document.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a>}
+            <div className="analysis">
+              <h3>Problemas extraídos</h3>
+              {document.analysis_model === 'controlled-test-fixture-v1' && <p className="test-label">Resultado controlado de teste; não é uma análise feita por IA.</p>}
+              {document.analysis_status === 'completed' ? document.issues.length ?
+                <ul className="issue-list">{document.issues.map((issue, index) => <li key={`${document.id}-${index}`}>
+                  <strong>{categoryNames[issue.category] ?? issue.category}</strong> · gravidade {severityNames[issue.severity] ?? issue.severity}
+                  <p>{issue.description}</p><blockquote>“{issue.evidence_quote}”</blockquote>
+                </li>)}</ul> : <p>Nenhum problema identificado nesta avaliação.</p> :
+                <p>{document.analysis_status === 'unavailable' ? 'Análise indisponível: configure um provedor real para processar esta avaliação.' :
+                  document.analysis_status === 'failed' ? `Análise falhou (${document.analysis_error ?? 'erro desconhecido'}).` :
+                    document.analysis_status === 'processing' ? 'Análise em andamento…' : 'Análise aguardando processamento.'}</p>}
+              {session.role !== 'viewer' && ['pending', 'failed', 'unavailable', null].includes(document.analysis_status) &&
+                <button className="small" disabled={busy} onClick={() => void run(async () => {
+                  await api(`documents/${document.id}/analyze`, session, { method: 'POST' }); await refresh(session);
+                })}>Reenfileirar análise</button>}
+            </div></article>)}</div> :
             <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}
         </section>
         <section className="card wide"><h2>Membros e convites</h2>

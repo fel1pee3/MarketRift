@@ -8,6 +8,7 @@ import { z } from 'zod';
 import { Db } from './db';
 import { Jobs } from './queue';
 import { makeJob } from './job';
+import { activeExtractorVersion, makeAnalysisJob } from './analysis-job';
 import { Accounts, Principal, Role } from './accounts';
 
 const uuid = z.uuid();
@@ -18,7 +19,7 @@ const csvRow = z.object({ external_key: z.string().trim().min(1).max(200), sourc
 type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: 'manual_review'; url: string };
 type ImportRow = QueryResultRow & { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: Date; finished_at: Date | null };
-type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; external_key: string; source_url: string; body: string; published_at: Date | null; collected_at: Date; synthetic: boolean };
+type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; external_key: string; source_url: string; body: string; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
 
 function input<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -148,6 +149,44 @@ export class ApiController {
   async documents(@Req() request: Request): Promise<DocumentRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<DocumentRow>(client,
-      'SELECT d.id, d.source_id, s.product_id, d.external_key, d.source_url, d.body, d.published_at, d.collected_at, d.synthetic FROM marketrift.documents d JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id ORDER BY d.collected_at DESC, d.id LIMIT 100'));
+      `SELECT d.id, d.source_id, s.product_id, d.external_key, d.source_url, d.body,
+        d.published_at, d.collected_at, d.synthetic, a.status AS analysis_status,
+        a.model_id AS analysis_model, a.last_error AS analysis_error,
+        COALESCE((SELECT json_agg(json_build_object('category', i.category,
+          'sentiment', i.sentiment, 'severity', i.severity, 'description', i.pain_point,
+          'evidence_quote', i.evidence_quote) ORDER BY i.issue_index)
+          FROM marketrift.insights i WHERE i.tenant_id = d.tenant_id AND i.analysis_id = a.id
+          AND a.status = 'completed'), '[]'::json) AS issues
+        FROM marketrift.documents d
+        JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id
+        LEFT JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id
+          AND a.document_id = d.id AND a.extractor_version = $1
+        ORDER BY d.collected_at DESC, d.id LIMIT 100`, [activeExtractorVersion]));
+  }
+
+  @Post('documents/:id/analyze')
+  @HttpCode(200)
+  async reanalyze(@Req() request: Request, @Param('id') idValue: string): Promise<{ status: string }> {
+    const principal = await this.principal(request, ['owner', 'admin', 'analyst']);
+    const id = input(uuid, idValue);
+    const status = await this.db.tenant(principal.tenantId, async client => {
+      const document = await this.db.rows<{ id: string }>(client,
+        "SELECT id FROM marketrift.documents WHERE id = $1 AND document_type = 'review'", [id]);
+      if (!document[0]) throw new NotFoundException('Review not found');
+      await client.query(
+        'INSERT INTO marketrift.document_analyses (tenant_id, document_id, extractor_version) '
+        + 'VALUES ($1, $2, $3) ON CONFLICT (tenant_id, document_id, extractor_version) DO NOTHING',
+        [principal.tenantId, id, activeExtractorVersion]);
+      const rows = await this.db.rows<{ status: string }>(client,
+        'SELECT status FROM marketrift.document_analyses WHERE document_id = $1 AND extractor_version = $2 FOR UPDATE',
+        [id, activeExtractorVersion]);
+      if (rows[0]!.status === 'failed' || rows[0]!.status === 'unavailable') {
+        await client.query("UPDATE marketrift.document_analyses SET status = 'pending', last_error = NULL, queued_at = now() WHERE document_id = $1 AND extractor_version = $2", [id, activeExtractorVersion]);
+        return 'pending';
+      }
+      return rows[0]!.status;
+    });
+    if (status === 'pending') await this.jobs.publishAnalysis(makeAnalysisJob(principal.tenantId, id));
+    return { status: status === 'pending' ? 'queued' : status };
   }
 }

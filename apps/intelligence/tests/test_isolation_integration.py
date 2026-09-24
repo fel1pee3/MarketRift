@@ -21,11 +21,17 @@ def run_ingest(job: dict) -> dict:
     return asyncio.run(ingest(job))
 
 
-def test_two_tenants_rls_and_repeated_jobs(request):
+def test_two_tenants_rls_and_repeated_jobs(request, monkeypatch):
     tenant_a, tenant_b = str(uuid4()), str(uuid4())
     product_a, product_b = str(uuid4()), str(uuid4())
     source_a, source_b = str(uuid4()), str(uuid4())
     import_a, import_a_again = str(uuid4()), str(uuid4())
+    queued = []
+
+    async def record_analysis_jobs(_tenant, document_ids):
+        queued.extend(document_ids)
+
+    monkeypatch.setattr("marketrift_intelligence.ingest.publish_analyses", record_analysis_jobs)
 
     def cleanup():
         with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
@@ -79,6 +85,7 @@ def test_two_tenants_rls_and_repeated_jobs(request):
     assert run_ingest(job(import_a, source_a))["new_documents"] == 1
     assert run_ingest(job(import_a, source_a))["new_documents"] == 0
     assert run_ingest(job(import_a_again, source_a))["new_documents"] == 0
+    assert len(set(queued)) == 1
 
     with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as runtime:
         runtime.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_a,))
@@ -97,6 +104,7 @@ def test_two_tenants_rls_and_repeated_jobs(request):
 
     # Browser credentials and invitation hashes are outside the worker/runtime role.
     for private_table in ("browser_sessions", "member_invitations"):
-        with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as runtime:
-            with pytest.raises(psycopg.errors.InsufficientPrivilege):
-                runtime.execute(f"SELECT count(*) FROM marketrift.{private_table}")
+        with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as runtime, pytest.raises(
+            psycopg.errors.InsufficientPrivilege
+        ):
+            runtime.execute(f"SELECT count(*) FROM marketrift.{private_table}")

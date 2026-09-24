@@ -8,10 +8,18 @@ const apiPort = Number(process.env.E2E_API_PORT ?? 3211);
 const webPort = Number(process.env.E2E_WEB_PORT ?? 3210);
 const webOrigin = `http://localhost:${webPort}`;
 const apiBase = `http://localhost:${apiPort}/v1`;
-const childEnv = { ...process.env, API_PORT: String(apiPort), WEB_ORIGIN: webOrigin };
+// Use a separate local Redis database so an already running development worker
+// cannot consume E2E jobs with a different analysis provider.
+const e2eRedisUrl = new URL(process.env.E2E_REDIS_URL ?? process.env.REDIS_URL);
+if (!process.env.E2E_REDIS_URL) e2eRedisUrl.pathname = '/15';
+const childEnv = { ...process.env, API_PORT: String(apiPort), WEB_ORIGIN: webOrigin,
+  REDIS_URL: e2eRedisUrl.toString() };
 const apiProcess = spawn(process.execPath, ['apps/api/dist/main.js'], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
+const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
+  env: { ...childEnv, ANALYSIS_PROVIDER: 'test', MARKETRIFT_TEST_MODE: '1' },
+  stdio: ['ignore', 'pipe', 'pipe'],
+});
 const webProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', 'apps/web', '-p', String(webPort)], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
 const children = [apiProcess, workerProcess, webProcess];
 let errors = '';
@@ -57,6 +65,16 @@ async function waitForImport(browser, id) {
     await delay(200);
   }
   throw new Error(`Import did not complete: ${errors}`);
+}
+async function waitForAnalysis(browser, documentId) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = await browser.call('documents');
+    const document = result.body.find(item => item.id === documentId);
+    if (document?.analysis_status === 'completed') return document;
+    if (document?.analysis_status === 'failed') throw new Error(`Analysis failed: ${JSON.stringify(document)}`);
+    await delay(200);
+  }
+  throw new Error(`Analysis did not complete: ${errors}`);
 }
 
 try {
@@ -134,7 +152,8 @@ try {
   assert.equal((await admin.call('sources', { method: 'POST', body: JSON.stringify({ product_id: competitor.body.id, url: 'https://example.invalid/other' }) })).status, 201);
 
   const externalKey = `synthetic-${suffix}`;
-  const csv = `external_key,source_url,published_at,body,synthetic\n${externalKey},https://example.invalid/reviews/${externalKey},2026-09-01T10:00:00Z,Synthetic e2e review,true\n`;
+  const positiveKey = `positive-${suffix}`;
+  const csv = `external_key,source_url,published_at,body,synthetic\n${externalKey},https://example.invalid/reviews/${externalKey},2026-09-01T10:00:00Z,O suporte demorou três dias e o preço aumentou sem aviso.,true\n${positiveKey},https://example.invalid/reviews/${positiveKey},2026-09-02T10:00:00Z,Gostei muito da facilidade de uso.,true\n`;
   async function upload(browser, sourceId) {
     const form = new FormData();
     form.append('source_id', sourceId);
@@ -153,6 +172,16 @@ try {
   assert.equal(documentsA.body.filter(document => document.external_key === externalKey).length, 1);
   assert.equal((await b.call('documents')).body.length, 0);
   assert.equal((await b.call(`imports/${first.body.id}`)).status, 404);
+  const analyzed = await waitForAnalysis(a, documentsA.body.find(document => document.external_key === externalKey).id);
+  assert.deepEqual(analyzed.issues.map(issue => issue.category).sort(), ['price', 'support']);
+  assert.equal(analyzed.analysis_model, 'controlled-test-fixture-v1');
+  assert.equal(analyzed.synthetic, true);
+  assert(analyzed.issues.every(issue => analyzed.body.includes(issue.evidence_quote)));
+  const positive = await waitForAnalysis(a, documentsA.body.find(document => document.external_key === positiveKey).id);
+  assert.deepEqual(positive.issues, []);
+  assert.equal((await a.call(`documents/${analyzed.id}/analyze`, { method: 'POST' })).body.status, 'completed');
+  assert.equal((await b.call(`documents/${analyzed.id}/analyze`, { method: 'POST' })).status, 404);
+  assert.equal((await viewer.call(`documents/${analyzed.id}/analyze`, { method: 'POST' })).status, 403);
 
   const members = await a.call('members');
   const viewerId = members.body.find(member => member.email === viewerEmail).user_id;
@@ -200,7 +229,7 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: cookie session, CSRF, invites, all roles, switch, isolation, CSV worker and deduplication');
+  console.log('E2E passed: sessions, RBAC, CSV ingest, queued analysis, literal evidence, replay and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
@@ -214,7 +243,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['import_rows', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['insights', 'document_analyses', 'import_rows', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

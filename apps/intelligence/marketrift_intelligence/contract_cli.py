@@ -3,11 +3,16 @@
 import json
 import sys
 
+from .analysis_job import validate_analysis_job
 from .job import validate_job
 
 
 def main() -> None:
-    validate_job(json.load(sys.stdin))
+    payload = json.load(sys.stdin)
+    if len(sys.argv) > 1 and sys.argv[1] == "analysis":
+        validate_analysis_job(payload)
+    else:
+        validate_job(payload)
     print("valid")
 
 

@@ -9,6 +9,7 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 .tmp/
+evalsets/private/
 *.tsbuildinfo
 *.egg-info/
 pytest-cache-files-*/

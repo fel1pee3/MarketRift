@@ -2,7 +2,7 @@
 
 **Plataforma B2B de inteligência competitiva baseada em evidências.** Empresas acompanham seus produtos e concorrentes; o sistema coleta avaliações públicas, mudanças de preço e notas de versão, identifica sinais relevantes e propõe ações para revisão humana.
 
-> Este repositório contém a **especificação do produto completo** e a primeira fatia funcional: conta, portfólio, fonte manual, CSV, fila, worker e documentos. Os marcos de entrega são uma ordem de construção, não uma redução do objetivo final.
+> Este repositório contém a **especificação do produto completo** e fatias funcionais de conta, portfólio, importação e análise versionada de avaliações. Os marcos de entrega são uma ordem de construção, não uma redução do objetivo final.
 
 ## O produto completo
 
@@ -76,7 +76,7 @@ Na pasta `apps/intelligence`, instale o pacote Python:
 .venv/Scripts/python.exe -m pip install -e ".[dev]"
 ```
 
-De volta à raiz, aplique as quatro migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
+De volta à raiz, aplique as cinco migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
 
 ```powershell
 npm run db:setup
@@ -93,11 +93,17 @@ Se você já usava o banco da primeira fatia, preserve o volume e aplique soment
 npm run db:migrate:account
 ```
 
+Para atualizar um banco que já tem a migração 004, aplique a migração de análise sem apagar os documentos:
+
+```powershell
+npm run db:migrate:analysis
+```
+
 O comando detecta se as tabelas da migração 004 já existem. Um `.env` antigo com `JWT_SECRET` continua aceito como segredo de transição; novas instalações usam `SESSION_SECRET`. A sessão anterior em `sessionStorage` deixa de valer: entre novamente após atualizar o código.
 
-O E2E usa as portas 3210 (web) e 3211 (API) para não interromper os servidores de desenvolvimento em 3000/3001. No navegador, use `http://localhost:3000`, igual ao `WEB_ORIGIN`; operações de escrita de outra origem são rejeitadas. Em produção, configure HTTPS, `WEB_ORIGIN` exato e um segredo aleatório: o cookie passa a usar `Secure` e o prefixo `__Host-`. Web e API devem estar no mesmo site para o cookie `SameSite=Lax` deste desenho.
+O E2E usa as portas 3210 (web) e 3211 (API), além do banco Redis local 15, para não disputar jobs com um worker de desenvolvimento em 3000/3001 e Redis 0. `E2E_REDIS_URL` permite escolher outro banco Redis para o teste. No navegador, use `http://localhost:3000`, igual ao `WEB_ORIGIN`; operações de escrita de outra origem são rejeitadas. Em produção, configure HTTPS, `WEB_ORIGIN` exato e um segredo aleatório: o cookie passa a usar `Secure` e o prefixo `__Host-`. Web e API devem estar no mesmo site para o cookie `SameSite=Lax` deste desenho.
 
-O teste E2E inicia e encerra API, worker e web. Em terminais separados, estes comandos de desenvolvimento também foram iniciados e verificados:
+O teste E2E inicia e encerra API, worker e web, verifica que a página é servida e usa chamadas HTTP à API; ainda não automatiza cliques no navegador. Em terminais separados, estes comandos de desenvolvimento também foram iniciados e verificados:
 
 ```powershell
 npm run dev:api
@@ -112,9 +118,33 @@ Abra `http://localhost:3000`. Crie uma empresa, cadastre produto próprio e conc
 
 Em **Membros e convites**, owner pode criar convites para admin, analyst ou viewer; admin pode convidar analyst ou viewer. Copie o código exibido uma única vez e entregue à pessoa convidada por canal seguro. Quem já tem conta entra e usa **Aceitar convite recebido**; quem é novo cola o código no formulário **Criar conta** usando o mesmo email do convite. Depois, **Empresa ativa** permite trocar de tenant. A sessão é recuperada após recarregar a página e termina ao clicar em **Sair**. O frontend não recebe o identificador secreto do cookie; mantém apenas um token CSRF em memória.
 
+### Análise de avaliações
+
+O worker grava cada avaliação e publica um job `analyze-document.v1` com IDs e versão do extrator. Uma análise pode produzir vários problemas com categoria, sentimento negativo, gravidade, descrição e trecho literal da avaliação. A API mostra o estado e os problemas junto do documento; respostas malformadas ou trechos que não existam no texto original ficam em estado de falha e não aparecem como insights. Avaliações positivas podem resultar em zero problemas. O botão **Reenfileirar análise** aparece apenas quando a análise está pendente, indisponível ou falhou; análises concluídas não precisam ser reenfileiradas. Ao mudar modelo, prompt, schema ou taxonomia, aumente `EXTRACTOR_VERSION` em API e worker e reenfileire o documento para manter as versões anteriores auditáveis.
+
+Sem chave de provedor, o padrão é `ANALYSIS_PROVIDER=disabled`: o fluxo registra `unavailable` e **não publica uma análise simulada**. Para usar OpenAI, configure somente no `.env` local `ANALYSIS_PROVIDER=openai`, `ANALYSIS_MODEL=gpt-5-nano` e `OPENAI_API_KEY` com sua chave; reinicie API e worker. Reenfileire apenas documentos pendentes, indisponíveis ou falhos; documentos novos são analisados automaticamente. A aplicação envia o texto da avaliação ao provedor escolhido, portanto use apenas dados cuja análise externa seja permitida. Em 2026-09-24, a chamada direta real foi verificada com quatro exemplos sintéticos. O fluxo completo também foi observado na interface para `demo-001` e `demo-002`: ambos ficaram `completed` com `model_id=gpt-5-nano` no banco. A integração usa `ChatOpenAI.with_structured_output` do LangChain e Pydantic, com validação literal adicional. O provedor controlado de teste só pode ser usado com `MARKETRIFT_TEST_MODE=1`; o E2E o ativa e a interface identifica seus resultados como teste, nunca como análise de IA.
+
+A avaliação legada abaixo usa seis exemplos **sintéticos** com rótulos definidos no próprio repositório. Ela verifica a rotina de comparação por categoria e de validade de evidências; seus números não medem precisão em avaliações reais rotuladas por pessoas:
+
+```powershell
+npm run eval:analysis:test
+```
+
+Em 2026-09-24, o antigo comando de chamada direta ao OpenAI passou em quatro exemplos sintéticos: quatro respostas estruturadas, quatro trechos literais válidos e nenhum resultado malformado. Essa execução histórica confirma a integração, não mede precisão em avaliações reais. O script `eval:analysis:openai` agora aponta para o avaliador com orçamento e exige as opções explícitas descritas abaixo. Não há estatísticas agregadas de reclamações no painel nesta etapa; dados sintéticos seguem identificados e não entram em qualquer métrica de dados reais.
+
+### Avaliação reproduzível da qualidade
+
+`evalsets/review-quality.synthetic.v1.json` contém seis casos criados para teste; `evalsets/real.template.json` está vazio porque ainda não há avaliações reais autorizadas e rotuladas por pessoas neste repositório. O avaliador usa o mesmo `extract_review` do worker, não grava nas tabelas dos tenants e exporta somente IDs, rótulos, métricas, versões, tokens e custo estimado, sem texto, URLs ou trechos das avaliações.
+
+```powershell
+npm run eval:quality -- --dataset evalsets/review-quality.synthetic.v1.json --max-examples 6 --output .tmp/quality-synthetic.json
+```
+
+O padrão é o provedor controlado e custa **USD 0** em API. Para rodar em textos reais, primeiro obtenha permissão de uso/envio ao provedor e rótulos humanos. Depois informe `--provider openai --model`, `--allow-paid`, `--max-examples`, `--budget-usd` e taxas de entrada/saída verificadas por você. O comando limita a saída, desliga retries e compara uma reserva estimada de tokens ao orçamento antes de cada chamada; a reserva não substitui a fatura do provedor. Veja [o guia de rotulagem e execução](evalsets/README.md) e [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md). Resultados perfeitos no conjunto sintético demonstram que o avaliador funciona, não que a IA seja confiável em dados reais.
+
 ### Migrações
 
-São **quatro migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites. `db:setup` aplica 001 a 004 em banco novo e cria os logins limitados. `db:migrate:account` aplica 004 sobre o banco existente sem recriá-lo.
+São **cinco migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação. `db:setup` aplica 001 a 005 em banco novo e cria os logins limitados. `db:migrate:account` e `db:migrate:analysis` aplicam somente as migrações respectivas sobre um banco existente.
 
 ## Ordem de construção
 
@@ -126,6 +156,6 @@ O código, a documentação e as fixtures sintéticas deste repositório são di
 
 ## Estado atual
 
-Em 2026-09-23, `001` a `004` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. `npm run test:db` passou com dois tenants, RLS e repetição de jobs; `npm run test:e2e` passou no caminho web → API → BullMQ → Python → PostgreSQL → API e cobriu sessão, CSRF, convites, papéis, troca de tenant e deduplicação. `npm run lint`, `npm run build`, `npm run test` e os testes Python passaram. Veja [ADR 0002](docs/adr/0002-primeira-fatia.md) e [ADR 0003](docs/adr/0003-sessoes-e-membros.md) para decisões e limites.
+Em 2026-09-24, `001` a `005` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, ausência de reclamação, falha do provedor e mudança de versão. O E2E de serviços passou no caminho API → BullMQ → Python → PostgreSQL → API com provedor controlado de teste, além de verificar que a página web é servida. A avaliação de qualidade com provedor controlado pontuou os seis casos sintéticos sem chamada paga; veja [ADR 0004](docs/adr/0004-analise-de-avaliacoes.md) e [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md) para decisões e limites. Os resultados finais de lint, build e testes desta entrega são registrados na resposta de encerramento.
 
-Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, extração avaliada por IA, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo passo concreto é a extração de avaliações com IA, usando saída estruturada, evidência literal, versionamento e um conjunto de avaliação rotulado antes de exibir análises no painel.
+Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é conectar uma primeira fonte real de avaliações com proveniência e coleta permitida; depois, rotular uma amostra legítima e medir erros por categoria e evidência antes de usar os insights em tendências.

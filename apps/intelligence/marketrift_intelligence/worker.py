@@ -5,6 +5,7 @@ import signal
 
 from bullmq import Worker
 
+from .analyze import analyze
 from .ingest import ingest, mark_failed
 
 logger = logging.getLogger(__name__)
@@ -21,6 +22,10 @@ async def process(job, _token):
         raise
 
 
+async def process_analysis(job, _token):
+    return await analyze(job.data)
+
+
 async def main() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -30,10 +35,11 @@ async def main() -> None:
         except NotImplementedError:  # Windows event loop
             signal.signal(event, lambda *_: loop.call_soon_threadsafe(stop.set))
     worker = Worker("review-ingest", process, {"connection": os.environ["REDIS_URL"]})
+    analysis_worker = Worker("review-analysis", process_analysis, {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
-        await worker.close()
+        await asyncio.gather(worker.close(), analysis_worker.close())
 
 
 if __name__ == "__main__":

@@ -12,7 +12,7 @@ Gerar Next.js, NestJS e serviço Python. Implementar autenticação, tenant, mem
 
 ## Marco 2 — extração inteligente
 
-As sessões por cookie, os convites manuais, os papéis e a troca de tenant foram antecipados para a continuação do Marco 1 em 2026-09-23. O Marco 2 continua sendo a próxima entrega de código.
+As sessões por cookie, os convites manuais, os papéis e a troca de tenant foram antecipados para a continuação do Marco 1 em 2026-09-23. Em 2026-09-24, a primeira parte do Marco 2 ganhou job versionado, saída Pydantic, evidência literal e testes com provedor controlado. A chamada direta real ao modelo passou com quatro exemplos sintéticos; duas avaliações sintéticas foram concluídas pelo fluxo completo da interface com `gpt-5-nano`. Um avaliador reproduzível e com orçamento foi acrescentado, mas a qualidade em dados reais rotulados por pessoas ainda não foi medida.
 
 Saída estruturada com Pydantic, versão de modelo/prompt, evidência literal, tratamento de falha e avaliação rotulada. Agregados SQL e dashboard de sentimentos/temas. **Entrega:** métricas de qualidade publicadas e cada classificação auditável.
 
@@ -32,6 +32,6 @@ Criar recomendações estratégicas com status de revisão, alegações a verifi
 
 Assinatura e quotas, entrega automática de convites, auditoria, observabilidade, custos, proteção de dados, backups, CI/CD, deploy e demo pública com dados sintéticos. Exercitar incidentes e restauração. **Entrega:** checklist de produto completo aprovado.
 
-## Primeira tarefa de implementação
+## Histórico da primeira tarefa de implementação
 
 Criar apps e implementar o Marco 1 em fatias pequenas: (a) autenticação/tenant, (b) produto/fonte, (c) importação/job, (d) worker/documento, (e) tela de resultado. Faça um teste A/B de isolamento e um teste de retry sem duplicata antes de adicionar LLM. Em paralelo, mantenha [00-escopo-completo.md](00-escopo-completo.md) como contrato do destino final.

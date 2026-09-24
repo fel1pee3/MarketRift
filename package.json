@@ -8,6 +8,9 @@
     "dev:web": "npm run dev -w @marketrift/web",
     "dev:worker": "node --env-file=.env scripts/run-python.mjs worker",
     "dev:intelligence-http": "node --env-file=.env scripts/run-python.mjs http",
+    "eval:analysis:test": "node --env-file=.env scripts/run-python.mjs evaluate test",
+    "eval:analysis:openai": "node --env-file=.env scripts/run-python.mjs quality --provider openai",
+    "eval:quality": "node --env-file=.env scripts/run-python.mjs quality",
     "build": "npm run build -w @marketrift/api && npm run build -w @marketrift/web",
     "lint": "npm run lint -w @marketrift/api && npm run lint -w @marketrift/web",
     "test": "npm run test -w @marketrift/api",
@@ -15,7 +18,8 @@
     "pretest:e2e": "npm run build",
     "test:e2e": "node --env-file=.env scripts/e2e.mjs",
     "db:setup": "node --env-file=.env scripts/setup-db.mjs",
-    "db:migrate:account": "node --env-file=.env scripts/migrate-account.mjs"
+    "db:migrate:account": "node --env-file=.env scripts/migrate-account.mjs",
+    "db:migrate:analysis": "node --env-file=.env scripts/migrate-analysis.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }

@@ -1,0 +1,11 @@
+# ADR 0005: avaliação offline de qualidade e custo da extração
+
+**Status:** implementado em 2026-09-24; apenas o conjunto sintético foi executado nesta entrega. Não há avaliações reais autorizadas e rotuladas no repositório.
+
+- O conjunto `review-quality-dataset-v1` fica em `evalsets/`, separado das tabelas de tenants. Exige proveniência quando disponível, marcação real/sintético, rótulo humano para dados reais, decisão de presença ou insuficiência de evidência, categoria, gravidade e trecho literal. Conjuntos reais e sintéticos não podem ser misturados. O template real é vazio para não inventar dados ou rótulos.
+- O CLI chama o mesmo `extract_review` usado pelo worker e reaplica `validate_extraction`. Nenhuma avaliação do conjunto é escrita no PostgreSQL. A execução padrão usa o provedor controlado; OpenAI exige `--allow-paid`, modelo explícito, máximo de exemplos, orçamento e preços por token fornecidos pelo operador.
+- Para controlar o lote, a avaliação desliga retries e limita tokens de saída. Uma reserva conservadora, baseada em bytes do prompt, schema e texto mais margem e saída máxima, é comparada ao orçamento antes de cada chamada. O relatório separa essa reserva do custo estimado a partir dos tokens informados pelo provedor. A reserva não é uma garantia de teto da fatura.
+- O relatório guarda hash do conjunto, versões do extrator/prompt/schema/taxonomia, modelo, contagens de tokens, custo estimado quando disponível, estado por exemplo, matriz binária de presença e métricas por categoria. Respostas inválidas ou falhas são não pontuadas e contabilizadas separadamente. Evidência literal e concordância com trechos humanos são métricas diferentes; nenhuma delas prova que a descrição seja semanticamente correta. Textos, URLs, citações e mensagens brutas de erro não são exportados.
+- O conjunto sintético cobre seis casos e serve para testar o mecanismo. Medição de qualidade em avaliações reais depende de obter textos legitimamente, revisão humana independente, amostra diversa e análise de erros. Até lá, classificações não sustentam tendências ou alegações sobre fraquezas de concorrentes.
+
+O processo de rotulagem, comandos e fórmulas estão em [evalsets/README.md](../../evalsets/README.md).

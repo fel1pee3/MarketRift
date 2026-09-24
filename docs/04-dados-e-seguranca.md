@@ -1,12 +1,12 @@
 # Banco, isolamento e por que existe o schema SQL
 
-Um schema e o contrato de persistencia: define o que pode ser gravado, quais dados se relacionam e o que o banco recusa. `db/migrations/001_initial.sql` cria as entidades fundamentais; `002_full_product.sql` amplia o modelo para coleta continua, sinais, recomendacoes, alertas, chat, uso e auditoria; `003_first_slice.sql` acrescenta login por senha, fonte manual e marcacao de dados sinteticos; `004_account_security.sql` acrescenta sessoes revogaveis e convites. Migracoes sao versionadas com o codigo e aplicadas em ordem em cada ambiente.
+Um schema e o contrato de persistencia: define o que pode ser gravado, quais dados se relacionam e o que o banco recusa. `db/migrations/001_initial.sql` cria as entidades fundamentais; `002_full_product.sql` amplia o modelo para coleta continua, sinais, recomendacoes, alertas, chat, uso e auditoria; `003_first_slice.sql` acrescenta login por senha, fonte manual e marcacao de dados sinteticos; `004_account_security.sql` acrescenta sessoes revogaveis e convites; `005_review_analysis.sql` acrescenta analises versionadas e multiplos problemas por documento. Migracoes sao versionadas com o codigo e aplicadas em ordem em cada ambiente.
 
 ## Exemplos concretos
 
 - `tenants` representa empresas clientes; `memberships` liga usuarios a empresas com papel.
 - `products` inclui o produto proprio e concorrentes; `sources` liga uma URL a um produto do mesmo tenant.
-- `documents` guarda o texto original, URL, data e chave externa; `insights` guarda extracao estruturada com versao do extrator.
+- `documents` guarda o texto original, URL, data e chave externa; `document_analyses` guarda estado, modelo e versoes; `insights` guarda problemas com trecho literal validado.
 - `imports` e `import_rows` guardam estado e entradas de um CSV pequeno ate o worker processar; o Redis recebe somente IDs.
 - `document_embeddings` guarda vetor **alem do texto**, para encontrar documentos semanticamente proximos. O vetor nao substitui fonte nem permite calcular contagens exatas.
 - `price_observations` e uma serie temporal de precos observados. Mudanca percentual depende de mesmo plano, moeda e periodo comparaveis.
@@ -27,4 +27,4 @@ A migracao escolhe vector(1536) como placeholder de um modelo a definir. Se o mo
 
 ## Ajustes antes de producao
 
-As migracoes 001 a 004 foram aplicadas em PostgreSQL 16 com pgvector no ambiente local em 2026-09-23; testes com dois tenants exerceram RLS em leitura e escrita. A implementacao ainda tera de escolher modelo de embedding, politicas de retencao, armazenamento de capturas e provedor de assinatura. Depois de uma instalacao publica, mudancas devem entrar por novas migracoes. Revisar URLs externas, retencao de texto, licencas/termos da fonte e dados pessoais antes de ativar coleta automatica.
+As migracoes 001 a 005 foram aplicadas em PostgreSQL 16 com pgvector no ambiente local em 2026-09-24; testes com dois tenants exerceram RLS em leitura e escrita. A implementacao ainda tera de escolher modelo de embedding, politicas de retencao, armazenamento de capturas e provedor de assinatura. Depois de uma instalacao publica, mudancas devem entrar por novas migracoes. Revisar URLs externas, retencao de texto, licencas/termos da fonte e dados pessoais antes de ativar coleta automatica ou analise externa.

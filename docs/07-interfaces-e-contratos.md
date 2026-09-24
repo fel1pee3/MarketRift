@@ -11,7 +11,7 @@ Auth/Memberships, Tenants/Subscriptions, Products/Competitors, Sources/Collectio
 | Conta | POST /v1/tenants, POST /v1/memberships/invitations, GET /v1/me |
 | Portfolio | POST/GET /v1/products, POST/GET /v1/topics |
 | Fontes | POST/GET /v1/sources, POST /v1/sources/:id/run, GET /v1/sources/:id/runs |
-| Importacao | POST /v1/imports/reviews, GET /v1/imports/:id |
+| Importacao e documentos | POST /v1/imports/reviews, GET /v1/imports/:id, GET /v1/documents, POST /v1/documents/:id/analyze |
 | Inteligencia | GET /v1/insights/summary, GET /v1/signals, GET /v1/signals/:id/evidence |
 | Mudancas | GET /v1/prices/history, GET /v1/releases |
 | Acao | GET /v1/alerts, PATCH /v1/alerts/:id, GET/PATCH /v1/recommendations/:id |
@@ -22,11 +22,11 @@ Auth/Memberships, Tenants/Subscriptions, Products/Competitors, Sources/Collectio
 
 `collect-source.v1`: tenant_id, source_id, run_id, idempotency_key.
 `ingest-review.v1`: tenant_id, source_id, import_id, idempotency_key (JSON Schema ja incluido).
-`analyze-document.v1`: tenant_id, document_id, extractor_version, idempotency_key.
+`analyze-document.v1`: tenant_id, document_id, extractor_version, idempotency_key (JSON Schema implementado; Python publica apos commit e a API permite reenfileirar).
 `detect-signals.v1`: tenant_id, product_id, window_start/end, detector_version.
 `build-recommendation.v1`: tenant_id, signal_id, generator_version.
 
-Todos possuem version, UUIDs, tamanho maximo, schema JSON compartilhado e um teste de contrato entre produtor TypeScript e worker Python. Nenhum job inclui JWT, chave de API ou texto completo. Contratos ainda nao criados alem do primeiro devem ser implementados junto dos modulos correspondentes.
+Os dois contratos implementados incluem version, UUIDs, limites, schema JSON compartilhado e testes entre produtor TypeScript e consumidor Python. Nenhum job inclui JWT, chave de API ou texto completo. Os demais contratos serao implementados com seus modulos.
 
 ## Servico FastAPI interno
 
