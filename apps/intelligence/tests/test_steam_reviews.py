@@ -114,6 +114,25 @@ def test_timeout_retry_is_bounded():
     assert len(calls) == 3
 
 
+def test_small_negative_only_sampling_uses_official_filter():
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json={"success": 1, "cursor": "next",
+                                         "reviews": [review("77", voted_up=False)]})
+
+    async def collect():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await fetch_reviews(620, None, 1, 20, client, review_type="negative")
+
+    rows, received, pages, _, _, _ = run(collect())
+    assert (len(rows), received, pages) == (1, 1, 1)
+    assert calls[0].url.host == "store.steampowered.com"
+    assert calls[0].url.params["review_type"] == "negative"
+    assert calls[0].url.params["num_per_page"] == "20"
+
+
 def test_invalid_source_and_test_endpoint_guard(monkeypatch):
     assert app_id_from_source("https://store.steampowered.com/app/620/") == 620
     for value in ("https://evil.test/app/620/", "https://store.steampowered.com/appreviews/620",

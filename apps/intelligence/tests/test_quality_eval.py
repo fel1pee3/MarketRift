@@ -186,3 +186,61 @@ def test_usage_and_cost_appear_in_report_and_reservation_stops_next_example(monk
     assert report["run"]["usage_based_estimated_cost_usd"] == 0.0015
     assert report["run"]["stopped"] == "budget_preflight"
     assert report["examples"][1]["status"] == "budget_skipped"
+
+
+def test_outside_taxonomy_is_reported_separately_and_unknown_severity_is_not_scored():
+    outside = {
+        "id": "game-story", "synthetic": True, "case_type": "complaint",
+        "text": "The story ending is disappointing.", "source": {},
+        "labeler": "synthetic-fixture", "rights_basis": None,
+        "gold": {"decision": "problem", "issues": [{"category": "out_of_taxonomy",
+                                                     "outside_topic": "story", "severity": None,
+                                                     "evidence_quote": "story ending is disappointing"}]},
+    }
+    in_scope = {
+        "id": "game-lag", "synthetic": True, "case_type": "complaint",
+        "text": "The controls lag badly.", "source": {},
+        "labeler": "synthetic-fixture", "rights_basis": None,
+        "gold": {"decision": "problem", "issues": [{"category": "performance",
+                                                     "severity": None, "evidence_quote": "controls lag badly"}]},
+    }
+    dataset = EvalDataset.model_validate({"schema_version": "review-quality-dataset-v2",
+                                          "dataset_id": "steam-fixture", "version": "1.0.0",
+                                          "examples": [outside, in_scope]})
+
+    async def fake(text):
+        if text == outside["text"]:
+            return response(("performance", "low", "story ending is disappointing"))
+        return response(("performance", "high", "controls lag badly"))
+
+    report = run(evaluate_quality(dataset, "fixture-hash", EvalSettings("test", "fixture", 2), fake))
+    assert report["metrics"]["outside_only_examples"] == 1
+    assert report["metrics"]["outside_only_forced_into_taxonomy"] == 1
+    assert report["metrics"]["categories"]["performance"]["fp"] == 1
+    assert report["metrics"]["categories"]["performance"]["tp"] == 1
+    assert report["metrics"]["severity_scored_on_aligned"] == 0
+    assert report["metrics"]["severity_accuracy_on_aligned"] is None
+    assert report["examples"][0]["expected_out_of_taxonomy"] is True
+    assert report["examples"][0]["expected_in_scope_decision"] == "no_problem"
+    with pytest.raises(ValidationError, match="dataset v2"):
+        EvalDataset.model_validate({"schema_version": "review-quality-dataset-v1",
+                                    "dataset_id": "steam-fixture", "version": "1.0.0",
+                                    "examples": [outside]})
+
+
+def test_missing_evidence_field_is_distinct_from_invented_quote():
+    dataset, digest = load_dataset(DATASET_PATH)
+    selected = dataset.model_copy(update={"examples": dataset.examples[:2]})
+
+    async def fake(text):
+        if text == selected.examples[0].text:
+            return {"issues": [{"category": "support", "sentiment": "negative",
+                                "severity": "low", "description": "Slow support"}]}
+        return response(("billing", "high", "fabricated literal quote"))
+
+    report = run(evaluate_quality(selected, digest, EvalSettings("test", "fixture", 2), fake))
+    assert report["metrics"]["missing_evidence_responses"] == 1
+    assert report["metrics"]["invalid_evidence_quotes"] == 1
+    assert report["metrics"]["format_failures"] == 0
+    assert report["examples"][0]["status"] == "missing_evidence"
+    assert report["examples"][1]["status"] == "invalid_evidence"

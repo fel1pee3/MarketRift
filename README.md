@@ -134,7 +134,7 @@ Em 2026-09-24, o antigo comando de chamada direta ao OpenAI passou em quatro exe
 
 ### Avaliação reproduzível da qualidade
 
-`evalsets/review-quality.synthetic.v1.json` contém seis casos criados para teste; `evalsets/real.template.json` está vazio porque ainda não há avaliações reais autorizadas e rotuladas por pessoas neste repositório. O avaliador usa o mesmo `extract_review` do worker, não grava nas tabelas dos tenants e exporta somente IDs, rótulos, métricas, versões, tokens e custo estimado, sem texto, URLs ou trechos das avaliações.
+`evalsets/review-quality.synthetic.v1.json` contém seis casos criados para teste; `evalsets/real.template.json` continua vazio. Há agora uma amostra **privada** de reviews Steam reais preparada para rotulagem, mas nenhum rótulo humano foi atribuído nesta entrega. O avaliador usa o mesmo `extract_review` do worker, não grava nas tabelas dos tenants e exporta somente IDs, rótulos, métricas, versões, tokens e custo estimado, sem texto, URLs ou trechos das avaliações.
 
 ```powershell
 npm run eval:quality -- --dataset evalsets/review-quality.synthetic.v1.json --max-examples 6 --output .tmp/quality-synthetic.json
@@ -180,7 +180,34 @@ npm run db:migrate:steam
 
 O E2E usa um servidor Steam simulado local e o provedor controlado de IA; não cobra OpenAI. Uma consulta direta real ao App ID `620` recebeu duas reviews em uma página. Um smoke test adicional consultou e persistiu **uma** review real em um tenant temporário, verificou `synthetic=false` e removeu o tenant e o documento em seguida; nenhum desses textos ficou em tenants de produção. Esses testes verificam acesso e armazenamento, não qualidade da IA nem permissão comercial ampla.
 
-Para medir extração em dados reais, primeiro confirme que pode obter, armazenar e enviar as reviews ao provedor escolhido. Selecione uma amostra diversa de reviews recentes, positivas, negativas e ambíguas, incluindo idiomas diferentes quando couber. Preserve App ID, `recommendationid`, URL da página do produto, datas e texto autorizado; não copie campos de autor. Rotule **antes de ver previsões** em `evalsets/private/reviews-v1.json` seguindo [o guia de avaliação](evalsets/README.md), com decisão de problema, categorias, gravidade e trechos literais. Execute `npm run eval:quality` com limites e orçamento explícitos conforme o guia. Separe métricas Steam das métricas CSV e revise se a taxonomia v1 cobre a amostra. Veja [ADR 0007](docs/adr/0007-steam-user-reviews.md).
+Para medir extração em dados reais, primeiro confirme que pode obter, armazenar e enviar as reviews ao provedor escolhido. A amostra privada atual tem **30 reviews reais distintas do App ID 620**, com 15 recomendações positivas e 15 negativas; contém 14 textos curtos, 13 médios e três longos. Dez reviews distintas estavam nos documentos locais; a preparação consultou mais duas páginas recentes (40 respostas) e uma página com filtro negativo (20 respostas), sem IA. Um App ID associado a dois produtos de teste não gera duas entradas para o mesmo `recommendationid`. A amostra é uma seleção operacional, não representativa do mercado nem prova de que contém 15 problemas. **Rótulos humanos: 0; precisão em dados reais: não medida; custo de IA nesta preparação: USD 0.** Os textos ficam em `evalsets/private/`, ignorado pelo Git.
+
+Na raiz do projeto, os comandos de preparação e validação executados foram:
+
+```powershell
+npm run eval:steam -- sources
+npm run eval:steam -- sample --app-id 620 --limit 30 --fetch-missing --max-pages 2
+npm run eval:steam -- sample --app-id 620 --limit 30 --balance-negative --max-pages 1
+npm run eval:steam -- validate
+```
+
+**A próxima ação manual é rotular três reviews antes de ver previsões.** Confira sua base de uso/envio dos textos e descreva-a com suas palavras. O comando mostra uma review por vez, permite problema, ausência de problema ou evidência insuficiente, múltiplas categorias, tema fora da taxonomia, gravidade quando sustentada e trecho literal. Cada rótulo é salvo; `q` interrompe e a próxima execução retoma. Uma recomendação negativa do Steam não é automaticamente uma reclamação.
+
+```powershell
+npm run eval:steam -- label --labeler human:felipe --rights-basis 'DESCREVA AQUI SUA BASE REAL DE USO E ENVIO' --max-items 3
+npm run eval:steam -- validate
+```
+
+Depois dos três rótulos, confirme que pode enviar os textos ao provedor, consulte as taxas atuais do modelo e preencha os valores solicitados. O comando abaixo configura **um lote pago opcional de no máximo três exemplos**; o opt-in, os limites e a validação do relatório são cobertos por testes, mas **nenhuma chamada paga foi executada nesta entrega**. Se a reserva estimada ultrapassar USD 0,05, o avaliador interrompe antes da próxima chamada e marca `budget_skipped`.
+
+```powershell
+$inputRate = Read-Host 'USD por 1M tokens de entrada (preço atual verificado)'
+$outputRate = Read-Host 'USD por 1M tokens de saida (preço atual verificado)'
+npm run eval:quality -- --dataset evalsets/private/reviews-v1.json --provider openai --model gpt-5-nano --allow-paid --max-examples 3 --max-output-tokens 1024 --budget-usd 0.05 --input-usd-per-million $inputRate --output-usd-per-million $outputRate --output .tmp/quality-steam-3.json
+Get-Content .tmp/quality-steam-3.json
+```
+
+No relatório, confira `run.api_calls_attempted`, `run.stopped`, tokens, `run.usage_based_estimated_cost_usd`, `metrics` e o estado de cada exemplo **antes de ampliar**. O JSON e o terminal separam erros de provedor, formato, evidência ausente/inventada, falsos positivos/negativos por categoria e casos fora da taxonomia; não exportam textos nem URLs. Compare o custo estimado à cobrança real do provedor. Consulte [o guia de avaliação](evalsets/README.md), [ADR 0007](docs/adr/0007-steam-user-reviews.md) e [ADR 0008](docs/adr/0008-amostra-e-rotulagem-steam.md) para interpretar os resultados.
 
 ### Migrações
 
@@ -198,4 +225,4 @@ O código, a documentação e as fixtures sintéticas deste repositório são di
 
 Em 2026-09-24, `001` a `007` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, ausência de reclamação, falha do provedor, mudança de versão e repetição/atualização de Issues e reviews Steam. O E2E de serviços passou no caminho API → BullMQ → Python → PostgreSQL → API com Steam HTTP simulado e provedor controlado de teste, além de verificar que a página web é servida. Ele não automatiza cliques no navegador. A avaliação de qualidade com provedor controlado pontuou os seis casos sintéticos sem chamada paga; veja [ADR 0004](docs/adr/0004-analise-de-avaliacoes.md), [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md), [ADR 0006](docs/adr/0006-github-issues-publicas.md) e [ADR 0007](docs/adr/0007-steam-user-reviews.md) para decisões e limites. Os resultados atuais de lint, build e testes são registrados na resposta de encerramento.
 
-Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco, após teste manual do conector Steam, é rotular e medir a qualidade numa amostra legítima dessas reviews; depois ampliar para plataformas relevantes ao segmento B2B escolhido, mediante condições de coleta verificadas.
+Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é rotular humanamente a amostra privada Steam, medir seus erros com orçamento limitado e decidir se a taxonomia precisa de revisão; depois ampliar para plataformas relevantes ao segmento B2B escolhido, mediante condições de coleta verificadas.

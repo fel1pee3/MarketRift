@@ -6,6 +6,7 @@ import os
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 from urllib.parse import urlparse
 
 import httpx
@@ -75,7 +76,8 @@ def endpoint(app_id: int) -> str:
 
 
 async def fetch_reviews(app_id: int, previous_cursor: str | None, max_pages: int, max_items: int,
-                        client: httpx.AsyncClient) -> tuple[list[SteamReview], int, int, int, bool, str | None]:
+                        client: httpx.AsyncClient, review_type: Literal["all", "positive", "negative"] = "all"
+                        ) -> tuple[list[SteamReview], int, int, int, bool, str | None]:
     previous = datetime.fromisoformat(previous_cursor) if previous_cursor else None
     cutoff = previous - OVERLAP if previous else None
     filter_name = "updated" if previous else "recent"
@@ -87,7 +89,7 @@ async def fetch_reviews(app_id: int, previous_cursor: str | None, max_pages: int
     latest = previous
     complete = False
     for _ in range(max_pages):
-        params = {"json": 1, "filter": filter_name, "language": "all", "review_type": "all",
+        params = {"json": 1, "filter": filter_name, "language": "all", "review_type": review_type,
                   "purchase_type": "all", "num_per_page": min(20, max_items - len(collected)), "cursor": cursor}
         for attempt in range(3):
             try:

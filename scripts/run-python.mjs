@@ -10,8 +10,10 @@ const args = target === 'worker'
       ? ['-m', 'marketrift_intelligence.evaluation', '--provider', process.argv[3]]
     : target === 'quality'
       ? ['-m', 'marketrift_intelligence.quality_cli', ...process.argv.slice(3)]
+    : target === 'steam-eval'
+      ? ['-m', 'marketrift_intelligence.steam_eval_cli', ...process.argv.slice(3)]
     : null;
-if (!args) throw new Error('Expected worker, http, quality or evaluate test');
+if (!args) throw new Error('Expected worker, http, quality, steam-eval or evaluate test');
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const child = spawn(python, args, { env: process.env, stdio: 'inherit' });
 for (const event of ['SIGINT', 'SIGTERM']) process.on(event, () => child.kill());

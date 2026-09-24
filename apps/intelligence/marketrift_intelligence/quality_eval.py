@@ -33,6 +33,7 @@ from .extract import (
 
 Decision = Literal["problem", "no_problem", "insufficient_evidence"]
 Severity = Literal["low", "medium", "high"]
+GoldCategory = Category | Literal["out_of_taxonomy"]
 Extractor = Callable[[str], Awaitable[object]]
 
 
@@ -42,14 +43,27 @@ class Source(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     url: HttpUrl | None = None
     published_at: date | None = None
+    app_id: int | None = Field(default=None, ge=1, le=4294967295)
+    external_id: str | None = Field(default=None, pattern=r"^[1-9][0-9]{0,29}$")
+    language: str | None = Field(default=None, min_length=2, max_length=40)
+    created_at: datetime | None = None
+    updated_at: datetime | None = None
+    voted_up: bool | None = None
 
 
 class GoldIssue(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    category: Category
-    severity: Severity
+    category: GoldCategory
+    severity: Severity | None = None
     evidence_quote: str = Field(min_length=3, max_length=500)
+    outside_topic: str | None = Field(default=None, min_length=2, max_length=120)
+
+    @model_validator(mode="after")
+    def outside_topic_scope(self):
+        if self.outside_topic and self.category != "out_of_taxonomy":
+            raise ValueError("outside_topic requires out_of_taxonomy category")
+        return self
 
 
 class GoldLabel(BaseModel):
@@ -103,7 +117,7 @@ class EvalExample(BaseModel):
 class EvalDataset(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    schema_version: Literal["review-quality-dataset-v1"]
+    schema_version: Literal["review-quality-dataset-v1", "review-quality-dataset-v2"]
     dataset_id: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,79}$")
     version: str = Field(pattern=r"^[0-9]+\.[0-9]+\.[0-9]+$")
     examples: list[EvalExample] = Field(max_length=1000)
@@ -115,6 +129,15 @@ class EvalDataset(BaseModel):
             raise ValueError("duplicate example id")
         if len({example.synthetic for example in self.examples}) > 1:
             raise ValueError("real and synthetic examples require separate datasets")
+        if self.schema_version == "review-quality-dataset-v1" and any(
+            issue.category == "out_of_taxonomy" or issue.severity is None
+            for example in self.examples for issue in example.gold.issues
+        ):
+            raise ValueError("out-of-taxonomy labels and unknown severity require dataset v2")
+        source_keys = [(example.source.app_id, example.source.external_id)
+                       for example in self.examples if example.source.app_id and example.source.external_id]
+        if len(source_keys) != len(set(source_keys)):
+            raise ValueError("duplicate source review")
         return self
 
 
@@ -178,10 +201,10 @@ def _usage(callback) -> tuple[int | None, int | None]:
             sum(item.get("output_tokens", 0) for item in callback.usage_metadata.values()))
 
 
-def _evidence_agreement(example: EvalExample, analysis: ReviewAnalysis) -> tuple[int, int]:
+def _evidence_agreement(example: EvalExample, analysis: ReviewAnalysis) -> tuple[int, int, int]:
     """Count same-category quote containment and severity on one-to-one gold matches."""
     used: set[int] = set()
-    aligned = severity_correct = 0
+    aligned = severity_correct = severity_scored = 0
     for predicted in analysis.issues:
         for index, gold in enumerate(example.gold.issues):
             if index in used or gold.category != predicted.category:
@@ -189,9 +212,11 @@ def _evidence_agreement(example: EvalExample, analysis: ReviewAnalysis) -> tuple
             if predicted.evidence_quote in gold.evidence_quote or gold.evidence_quote in predicted.evidence_quote:
                 used.add(index)
                 aligned += 1
-                severity_correct += predicted.severity == gold.severity
+                if gold.severity is not None:
+                    severity_scored += 1
+                    severity_correct += predicted.severity == gold.severity
                 break
-    return aligned, severity_correct
+    return aligned, severity_correct, severity_scored
 
 
 async def evaluate_quality(
@@ -203,8 +228,9 @@ async def evaluate_quality(
     categories = {name: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for name in CATEGORIES}
     presence = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     rows: list[dict] = []
-    format_failures = invalid_evidence = provider_failures = 0
-    literal_issues = aligned_issues = severity_correct = 0
+    format_failures = missing_evidence = invalid_evidence = provider_failures = 0
+    literal_issues = aligned_issues = severity_correct = severity_scored = 0
+    outside_examples = outside_only = outside_forced = 0
     correct_insufficient = scored = real_calls = 0
     input_total = output_total = 0
     missing_usage = 0
@@ -218,14 +244,20 @@ async def evaluate_quality(
             for skipped in selected[position:]:
                 rows.append({"id": skipped.id, "synthetic": skipped.synthetic,
                              "case_type": skipped.case_type, "expected_decision": skipped.gold.decision,
-                             "expected_categories": sorted({issue.category for issue in skipped.gold.issues}),
+                             "expected_categories": sorted({issue.category for issue in skipped.gold.issues
+                                                            if issue.category in CATEGORIES}),
+                             "expected_out_of_taxonomy": any(issue.category == "out_of_taxonomy"
+                                                             for issue in skipped.gold.issues),
                              "status": "budget_skipped", "tokens": {"input": None, "output": None},
                              "reserved_usd": 0.0, "estimated_cost_usd": None})
             break
         gate_used += reserved
         row = {"id": example.id, "synthetic": example.synthetic, "case_type": example.case_type,
                "expected_decision": example.gold.decision,
-               "expected_categories": sorted({issue.category for issue in example.gold.issues}),
+               "expected_categories": sorted({issue.category for issue in example.gold.issues
+                                              if issue.category in CATEGORIES}),
+               "expected_out_of_taxonomy": any(issue.category == "out_of_taxonomy"
+                                               for issue in example.gold.issues),
                "reserved_usd": float(reserved)}
         if settings.provider == "openai":
             real_calls += 1
@@ -237,7 +269,15 @@ async def evaluate_quality(
                 row.update(status="invalid_evidence", error_code="InvalidEvidence",
                            invalid_evidence_count=error.count)
                 analysis = None
-            except (ValidationError, OutputParserException, TypeError):
+            except ValidationError as error:
+                if error.errors() and all("evidence_quote" in item["loc"] for item in error.errors()):
+                    missing_evidence += 1
+                    row.update(status="missing_evidence", error_code="MissingEvidence")
+                else:
+                    format_failures += 1
+                    row.update(status="invalid_format", error_code="ValidationError")
+                analysis = None
+            except (OutputParserException, TypeError):
                 format_failures += 1
                 row.update(status="invalid_format", error_code="ValidationError")
                 analysis = None
@@ -264,17 +304,26 @@ async def evaluate_quality(
             continue
         scored += 1
         actual = {issue.category for issue in analysis.issues}
-        expected = {issue.category for issue in example.gold.issues}
+        expected = {issue.category for issue in example.gold.issues if issue.category in CATEGORIES}
         row.update(status="scored", predicted_decision="problem" if actual else "no_problem",
+                   expected_in_scope_decision="problem" if expected else "no_problem",
                    predicted_categories=sorted(actual), false_positive_categories=sorted(actual - expected),
                    false_negative_categories=sorted(expected - actual),
                    literal_evidence_count=len(analysis.issues))
+        if row["expected_out_of_taxonomy"]:
+            outside_examples += 1
+            if not expected:
+                outside_only += 1
+                if actual:
+                    outside_forced += 1
         literal_issues += len(analysis.issues)
-        aligned, severity_matches = _evidence_agreement(example, analysis)
+        aligned, severity_matches, severity_eligible = _evidence_agreement(example, analysis)
         row["evidence_aligned_with_gold"] = aligned
         row["severity_correct_on_aligned"] = severity_matches
+        row["severity_scored_on_aligned"] = severity_eligible
         aligned_issues += aligned
         severity_correct += severity_matches
+        severity_scored += severity_eligible
         if example.gold.decision == "insufficient_evidence" and not actual:
             correct_insufficient += 1
         expected_problem, predicted_problem = bool(expected), bool(actual)
@@ -285,8 +334,9 @@ async def evaluate_quality(
                                  "fp" if category in actual else "fn" if category in expected else "tn"] += 1
         rows.append(row)
     return {
-        "report_schema_version": "review-quality-report-v1",
-        "dataset": {"id": dataset.dataset_id, "version": dataset.version, "sha256": dataset_sha256,
+        "report_schema_version": "review-quality-report-v2",
+        "dataset": {"id": dataset.dataset_id, "version": dataset.version,
+                    "schema_version": dataset.schema_version, "sha256": dataset_sha256,
                     "total_examples": len(dataset.examples), "selected_examples": len(selected),
                     "selected_real": sum(not item.synthetic for item in selected),
                     "selected_synthetic": sum(item.synthetic for item in selected)},
@@ -309,13 +359,18 @@ async def evaluate_quality(
                     "unscored_examples": sum(row["status"] not in ("scored", "budget_skipped") for row in rows),
                     "budget_skipped_examples": sum(row["status"] == "budget_skipped" for row in rows),
                     "format_failures": format_failures, "invalid_evidence_quotes": invalid_evidence,
+                    "missing_evidence_responses": missing_evidence,
                     "provider_failures": provider_failures, "problem_presence": _scores(presence),
                     "categories": {name: _scores(counts) for name, counts in categories.items()},
                     "literal_evidence_issues": literal_issues,
                     "evidence_aligned_with_gold": aligned_issues,
                     "evidence_alignment_rate": _ratio(aligned_issues, literal_issues),
                     "severity_correct_on_aligned": severity_correct,
-                    "severity_accuracy_on_aligned": _ratio(severity_correct, aligned_issues),
+                    "severity_scored_on_aligned": severity_scored,
+                    "severity_accuracy_on_aligned": _ratio(severity_correct, severity_scored),
+                    "outside_taxonomy_examples": outside_examples,
+                    "outside_only_examples": outside_only,
+                    "outside_only_forced_into_taxonomy": outside_forced,
                     "insufficient_evidence_correct": correct_insufficient},
         "examples": rows,
     }

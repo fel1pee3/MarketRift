@@ -57,13 +57,18 @@ def render_markdown(report: dict) -> str:
         (f"Usage-based estimated cost USD: {run['usage_based_estimated_cost_usd']}; "
          f"preflight budget reserved USD: {run['preflight_budget_reserved_usd']}; "
          f"budget USD: {run['budget_usd']}"),
-        (f"Problem presence: TP={presence['tp']} FP={presence['fp']} FN={presence['fn']} "
+        (f"In-taxonomy problem presence: TP={presence['tp']} FP={presence['fp']} FN={presence['fn']} "
          f"TN={presence['tn']}; precision={presence['precision']} recall={presence['recall']} F1={presence['f1']}"),
-        (f"Failures: format={metrics['format_failures']}, invalid evidence={metrics['invalid_evidence_quotes']}, "
+        (f"Failures: format={metrics['format_failures']}, missing evidence="
+         f"{metrics['missing_evidence_responses']}, invented evidence="
+         f"{metrics['invalid_evidence_quotes']}, "
          f"provider={metrics['provider_failures']}; unscored={metrics['unscored_examples']}"),
         (f"Evidence aligned with gold: {metrics['evidence_aligned_with_gold']}/"
          f"{metrics['literal_evidence_issues']}; severity correct on aligned: "
-         f"{metrics['severity_correct_on_aligned']}/{metrics['evidence_aligned_with_gold']}"),
+         f"{metrics['severity_correct_on_aligned']}/{metrics['severity_scored_on_aligned']}"),
+        (f"Outside taxonomy (scored): {metrics['outside_taxonomy_examples']}; "
+         f"outside-only: {metrics['outside_only_examples']}; "
+         f"forced into an existing category: {metrics['outside_only_forced_into_taxonomy']}"),
         f"Insufficient-evidence cases correctly left without claims: {metrics['insufficient_evidence_correct']}",
         "",
         "| Category | TP | FP | FN | TN | Precision | Recall | F1 |",
@@ -72,24 +77,28 @@ def render_markdown(report: dict) -> str:
     for name, counts in metrics["categories"].items():
         lines.append(f"| {name} | {counts['tp']} | {counts['fp']} | {counts['fn']} | {counts['tn']} | "
                      f"{counts['precision']} | {counts['recall']} | {counts['f1']} |")
-    lines += ["", ("| Example | Status | Error | Expected | Predicted | FP categories | FN categories | "
+    lines += ["", ("| Example | Status | Error | Expected | Outside taxonomy | Predicted | FP categories | FN categories | "
                    "Tokens in/out | Est. USD |"),
-              "| --- | --- | --- | --- | --- | --- | --- | --- | ---: |"]
+              "| --- | --- | --- | --- | --- | --- | --- | --- | --- | ---: |"]
     for row in report["examples"]:
         tokens = row["tokens"]
         lines.append(f"| {row['id']} | {row['status']} | {row.get('error_code', '')} | "
                      f"{row['expected_decision']} "
                      f"({','.join(row['expected_categories'])}) | "
+                     f"{row['expected_out_of_taxonomy']} | "
                      f"{row.get('predicted_decision', 'unscored')} "
                      f"({','.join(row.get('predicted_categories', []))}) | "
                      f"{','.join(row.get('false_positive_categories', []))} | "
                      f"{','.join(row.get('false_negative_categories', []))} | "
                      f"{tokens['input']}/{tokens['output']} | {row['estimated_cost_usd']} |")
-    lines += ["", ("A category is counted once per scored example. Precision=TP/(TP+FP), "
+    lines += ["", ("Only in-taxonomy problems enter category and presence TP/FP/FN/TN. "
+                   "Outside-only cases are shown separately; an existing-category prediction on one is a forced-category FP. "
+                   "A category is counted once per scored example. Precision=TP/(TP+FP), "
                    "recall=TP/(TP+FN), F1=2TP/(2TP+FP+FN); undefined denominators appear as None. "
                    "Failed extractions are unscored, not silently counted as negatives. "
                    "Evidence alignment requires same category and quote containment with one human gold quote; "
-                   "it does not prove semantic correctness. No review text, URL or quote is exported.")]
+                   "severity is scored only when the human supplied it. Alignment does not prove semantic correctness. "
+                   "No review text, URL or quote is exported.")]
     return "\n".join(lines)
 
 

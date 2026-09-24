@@ -11,6 +11,7 @@
     "eval:analysis:test": "node --env-file=.env scripts/run-python.mjs evaluate test",
     "eval:analysis:openai": "node --env-file=.env scripts/run-python.mjs quality --provider openai",
     "eval:quality": "node --env-file=.env scripts/run-python.mjs quality",
+    "eval:steam": "node --env-file=.env scripts/run-python.mjs steam-eval",
     "build": "npm run build -w @marketrift/api && npm run build -w @marketrift/web",
     "lint": "npm run lint -w @marketrift/api && npm run lint -w @marketrift/web",
     "test": "npm run test -w @marketrift/api",
