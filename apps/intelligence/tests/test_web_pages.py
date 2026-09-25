@@ -54,6 +54,13 @@ def test_local_e2e_transport_is_disabled_without_test_mode(monkeypatch):
         e2e_fetch_public_page("https://example.com/pricing")
 
 
+def test_local_e2e_transport_rejects_real_page_host(monkeypatch):
+    monkeypatch.setenv("MARKETRIFT_TEST_MODE", "1")
+    monkeypatch.setenv("WEB_PAGE_TEST_BASE_URL", "http://127.0.0.1:9876")
+    with pytest.raises(PageError, match="invalid_test_host"):
+        e2e_fetch_public_page("https://www.postgresql.org/docs/release/")
+
+
 def test_redirect_to_internal_or_other_host_never_gets_requested():
     calls = []
 

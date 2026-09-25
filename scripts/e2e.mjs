@@ -299,6 +299,10 @@ try {
   const discussionFirst = await syncDiscussions();
   assert.equal(discussionFirst.documents_new, 1);
   assert.equal(discussionFirst.scan_complete, false);
+  const partialEvidence = await viewer.call('evidence/search?source_type=github_discussion');
+  assert.equal(partialEvidence.status, 200, JSON.stringify(partialEvidence.body));
+  assert.equal(partialEvidence.body.counts[0].count, 1);
+  assert(partialEvidence.body.partial_sources.some(item => item.source_id === discussionSource.body.id));
   const discussionSecond = await syncDiscussions();
   assert.equal(discussionSecond.documents_new, 1);
   assert.equal(discussionSecond.scan_complete, true);
@@ -598,6 +602,83 @@ try {
   assert.equal((await b.call(`documents/${analyzed.id}/analyze`, { method: 'POST' })).status, 404);
   assert.equal((await viewer.call(`documents/${analyzed.id}/analyze`, { method: 'POST' })).status, 403);
 
+  // Evidence queries count identities, not repeated imports or source associations.
+  const sharedSteamSource = await a.call('sources/steam-reviews', { method: 'POST',
+    body: JSON.stringify({ product_id: product.body.id, app: '620' }) });
+  assert.equal(sharedSteamSource.status, 201);
+  const evidenceDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await evidenceDb.connect();
+    await evidenceDb.query(`INSERT INTO marketrift.documents
+      (tenant_id, source_id, document_type, external_key, source_url, source_url_kind,
+       body, published_at, source_created_at, source_updated_at, steam_app_id,
+       review_language, review_voted_up, synthetic)
+      SELECT tenant_id, $1, document_type, external_key, source_url, source_url_kind,
+       body, published_at, source_created_at, source_updated_at, steam_app_id,
+       review_language, review_voted_up, synthetic
+      FROM marketrift.documents WHERE id = $2`, [sharedSteamSource.body.id, steamChanged.id]);
+  } finally { await evidenceDb.end(); }
+
+  const anonymousEvidence = await new Browser().call('evidence/search');
+  assert.equal(anonymousEvidence.status, 401);
+  for (const invalid of ['source_type=other', 'limit=51', 'offset=-1',
+    'from=2026-09-03&to=2026-09-01', `product_id=${encodeURIComponent('bad')}`]) {
+    assert.equal((await viewer.call(`evidence/search?${invalid}`)).status, 400);
+  }
+  assert.equal((await viewer.call('evidence/signals?q=suporte')).status, 400);
+  const allEvidence = await viewer.call('evidence/search?limit=50');
+  assert.equal(allEvidence.status, 200, JSON.stringify(allEvidence.body));
+  assert.equal((await a.call('evidence/search')).status, 200);
+  assert.equal((await admin.call('evidence/search')).status, 200);
+  assert.equal((await analyst.call('evidence/search')).status, 200);
+  assert.equal(allEvidence.body.counts.find(item => item.source_type === 'csv_review').count, 2);
+  assert.equal(allEvidence.body.counts.find(item => item.source_type === 'steam_review').count, 1);
+  assert.equal(allEvidence.body.counts.find(item => item.source_type === 'github_discussion').count, 2);
+  assert.equal(allEvidence.body.ambiguous_total, 1);
+  const sharedReview = allEvidence.body.items.find(item => item.source_type === 'steam_review');
+  assert.equal(sharedReview.association_count, 2);
+  assert.equal(sharedReview.duplicate_rows, 2);
+  assert.equal((await viewer.call(`evidence/search?product_id=${product.body.id}&source_type=steam_review`)).body.total, 1);
+  assert.equal((await viewer.call('evidence/search?source_type=steam_review&limit=1&offset=1')).body.items.length, 0);
+  const filteredEvidence = await viewer.call('evidence/search?from=2026-09-01&to=2026-09-02&q=facilidade');
+  assert.equal(filteredEvidence.status, 200);
+  assert.equal(filteredEvidence.body.counts.find(item => item.source_type === 'csv_review').count, 1);
+  assert.equal(filteredEvidence.body.counts.some(item => item.source_type === 'pricing_page'), false);
+
+  const signalResponse = await analyst.call('evidence/signals');
+  assert.equal(signalResponse.status, 200, JSON.stringify(signalResponse.body));
+  const syntheticCsv = signalResponse.body.review_buckets.find(item => item.source_type === 'csv_review' && item.synthetic);
+  assert.deepEqual([syntheticCsv.total_reviews, syntheticCsv.analyzed_reviews, syntheticCsv.documents_without_analysis], [2, 2, 0]);
+  assert.equal(signalResponse.body.categories.find(item => item.category === 'support').documents_with_problem, 1);
+  assert.equal(signalResponse.body.categories.find(item => item.category === 'price').documents_with_problem, 1);
+  const realSteam = signalResponse.body.review_buckets.find(item => item.source_type === 'steam_review' && !item.synthetic);
+  assert.deepEqual([realSteam.total_reviews, realSteam.analyzed_reviews, realSteam.documents_without_analysis], [1, 0, 1]);
+  assert.equal(signalResponse.body.categories.some(item => item.source_type === 'steam_review'), false);
+  assert.equal(signalResponse.body.page_events.filter(item => item.detail.kind === 'price_observed').length, 1);
+  assert.equal(signalResponse.body.page_events.filter(item => item.detail.kind === 'entry_appeared').length, 1);
+  assert.equal(signalResponse.body.page_events.some(item => item.source_type === 'release_notes'
+    && item.source_url === legacySource.body.url), false);
+  assert.equal(signalResponse.body.page_events.some(item => item.source_type === 'release_notes'
+    && item.source_url === editorialSource.body.url), false);
+  assert.equal((await analyst.call('evidence/signals?source_type=pricing_page')).body.page_events.length, 1);
+
+  const foreignProduct = await b.call('products', { method: 'POST',
+    body: JSON.stringify({ name: 'Foreign Test Product', kind: 'competitor' }) });
+  const foreignSource = await b.call('sources', { method: 'POST',
+    body: JSON.stringify({ product_id: foreignProduct.body.id, url: 'https://example.invalid/foreign' }) });
+  assert.equal(foreignSource.status, 201);
+  const foreignCsv = `external_key,source_url,published_at,body,synthetic\nforeign-${suffix},https://example.invalid/foreign/${suffix},2026-09-01T10:00:00Z,Foreign tenant only.,true\n`;
+  const foreignForm = new FormData();
+  foreignForm.append('source_id', foreignSource.body.id);
+  foreignForm.append('file', new Blob([foreignCsv], { type: 'text/csv' }), 'foreign.csv');
+  const foreignImport = await b.call('imports/reviews', { method: 'POST', body: foreignForm });
+  assert.equal(foreignImport.status, 201);
+  await waitForImport(b, foreignImport.body.id);
+  assert.equal((await b.call('evidence/search')).body.total, 1);
+  assert.equal((await a.call('evidence/search?q=Foreign%20tenant%20only')).body.total, 0);
+  assert.equal((await b.call(`evidence/search?product_id=${competitor.body.id}`)).body.total, 0);
+  assert.equal((await b.call('evidence/signals')).body.page_events.length, 0);
+
   const members = await a.call('members');
   const viewerId = members.body.find(member => member.email === viewerEmail).user_id;
   const adminId = members.body.find(member => member.email === adminEmail).user_id;
@@ -639,12 +720,13 @@ try {
   assert.equal((await viewer.call('auth/logout', { method: 'POST', withoutCsrf: true })).status, 403);
   assert.equal((await viewer.call('auth/logout', { method: 'POST' })).status, 204);
   assert.equal((await viewer.call('auth/session')).status, 401);
+  assert.equal((await viewer.call('evidence/search')).status, 401);
   const relogin = await viewer.call('auth/login', { method: 'POST', body: JSON.stringify({ email: viewerEmail, password }) });
   assert.equal(relogin.status, 200);
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV, Steam, GitHub Discussions GraphQL, pages, schedulers, retries, conservative interpretation and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, CSV, Steam, GitHub Discussions GraphQL, pages, evidence, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;

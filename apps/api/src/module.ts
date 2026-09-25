@@ -4,6 +4,7 @@ import { Db } from './db';
 import { Jobs } from './queue';
 import { Accounts, AccountsController } from './accounts';
 import { WebPagesController } from './web-pages';
+import { EvidenceController } from './evidence';
 
-@Module({ controllers: [ApiController, AccountsController, WebPagesController], providers: [Db, Jobs, Accounts] })
+@Module({ controllers: [ApiController, AccountsController, WebPagesController, EvidenceController], providers: [Db, Jobs, Accounts] })
 export class AppModule {}

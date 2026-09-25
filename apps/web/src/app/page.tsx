@@ -1,6 +1,7 @@
 'use client';
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
+import EvidencePanel from './EvidencePanel';
 
 type Role = 'owner' | 'admin' | 'analyst' | 'viewer';
 type Tenant = { tenant_id: string; name: string; role: Role };
@@ -51,6 +52,7 @@ const pageErrorReasons: Record<string, string> = {
   no_extractable_content: 'Não há conteúdo textual utilizável.', network_failure: 'Falha de rede.',
   worker_timeout: 'O worker não concluiu a verificação no tempo esperado.',
   monitor_paused: 'A verificação agendada foi cancelada porque a monitoração foi pausada.',
+  invalid_test_host: 'Um worker em modo de teste tentou verificar uma página real. Reinicie o worker sem MARKETRIFT_TEST_MODE e WEB_PAGE_TEST_BASE_URL; a captura anterior foi preservada.',
 };
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const categoryNames: Record<string, string> = {
@@ -204,6 +206,7 @@ export default function Home() {
             {session.tenants.map(tenant => <option key={tenant.tenant_id} value={tenant.tenant_id}>{tenant.name} ({tenant.role})</option>)}
           </select></label><button disabled={busy}>Trocar empresa</button></form>}
         </section>
+        <EvidencePanel key={session.tenant_id} products={products} />
         <section className="card"><h2>Produtos</h2><p>Cadastre o produto próprio e concorrentes.</p>
           <form onSubmit={event => void run(async () => {
             const data = formValues(event); const form = event.currentTarget;
