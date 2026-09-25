@@ -12,12 +12,12 @@ type SourceRun = { id: string; source_id: string; status: string; documents_seen
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
 type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
-type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null };
-type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null };
-type PagePlan = { name: string; amount: string; currency: string; period: string | null; conditions: string; confirmed: boolean; evidence: string };
+type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
+type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null; trigger_kind: 'manual' | 'scheduled' };
+type PagePlan = { name: string; amount: string | null; currency: string | null; period: string | null; conditions: string; confirmed: boolean; evidence: string };
 type PageEntry = { title: string; date: string | null; url: string; evidence: string };
-type PageExtract = { kind: string; text: string; status: 'structured' | 'unconfirmed'; excerpt: string; plans?: PagePlan[]; entries?: PageEntry[] };
-type PageSnapshot = { id: string; source_id: string; version_no: number; final_url: string; content_sha256: string; normalized_text: string; extracted: PageExtract; fetched_at: string };
+type PageExtract = { kind: string; text: string; status: string; reason?: string; excerpt: string; plans?: PagePlan[]; entries?: PageEntry[] };
+type PageSnapshot = { id: string; source_id: string; version_no: number; final_url: string; content_sha256: string; normalized_text: string; extracted: PageExtract; fetched_at: string; interpretation_version: number | null; interpretation_status: string; interpretation_reason: string };
 type PageDetail = { kind: string; name?: string; previous?: string | PagePlan | PageEntry | null; current?: string | PagePlan | PageEntry | null; percent_change?: string | null };
 type PageChange = { id: string; source_id: string; previous_snapshot_id: string; current_snapshot_id: string; change_details: PageDetail[]; detected_at: string };
 type PageData = { sources: PageSource[]; runs: PageRun[]; snapshots: PageSnapshot[]; changes: PageChange[] };
@@ -28,6 +28,30 @@ function pageEvidence(value: PageDetail['previous']): string {
   if ('amount' in value) return `${value.name}: ${value.currency} ${value.amount} / ${value.period ?? 'período não confirmado'}. Condições: ${value.conditions}. Trecho: “${value.evidence}”`;
   return `${value.title}${value.date ? ` · ${value.date}` : ''}. Trecho: “${value.evidence}”`;
 }
+const interpretationStatus: Record<string, string> = {
+  confirmed: 'confirmada', partial: 'parcialmente confirmada', unconfirmed: 'não confirmada',
+  needs_review: 'precisa de revisão',
+};
+const interpretationReasons: Record<string, string> = {
+  legacy_extractor_requires_review: 'Captura anterior às regras atuais; a interpretação antiga não foi validada.',
+  release_context_missing: 'A página não se identifica como changelog ou notas de versão.',
+  release_entries_missing: 'Nenhuma entrada de alteração de produto foi encontrada.',
+  release_link_or_title_missing: 'Faltou título, evidência de alteração ou link específico da entrada.',
+  some_release_entries_unconfirmed: 'Algumas entradas não têm evidência completa.',
+  release_entries_confirmed: 'Entradas com contexto de release e links específicos.',
+  pricing_context_missing: 'A página não se identifica como página de preços.',
+  price_fields_missing: 'Plano, valor, moeda ou período não estão explícitos.',
+  some_plans_unconfirmed: 'Alguns planos não têm todos os campos explícitos.',
+  price_plans_confirmed: 'Planos com valor, moeda e período explícitos.',
+};
+const pageErrorReasons: Record<string, string> = {
+  access_denied: 'A origem recusou o acesso.', robots_disallowed: 'A origem não permite esta coleta em robots.txt.',
+  robots_unavailable: 'Não foi possível confirmar as regras de robots.txt.',
+  rate_limited: 'A origem limitou as requisições.', not_found: 'A página não foi encontrada.',
+  no_extractable_content: 'Não há conteúdo textual utilizável.', network_failure: 'Falha de rede.',
+  worker_timeout: 'O worker não concluiu a verificação no tempo esperado.',
+  monitor_paused: 'A verificação agendada foi cancelada porque a monitoração foi pausada.',
+};
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const categoryNames: Record<string, string> = {
   support: 'Suporte', price: 'Preço', billing: 'Cobrança', performance: 'Desempenho',
@@ -50,7 +74,13 @@ async function api<T>(path: string, session: Session | null, init: RequestInit =
   if (session && init.method && !['GET', 'HEAD'].includes(init.method)) headers.set('X-CSRF-Token', session.csrf_token);
   const response = await fetch(`${base}/v1/${path}`, { ...init, headers, credentials: 'include', cache: 'no-store' });
   const body = response.status === 204 ? null : await response.json();
-  if (!response.ok) throw new ApiError(Array.isArray(body?.message) ? body.message.join(', ') : body?.message ?? 'Falha na API', response.status);
+  if (!response.ok) {
+    const message = Array.isArray(body?.message) ? body.message.join(', ') : body?.message ?? 'Falha na API';
+    const friendly = response.status === 409 && path.startsWith('page-sources/') ?
+      message.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g,
+        (value: string) => new Date(value).toLocaleString('pt-BR')) : message;
+    throw new ApiError(friendly, response.status);
+  }
   return body as T;
 }
 
@@ -266,7 +296,7 @@ export default function Home() {
           })}</ul>
         </section>
         <section className="card wide"><h2>Páginas de preços e changelogs</h2>
-          <p>Verificação manual de uma página pública por vez. A periodicidade desejada fica registrada; o agendamento automático ainda não está ativo. Não há análise por IA neste fluxo.</p>
+          <p>A monitoração inicia automaticamente após o cadastro e segue a periodicidade escolhida enquanto o agendador estiver ligado. Você também pode pedir uma verificação manual. Capturar uma página não confirma que ela contém preços ou notas de versão. Não há análise por IA neste fluxo.</p>
           <form onSubmit={event => void run(async () => {
             const data = formValues(event); const form = event.currentTarget;
             await api('page-sources', session, { method: 'POST', body: JSON.stringify({
@@ -285,24 +315,33 @@ export default function Home() {
               .sort((a, b) => b.version_no - a.version_no);
             const changes = pageData.changes.filter(change => change.source_id === source.id);
             return <li key={source.id}><strong>{source.product_name}</strong> · {source.source_type === 'pricing_page' ? 'Preços' : 'Changelog'} · <a href={source.url} target="_blank" rel="noreferrer">Página cadastrada ↗</a>
-              <p>Última verificação concluída: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'} · periodicidade desejada: {source.check_interval_minutes} min.</p>
-              {latest && <p>Execução: <strong>{latest.status}</strong> · novo snapshot: {latest.documents_new ? 'sim' : 'não'}
-                {latest.error_code && <> · motivo: {latest.error_code}</>}
+              <p>Monitoração: <strong>{source.monitoring_enabled ? 'ativa' : 'pausada'}</strong> · periodicidade: {source.check_interval_minutes} min. · última verificação concluída: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'} · próxima prevista: {source.monitoring_enabled && source.next_check_at ? new Date(source.next_check_at).toLocaleString('pt-BR') : 'não agendada'}</p>
+              {latest && <p>Execução {latest.trigger_kind === 'scheduled' ? 'automática' : 'manual'}: <strong>{latest.status}</strong> · novo snapshot: {latest.documents_new ? 'sim' : 'não'}
+                {latest.error_code && <> · motivo: {pageErrorReasons[latest.error_code] ?? latest.error_code}</>}
                 {latest.retry_after_at && <> · aguarde até {new Date(latest.retry_after_at).toLocaleString('pt-BR')}</>}</p>}
-              {session.role !== 'viewer' && <button className="small" disabled={busy || latest?.status === 'running'} onClick={() => void run(async () => {
+              {canManage && <button className="small" disabled={busy} onClick={() => void run(async () => {
+                await api(`page-sources/${source.id}/${source.monitoring_enabled ? 'pause' : 'resume'}`, session, { method: 'POST' }); await refresh(session);
+              })}>{source.monitoring_enabled ? 'Pausar monitoração' : 'Reativar monitoração'}</button>}
+              {session.role !== 'viewer' && <button className="small" disabled={busy || latest?.status === 'running' || latest?.status === 'pending'} onClick={() => void run(async () => {
                 await api(`page-sources/${source.id}/check`, session, { method: 'POST' }); await refresh(session);
               })}>Verificar agora (1 página)</button>}
               {snapshots.length > 0 && <div className="page-history"><h3>Capturas verificáveis</h3><ul>{snapshots.slice(0, 5).map(snapshot => <li key={snapshot.id}>
                 Versão {snapshot.version_no} · {new Date(snapshot.fetched_at).toLocaleString('pt-BR')} · hash <code>{snapshot.content_sha256.slice(0, 12)}</code> · <a href={snapshot.final_url} target="_blank" rel="noreferrer">URL final ↗</a>
-                {snapshot.extracted.status === 'unconfirmed' && <p><strong>Não confirmado:</strong> {snapshot.extracted.excerpt}</p>}
-                {snapshot.extracted.plans?.map(plan => <p key={plan.name}><strong>{plan.name}</strong>: {plan.confirmed ? `${plan.currency} ${plan.amount} / ${plan.period}` : 'não confirmado'} · trecho: “{plan.evidence}”</p>)}
-                {snapshot.extracted.entries?.map((entry, index) => <p key={`${entry.url}-${index}`}><strong>{entry.title}</strong> · {entry.date ?? 'data não informada'} · <a href={entry.url} target="_blank" rel="noreferrer">entrada ↗</a></p>)}
+                <p>Interpretação: <strong>{interpretationStatus[snapshot.interpretation_status] ?? snapshot.interpretation_status}</strong> · {interpretationReasons[snapshot.interpretation_reason] ?? snapshot.interpretation_reason}</p>
+                {snapshot.interpretation_status === 'needs_review' ? <p>Trecho histórico para revisão: “{snapshot.extracted.excerpt}”</p> : <>
+                  {snapshot.interpretation_status !== 'confirmed' && <p>Trecho da página: “{snapshot.extracted.excerpt}”</p>}
+                  {snapshot.extracted.plans?.map(plan => <p key={plan.name}><strong>{plan.name}</strong>: {plan.confirmed ? `${plan.currency} ${plan.amount} / ${plan.period}` : 'preço não confirmado'} · trecho: “{plan.evidence}”</p>)}
+                  {snapshot.extracted.entries?.map((entry, index) => <p key={`${entry.url}-${index}`}><strong>{entry.title}</strong> · {entry.date ?? 'data não informada'} · <a href={entry.url} target="_blank" rel="noreferrer">entrada confirmada ↗</a></p>)}
+                </>}
               </li>)}</ul></div>}
               {changes.length > 0 && <div className="page-history"><h3>Mudanças observadas</h3>{changes.slice(0, 5).map(change => <article key={change.id}>
                 <p>{new Date(change.detected_at).toLocaleString('pt-BR')} · versões {snapshots.find(item => item.id === change.previous_snapshot_id)?.version_no ?? '?'} → {snapshots.find(item => item.id === change.current_snapshot_id)?.version_no ?? '?'}.
                   <a href={snapshots.find(item => item.id === change.previous_snapshot_id)?.final_url ?? source.url} target="_blank" rel="noreferrer"> URL anterior ↗</a> ·
                   <a href={snapshots.find(item => item.id === change.current_snapshot_id)?.final_url ?? source.url} target="_blank" rel="noreferrer"> URL atual ↗</a></p>
-                {change.change_details.map((detail, index) => <div key={index}><strong>{detail.kind}</strong>{detail.name && <> · {detail.name}</>}{detail.percent_change !== null && detail.percent_change !== undefined && <> · variação comparável: {detail.percent_change}%</>}
+                {snapshots.find(item => item.id === change.previous_snapshot_id)?.interpretation_status === 'needs_review' ||
+                 snapshots.find(item => item.id === change.current_snapshot_id)?.interpretation_status === 'needs_review' ?
+                  <p>Comparação histórica anterior às regras atuais. Revise os textos das duas capturas; os campos estruturados antigos não são considerados confirmados.</p> :
+                  change.change_details.map((detail, index) => <div key={index}><strong>{detail.kind}</strong>{detail.name && <> · {detail.name}</>}{detail.percent_change !== null && detail.percent_change !== undefined && <> · variação comparável: {detail.percent_change}%</>}
                   <p>Antes: {pageEvidence(detail.previous)}</p><p>Depois: {pageEvidence(detail.current)}</p></div>)}
               </article>)}</div>}
             </li>;

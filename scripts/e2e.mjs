@@ -18,6 +18,8 @@ let steamUpdated = 1780000000;
 let steamVotedUp = false;
 const steamRequests = [];
 let pagePrice = '10';
+let releaseVersion = 1;
+let flakyAttempts = 0;
 const pageRequests = [];
 const steamMock = createServer((request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1');
@@ -27,6 +29,30 @@ const steamMock = createServer((request, response) => {
     if (url.pathname === '/web-page/pricing') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end(`<main><section class="plan"><h2>Pro</h2><p>USD ${pagePrice} per month</p><p>API access</p></section><footer>Updated today</footer></main>`);
+      return;
+    }
+    if (url.pathname === '/web-page/changelog') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end(`<main><h1>Changelog</h1><article><h2>Version ${releaseVersion}</h2>`
+        + `<time datetime="2026-09-24">24 Sep</time><a href="/releases/${releaseVersion}">Details</a>`
+        + `<p>Fixed product sync in version ${releaseVersion}.</p></article></main>`);
+      return;
+    }
+    if (url.pathname === '/web-page/changelog-flaky') {
+      flakyAttempts += 1;
+      if (flakyAttempts === 1) {
+        response.writeHead(503, { 'Retry-After': '1' }); response.end(); return;
+      }
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<main><h1>Changelog</h1><article><h2>Version 1</h2>'
+        + '<a href="/releases/1">Details</a><p>Fixed sync.</p></article></main>');
+      return;
+    }
+    if (url.pathname === '/web-page/') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<main><h1>Perspectives</h1><article><h2>AI in banking</h2>'
+        + '<a href="/insights/ai">Read more</a><p>Author: Alex. Read more about trends.</p>'
+        + '</article></main>');
       return;
     }
     response.writeHead(404); response.end(); return;
@@ -64,6 +90,16 @@ const cleanupEmails = [];
 for (const child of children) {
   child.stderr.on('data', chunk => { errors += String(chunk); });
   child.on('error', error => { errors += String(error); });
+}
+function launchScheduler() {
+  const schedulerProcess = spawn(process.execPath, ['apps/api/dist/page-scheduler-main.js'], {
+    env: { ...childEnv, MARKETRIFT_TEST_MODE: '1', PAGE_SCHEDULER_TEST_POLL_MS: '200' },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  schedulerProcess.stderr.on('data', chunk => { errors += String(chunk); });
+  schedulerProcess.on('error', error => { errors += String(error); });
+  children.push(schedulerProcess);
+  return schedulerProcess;
 }
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -131,6 +167,16 @@ async function waitForPageRun(browser, id) {
     await delay(200);
   }
   throw new Error(`Page check did not complete: ${errors}`);
+}
+async function waitForScheduledPageRun(browser, sourceId, count) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = await browser.call('page-sources');
+    const runs = result.body.runs.filter(item => item.source_id === sourceId && item.trigger_kind === 'scheduled');
+    if (runs.some(item => item.status === 'failed')) throw new Error(`Scheduled check failed: ${JSON.stringify(runs)}`);
+    if (runs.filter(item => item.status === 'succeeded').length >= count) return result.body;
+    await delay(200);
+  }
+  throw new Error(`Scheduled page check did not complete: ${errors}`);
 }
 
 try {
@@ -289,7 +335,9 @@ try {
   const pageFirst = await checkPage();
   assert.equal(pageFirst.snapshots.filter(item => item.source_id === pageSource.body.id).length, 1);
   assert.equal(pageFirst.changes.filter(item => item.source_id === pageSource.body.id).length, 0);
-  assert.equal((await analyst.call(`page-sources/${pageSource.body.id}/check`, { method: 'POST' })).status, 409);
+  const tooSoon = await analyst.call(`page-sources/${pageSource.body.id}/check`, { method: 'POST' });
+  assert.equal(tooSoon.status, 409);
+  assert.match(tooSoon.body.message, /Aguarde o intervalo mínimo.*Tente novamente após/);
   async function clearPageCooldown() {
     const client = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
     try {
@@ -310,6 +358,146 @@ try {
   assert.equal(priceChange.change_details[0].percent_change, '20.00');
   assert.equal(pageRequests.filter(path => path === '/web-page/pricing').length, 3);
   assert.equal((await b.call('page-sources')).body.changes.length, 0);
+
+  const legacySource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'release_notes',
+    url: 'https://example.com/legacy', check_interval_minutes: 1440,
+  }) });
+  assert.equal(legacySource.status, 201);
+  assert.equal((await a.call(`page-sources/${legacySource.body.id}/pause`, { method: 'POST' })).status, 200);
+  const legacyDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await legacyDb.connect();
+    const previousId = randomUUID(); const currentId = randomUUID();
+    for (const [index, runId] of [previousId, currentId].entries()) {
+      await legacyDb.query("INSERT INTO marketrift.source_runs "
+        + "(id, tenant_id, source_id, status, run_kind, started_at, finished_at) "
+        + "VALUES ($1, $2, $3, 'succeeded', 'web_page', now() - interval '2 minutes', now() - interval '2 minutes')",
+      [runId, registeredA.body.tenant_id, legacySource.body.id]);
+      const oldJson = { kind: 'release_notes', text: `Editorial article ${index}`, status: 'structured',
+        excerpt: `Editorial article ${index}`, entries: [{ title: 'Editorial article', url: 'https://example.com/legacy' }] };
+      await legacyDb.query("INSERT INTO marketrift.source_snapshots "
+        + "(tenant_id, source_id, run_id, source_url, storage_key, content_sha256, "
+        + "version_no, final_url, normalized_text, extracted) "
+        + "VALUES ($1, $2, $3, 'https://example.com/legacy', $4, $5, $6, "
+        + "'https://example.com/legacy', $7, $8::jsonb)",
+      [registeredA.body.tenant_id, legacySource.body.id, runId, `legacy:${index}`, String(index).repeat(64),
+        index + 1, oldJson.text, JSON.stringify(oldJson)]);
+    }
+    const ids = await legacyDb.query("SELECT id FROM marketrift.source_snapshots WHERE tenant_id = $1 "
+      + 'AND source_id = $2 ORDER BY version_no', [registeredA.body.tenant_id, legacySource.body.id]);
+    await legacyDb.query("INSERT INTO marketrift.page_changes "
+      + "(tenant_id, source_id, previous_snapshot_id, current_snapshot_id, change_details) "
+      + "VALUES ($1, $2, $3, $4, '[{\"kind\":\"entry_appeared\"}]'::jsonb)",
+    [registeredA.body.tenant_id, legacySource.body.id, ids.rows[0].id, ids.rows[1].id]);
+  } finally { await legacyDb.end(); }
+  const oldApi = (await a.call('page-sources')).body;
+  const oldSnapshot = oldApi.snapshots.find(item => item.source_id === legacySource.body.id);
+  assert.equal(oldSnapshot.interpretation_status, 'needs_review');
+  assert.equal(oldSnapshot.extracted.entries, undefined);
+  assert.equal(oldApi.changes.find(item => item.source_id === legacySource.body.id).change_details[0].kind,
+    'legacy_interpretation_requires_review');
+
+  const autoSource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'release_notes',
+    url: 'https://example.com/changelog', check_interval_minutes: 60,
+  }) });
+  assert.equal(autoSource.status, 201, JSON.stringify(autoSource.body));
+  assert.equal(autoSource.body.monitoring_enabled, true);
+  assert.equal((await viewer.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' })).status, 403);
+  assert.equal((await analyst.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' })).status, 403);
+  assert.equal((await b.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' })).status, 404);
+  const schedulerA = launchScheduler();
+  const schedulerB = launchScheduler();
+  const scheduledFirst = await waitForScheduledPageRun(a, autoSource.body.id, 1);
+  assert.equal(scheduledFirst.runs.filter(item => item.source_id === autoSource.body.id).length, 1);
+  assert.equal(scheduledFirst.snapshots.find(item => item.source_id === autoSource.body.id).interpretation_status, 'confirmed');
+  assert.equal((await b.call('page-sources')).body.sources.length, 0);
+  await delay(800);
+  assert.equal((await a.call('page-sources')).body.runs.filter(item => item.source_id === autoSource.body.id).length, 1);
+  schedulerA.kill(); schedulerB.kill();
+  async function advanceScheduledClock() {
+    const client = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+    try {
+      await client.connect();
+      await client.query("UPDATE marketrift.source_runs SET started_at = now() - interval '2 minutes', "
+        + "finished_at = now() - interval '2 minutes' WHERE tenant_id = $1 AND source_id = $2 "
+        + "AND run_kind = 'web_page' AND status = 'succeeded'",
+      [registeredA.body.tenant_id, autoSource.body.id]);
+      await client.query("UPDATE marketrift.sources SET next_check_at = now() - interval '1 second' "
+        + 'WHERE tenant_id = $1 AND id = $2', [registeredA.body.tenant_id, autoSource.body.id]);
+    } finally { await client.end(); }
+  }
+  await advanceScheduledClock();
+  launchScheduler();
+  const scheduledSecond = await waitForScheduledPageRun(a, autoSource.body.id, 2);
+  assert.equal(scheduledSecond.snapshots.filter(item => item.source_id === autoSource.body.id).length, 1);
+  assert.equal(scheduledSecond.runs.filter(item => item.source_id === autoSource.body.id).length, 2);
+
+  const paused = await admin.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' });
+  assert.equal(paused.status, 200);
+  assert.equal(paused.body.monitoring_enabled, false);
+  await delay(800);
+  assert.equal((await a.call('page-sources')).body.runs.filter(item => item.source_id === autoSource.body.id).length, 2);
+
+  const editorialSource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'release_notes',
+    url: 'https://example.com/', check_interval_minutes: 60,
+  }) });
+  assert.equal(editorialSource.status, 201);
+  const editorialResult = await waitForScheduledPageRun(a, editorialSource.body.id, 1);
+  const editorialSnapshot = editorialResult.snapshots.find(item => item.source_id === editorialSource.body.id);
+  assert.equal(editorialSnapshot.interpretation_status, 'unconfirmed');
+  assert.equal(editorialSnapshot.interpretation_reason, 'release_context_missing');
+  assert.deepEqual(editorialSnapshot.extracted.entries, []);
+
+  await advanceScheduledClock();
+  releaseVersion = 2;
+  const resumed = await a.call(`page-sources/${autoSource.body.id}/resume`, { method: 'POST' });
+  assert.equal(resumed.status, 200);
+  assert.equal(resumed.body.monitoring_enabled, true);
+  const scheduledThird = await waitForScheduledPageRun(a, autoSource.body.id, 3);
+  assert.equal(scheduledThird.snapshots.filter(item => item.source_id === autoSource.body.id).length, 2);
+  const releaseChange = scheduledThird.changes.find(item => item.source_id === autoSource.body.id);
+  assert(releaseChange.change_details.some(item => item.kind === 'entry_appeared'));
+  assert.equal(pageRequests.filter(path => path === '/web-page/changelog').length, 3);
+
+  const flakySource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'release_notes',
+    url: 'https://example.com/changelog-flaky', check_interval_minutes: 60,
+  }) });
+  assert.equal(flakySource.status, 201);
+  let flakyFailed;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = (await a.call('page-sources')).body;
+    const failed = result.runs.find(item => item.source_id === flakySource.body.id && item.status === 'failed');
+    if (failed) { flakyFailed = { run: failed, source: result.sources.find(item => item.id === flakySource.body.id) }; break; }
+    await delay(200);
+  }
+  assert.equal(flakyFailed?.run.error_code, 'rate_limited');
+  assert(new Date(flakyFailed.source.next_check_at).getTime() > Date.now() + 4 * 60_000);
+  assert.equal(flakyAttempts, 1);
+  const retryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await retryDb.connect();
+    await retryDb.query("UPDATE marketrift.source_runs SET started_at = now() - interval '2 minutes', "
+      + "finished_at = CASE WHEN finished_at IS NOT NULL THEN now() - interval '2 minutes' ELSE NULL END, "
+      + "retry_after_at = CASE WHEN retry_after_at IS NOT NULL THEN now() - interval '2 minutes' ELSE NULL END "
+      + "WHERE tenant_id = $1 AND run_kind = 'web_page'",
+    [registeredA.body.tenant_id]);
+    await retryDb.query("UPDATE marketrift.sources SET next_check_at = now() - interval '1 second' "
+      + 'WHERE tenant_id = $1 AND id = $2', [registeredA.body.tenant_id, flakySource.body.id]);
+  } finally { await retryDb.end(); }
+  let flakyRecovered;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = (await a.call('page-sources')).body;
+    const runs = result.runs.filter(item => item.source_id === flakySource.body.id);
+    if (runs.length === 2 && runs.some(item => item.status === 'succeeded')) { flakyRecovered = result; break; }
+    await delay(200);
+  }
+  assert(flakyRecovered, 'Transient source did not retry after its due time');
+  assert.equal(flakyAttempts, 2);
+  assert.equal(flakyRecovered.sources.find(item => item.id === flakySource.body.id).consecutive_failures, 0);
 
   const externalKey = `synthetic-${suffix}`;
   const positiveKey = `positive-${suffix}`;
@@ -389,7 +577,7 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV, Steam and page checks through queue/worker, page dedup/change evidence, tenant isolation');
+  console.log('E2E passed: sessions, RBAC, CSV, Steam, manual pages, two schedulers, restart, pause/resume, retry/backoff, conservative interpretation and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;

@@ -33,6 +33,14 @@ PRICE = re.compile(r"(?<!\w)(USD|BRL|EUR|GBP|R\$|€|£)\s*(\d+(?:[.,]\d{1,2})?)
 PERIOD = re.compile(r"(?:\b(?:per\s+month|monthly|mensal|por\s+m[eê]s|"
                     r"per\s+year|yearly|annually|anual|por\s+ano)\b|/(?:month|mo|m[eê]s|year)\b)",
                     re.IGNORECASE)
+RELEASE_CONTEXT = re.compile(r"(?:changelog|release[-_/ ]?notes?|version[-_/ ]?history|"
+                             r"notas? de vers[aã]o|hist[oó]rico de vers[oõ]es)", re.IGNORECASE)
+RELEASE_EVIDENCE = re.compile(r"(?:\b(?:release|version|v\d+(?:\.\d+)*|fixed|added|improved|"
+                              r"changed|shipped|corrigid[oa]|adicionad[oa]|lan[cç]ad[oa]|"
+                              r"atualizad[oa])\b)", re.IGNORECASE)
+PRICING_CONTEXT = re.compile(r"(?:pricing|prices|plans?[-_/ ]?(?:and[-_/ ]?)?pricing|"
+                             r"pre[cç]os?|planos?)", re.IGNORECASE)
+EXTRACTOR_VERSION = 2
 
 
 class PageError(Exception):
@@ -280,28 +288,53 @@ def page_content(html: str, kind: str, final_url: str) -> dict:
     text = ("\n".join(blocks) if blocks else node_text(root))[:MAX_TEXT]
     if len(text.strip()) < 10:
         raise PageError("no_extractable_content")
-    result: dict = {"kind": kind, "text": text, "status": "unconfirmed", "excerpt": text[:500]}
+    heading = next(descendants(root, "h1"), None)
+    context = (urlsplit(final_url).path + " " + (node_text(heading) if heading else ""))
+    result: dict = {"kind": kind, "text": text, "status": "unconfirmed", "reason": "source_type_unverified",
+                    "extractor_version": EXTRACTOR_VERSION, "excerpt": text[:500]}
     if kind == "release_notes":
         entries = []
+        if not RELEASE_CONTEXT.search(context):
+            result.update(entries=entries, reason="release_context_missing")
+            return result
+        candidate_count = 0
         for article in descendants(root, "article"):
             heading = next((node for node in descendants(article) if node.tag in ("h1", "h2", "h3", "h4")), None)
             if not heading:
                 continue
             title = node_text(heading)[:300]
+            evidence = node_text(article)[:500]
+            marker = article.attrs.get("class", "").lower()
+            if any(word in marker for word in ("blog", "news", "insight", "editorial")) or (
+                    "author:" in evidence.lower() and "read more" in evidence.lower()):
+                continue
+            if not title or not RELEASE_EVIDENCE.search(evidence):
+                continue
+            candidate_count += 1
             date_node = next(descendants(article, "time"), None)
             date = (date_node.attrs.get("datetime") or node_text(date_node))[:80] if date_node else None
             anchor = next((node for node in descendants(article, "a") if node.attrs.get("href")), None)
-            link = urljoin(final_url, anchor.attrs["href"]) if anchor else final_url
+            if not anchor:
+                continue
+            link = urljoin(final_url, anchor.attrs["href"])
             try:
                 link = canonical_url(link, expected_host=urlsplit(final_url).hostname)
             except PageError:
-                link = final_url
-            if title:
-                entries.append({"title": title, "date": date, "url": link, "evidence": node_text(article)[:500]})
+                continue
+            if link == final_url:
+                continue
+            entries.append({"title": title, "date": date, "url": link, "evidence": evidence})
         result["entries"] = entries[:50]
-        result["status"] = "structured" if entries else "unconfirmed"
+        result["status"] = "confirmed" if entries and len(entries) == candidate_count else (
+            "partial" if entries else "unconfirmed")
+        result["reason"] = ("release_entries_confirmed" if result["status"] == "confirmed" else
+                            "some_release_entries_unconfirmed" if entries else
+                            "release_link_or_title_missing" if candidate_count else "release_entries_missing")
     elif kind == "pricing_page":
         plans = []
+        if not PRICING_CONTEXT.search(context):
+            result.update(plans=plans, reason="pricing_context_missing")
+            return result
         cards = [node for node in descendants(root) if node.tag in ("article", "section", "div") and
                  re.search(r"(^|[\s_-])(plan|pricing|tier)([\s_-]|$)",
                            node.attrs.get("class", "") + " " + node.attrs.get("id", ""), re.IGNORECASE)]
@@ -310,26 +343,36 @@ def page_content(html: str, kind: str, final_url: str) -> dict:
             evidence = node_text(card)[:500]
             match = PRICE.search(evidence)
             period_match = PERIOD.search(evidence)
-            if not heading or not match:
+            if not heading:
                 continue
-            symbol = match.group(1).upper()
-            currency = {"R$": "BRL", "€": "EUR", "£": "GBP"}.get(symbol, symbol)
+            symbol = match.group(1).upper() if match else None
+            currency = {"R$": "BRL", "€": "EUR", "£": "GBP"}.get(symbol, symbol) if symbol else None
             period = None
             if period_match:
                 period = "year" if re.search(r"year|annual|ano", period_match.group(), re.IGNORECASE) else "month"
-            raw_amount = match.group(2).replace(",", ".")
+            raw_amount = match.group(2).replace(",", ".") if match else None
             try:
-                amount = str(Decimal(raw_amount))
+                amount = str(Decimal(raw_amount)) if raw_amount else None
             except InvalidOperation:
-                continue
+                amount = None
             name = node_text(heading)[:120]
-            conditions = re.sub(r"\s+", " ", evidence.replace(match.group(), "", 1)).strip()
+            remaining = evidence.replace(name, "", 1)
+            if match:
+                remaining = remaining.replace(match.group(), "", 1)
+            if period_match:
+                remaining = remaining.replace(period_match.group(), "", 1)
+            conditions = re.sub(r"\s+", " ", remaining).strip()
             if name and not any(plan["name"] == name for plan in plans):
                 plans.append({"name": name, "amount": amount, "currency": currency,
-                              "period": period, "conditions": conditions, "confirmed": period is not None,
+                              "period": period, "conditions": conditions,
+                              "confirmed": amount is not None and currency is not None and period is not None,
                               "evidence": evidence})
         result["plans"] = plans[:30]
-        result["status"] = "structured" if any(plan["confirmed"] for plan in plans) else "unconfirmed"
+        confirmed_count = sum(plan["confirmed"] for plan in plans)
+        result["status"] = "confirmed" if plans and confirmed_count == len(plans) else (
+            "partial" if confirmed_count else "unconfirmed")
+        result["reason"] = ("price_plans_confirmed" if result["status"] == "confirmed" else
+                            "some_plans_unconfirmed" if confirmed_count else "price_fields_missing")
     else:
         raise PageError("invalid_source_type")
     return result
@@ -339,16 +382,17 @@ def semantic_hash(content: dict) -> str:
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
-def compare_pages(before: dict, after: dict) -> list[dict]:
+def compare_pages(before: dict, after: dict, *, before_trusted: bool = True) -> list[dict]:
     changes = []
-    if before["kind"] == after["kind"] == "pricing_page":
+    structured = before_trusted and before.get("status") == after.get("status") == "confirmed"
+    if structured and before["kind"] == after["kind"] == "pricing_page":
         old_plans = {item["name"]: item for item in before.get("plans", [])}
         new_plans = {item["name"]: item for item in after.get("plans", [])}
         for name in sorted(old_plans.keys() & new_plans.keys()):
             old, new = old_plans[name], new_plans[name]
             if old == new:
                 continue
-            comparable = (old["confirmed"] and new["confirmed"] and
+            comparable = (old["confirmed"] and new["confirmed"] and bool(old["conditions"]) and
                           (old["currency"], old["period"], old["conditions"]) ==
                           (new["currency"], new["period"], new["conditions"]))
             percent = None
@@ -360,7 +404,7 @@ def compare_pages(before: dict, after: dict) -> list[dict]:
             changes.append({"kind": "plan_appeared" if name in new_plans else "plan_disappeared_from_page",
                             "name": name, "previous": old_plans.get(name), "current": new_plans.get(name),
                             "percent_change": None})
-    elif before["kind"] == after["kind"] == "release_notes":
+    elif structured and before["kind"] == after["kind"] == "release_notes":
         old_entries = {(item["url"], item["title"]): item for item in before.get("entries", [])}
         new_entries = {(item["url"], item["title"]): item for item in after.get("entries", [])}
         for key in sorted(old_entries.keys() ^ new_entries.keys()):
@@ -395,10 +439,28 @@ def validate_job(payload: object) -> dict:
 async def mark_failed(job: dict, error: PageError) -> None:
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
-        await connection.execute("UPDATE marketrift.source_runs SET status = 'failed', error_code = %s, "
-                                 "retry_after_at = %s, finished_at = now() WHERE tenant_id = %s AND source_id = %s "
-                                 "AND id = %s AND status = 'running'",
-                                 (error.code, error.retry_at, job["tenant_id"], job["source_id"], job["run_id"]))
+        updated = await (await connection.execute(
+            "UPDATE marketrift.source_runs SET status = 'failed', error_code = %s, "
+            "retry_after_at = %s, finished_at = now() WHERE tenant_id = %s AND source_id = %s "
+            "AND id = %s AND status = 'running' RETURNING id",
+            (error.code, error.retry_at, job["tenant_id"], job["source_id"], job["run_id"]))).fetchone()
+        if updated:
+            source = await (await connection.execute(
+                "SELECT check_interval_minutes, consecutive_failures FROM marketrift.sources "
+                "WHERE tenant_id = %s AND id = %s AND monitoring_enabled FOR UPDATE",
+                (job["tenant_id"], job["source_id"]))).fetchone()
+            if source:
+                permanent = error.code in ("access_denied", "robots_disallowed", "robots_unavailable",
+                                           "not_found", "unsafe_destination", "no_extractable_content",
+                                           "unsupported_content_type", "unsupported_encoding",
+                                           "unsupported_charset", "redirect_without_location",
+                                           "unsupported_redirect", "redirect_limit")
+                delay_seconds = source[0] * 60 if permanent else min(3600, 300 * 2 ** min(source[1], 4))
+                await connection.execute(
+                    "UPDATE marketrift.sources SET consecutive_failures = consecutive_failures + 1, "
+                    "next_check_at = greatest(now() + %s * interval '1 second', "
+                    "coalesce(%s::timestamptz, now())) WHERE tenant_id = %s AND id = %s",
+                    (delay_seconds, error.retry_at, job["tenant_id"], job["source_id"]))
 
 
 async def check_web_page(payload: object, fetcher: Callable = fetch_public_page) -> dict:
@@ -406,18 +468,24 @@ async def check_web_page(payload: object, fetcher: Callable = fetch_public_page)
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
         source = await (await connection.execute(
-            "SELECT s.url, s.source_type, s.last_checked_at FROM marketrift.sources s "
+            "SELECT s.url, s.source_type, s.last_checked_at, s.monitoring_enabled FROM marketrift.sources s "
             "JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id "
             "WHERE s.tenant_id = %s AND s.id = %s AND s.source_type IN ('pricing_page', 'release_notes') "
             "AND s.enabled = true", (job["tenant_id"], job["source_id"]))).fetchone()
         run = await (await connection.execute(
-            "SELECT status FROM marketrift.source_runs WHERE tenant_id = %s AND source_id = %s "
+            "SELECT status, trigger_kind FROM marketrift.source_runs WHERE tenant_id = %s AND source_id = %s "
             "AND id = %s AND run_kind = 'web_page' FOR UPDATE",
             (job["tenant_id"], job["source_id"], job["run_id"]))).fetchone()
         if source is None or run is None:
             raise PageError("source_product_or_run_not_in_tenant")
         if run[0] != "pending":
             return {"status": run[0], "replayed": True}
+        if run[1] == "scheduled" and not source[3]:
+            await connection.execute(
+                "UPDATE marketrift.source_runs SET status = 'failed', error_code = 'monitor_paused', "
+                "finished_at = now() WHERE tenant_id = %s AND id = %s",
+                (job["tenant_id"], job["run_id"]))
+            return {"status": "failed", "error_code": "monitor_paused"}
         await connection.execute("UPDATE marketrift.source_runs SET status = 'running', started_at = now() "
                                  "WHERE tenant_id = %s AND id = %s", (job["tenant_id"], job["run_id"]))
     try:
@@ -432,20 +500,25 @@ async def check_web_page(payload: object, fetcher: Callable = fetch_public_page)
             if locked is None or locked[0] != "running":
                 raise PageError("run_state_changed")
             previous = await (await connection.execute(
-                "SELECT id, version_no, content_sha256, extracted, final_url FROM marketrift.source_snapshots "
+                "SELECT id, version_no, content_sha256, extracted, final_url, normalized_text, "
+                "interpretation_version, interpretation_status FROM marketrift.source_snapshots "
                 "WHERE tenant_id = %s AND source_id = %s AND extracted IS NOT NULL "
                 "ORDER BY version_no DESC LIMIT 1", (job["tenant_id"], job["source_id"]))).fetchone()
-            changed = previous is None or previous[2] != digest or previous[4] != final_url
+            changed = previous is None or previous[5] != content["text"] or previous[4] != final_url
             if changed:
                 inserted = await (await connection.execute(
                     "INSERT INTO marketrift.source_snapshots (tenant_id, source_id, run_id, source_url, "
-                    "storage_key, content_sha256, version_no, final_url, normalized_text, extracted) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb) RETURNING id",
+                    "storage_key, content_sha256, version_no, final_url, normalized_text, extracted, "
+                    "interpretation_version, interpretation_status, interpretation_reason) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s) RETURNING id",
                     (job["tenant_id"], job["source_id"], job["run_id"], source[0],
                      f"db:page-snapshot/{job['run_id']}", digest, (previous[1] + 1) if previous else 1,
-                     final_url, content["text"], json.dumps(content, ensure_ascii=False)))).fetchone()
+                     final_url, content["text"], json.dumps(content, ensure_ascii=False),
+                     EXTRACTOR_VERSION, content["status"], content["reason"]))).fetchone()
                 if previous:
-                    details = compare_pages(previous[3], content)
+                    details = compare_pages(previous[3], content,
+                                            before_trusted=previous[6] == EXTRACTOR_VERSION and
+                                            previous[7] == "confirmed")
                     if previous[4] != final_url:
                         details.append({"kind": "final_url_changed", "previous": previous[4],
                                         "current": final_url})
@@ -459,8 +532,11 @@ async def check_web_page(payload: object, fetcher: Callable = fetch_public_page)
                 "UPDATE marketrift.source_runs SET status = 'succeeded', documents_seen = 1, "
                 "documents_new = %s, finished_at = now() WHERE tenant_id = %s AND id = %s",
                 (int(changed), job["tenant_id"], job["run_id"]))
-            await connection.execute("UPDATE marketrift.sources SET last_checked_at = now() "
-                                     "WHERE tenant_id = %s AND id = %s", (job["tenant_id"], job["source_id"]))
+            await connection.execute(
+                "UPDATE marketrift.sources SET last_checked_at = now(), consecutive_failures = 0, "
+                "next_check_at = CASE WHEN monitoring_enabled THEN now() + "
+                "check_interval_minutes * interval '1 minute' ELSE NULL END "
+                "WHERE tenant_id = %s AND id = %s", (job["tenant_id"], job["source_id"]))
         return {"status": "succeeded", "new_snapshot": changed}
     except PageError as error:
         await mark_failed(job, error)

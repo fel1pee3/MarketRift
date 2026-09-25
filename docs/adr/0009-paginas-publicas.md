@@ -1,6 +1,6 @@
 # ADR 0009: capturas verificáveis de páginas públicas
 
-**Status:** implementado em 2026-09-24 para verificação manual. Agendamento, alertas estratégicos e avaliação de qualidade em fontes reais continuam pendentes.
+**Status:** decisão histórica da fase manual, implementada em 2026-09-24. O agendamento e a interpretação v2 foram acrescentados pela [ADR 0010](0010-agendamento-e-interpretacao-paginas.md); alertas estratégicos e avaliação de qualidade em fontes reais continuam pendentes.
 
 ## Decisão
 

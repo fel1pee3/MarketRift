@@ -140,6 +140,34 @@ def test_plain_text_changelog_is_preserved_without_invented_entries():
     assert "added export" in content["text"]
 
 
+def test_editorial_homepage_articles_are_not_release_notes():
+    # This is a local fixture representing the failure mode of a consultancy homepage.
+    html = ("<main><h1>Perspectives</h1><article><h2>AI in banking</h2>"
+            "<time datetime='2026-09-15'>15 Sep</time><a href='/insights/ai-banking'>Read more</a>"
+            "<p>Author: Alex. Read more about industry trends.</p></article></main>")
+    result = page_content(html, "release_notes", "https://example.com/")
+    assert result["status"] == "unconfirmed"
+    assert result["reason"] == "release_context_missing"
+    assert result["entries"] == []
+
+
+def test_release_context_needs_specific_entry_link():
+    missing = page_content("<main><h1>Changelog</h1><article><h2>Version 2</h2>"
+                           "<p>Fixed sync.</p></article></main>", "release_notes",
+                           "https://example.com/changelog")
+    assert missing["entries"] == []
+    assert missing["reason"] == "release_link_or_title_missing"
+
+
+def test_incomplete_price_and_unverified_page_are_not_confirmed():
+    incomplete = page_content(pricing(period=""), "pricing_page", "https://example.com/pricing")
+    assert incomplete["status"] == "unconfirmed"
+    assert incomplete["plans"][0]["confirmed"] is False
+    wrong_page = page_content(pricing(), "pricing_page", "https://example.com/")
+    assert wrong_page["status"] == "unconfirmed"
+    assert wrong_page["reason"] == "pricing_context_missing"
+
+
 def test_price_comparison_requires_same_currency_period_and_conditions():
     old = page_content(pricing(), "pricing_page", "https://example.com/pricing")
     newer = page_content(pricing(amount="12"), "pricing_page", "https://example.com/pricing")
@@ -152,6 +180,13 @@ def test_price_comparison_requires_same_currency_period_and_conditions():
                                     "pricing_page", "https://example.com/pricing")
     assert compare_pages(old, different_currency)[0]["percent_change"] is None
     assert compare_pages(old, different_period)[0]["percent_change"] is None
+    assert compare_pages(old, newer, before_trusted=False)[0]["kind"] == "text_changed_unconfirmed"
+    bare_old = page_content("<main><section class='plan'><h2>Pro</h2><p>USD 10 per month</p></section></main>",
+                            "pricing_page", "https://example.com/pricing")
+    bare_new = page_content("<main><section class='plan'><h2>Pro</h2><p>USD 12 per month</p></section></main>",
+                            "pricing_page", "https://example.com/pricing")
+    assert bare_old["plans"][0]["conditions"] == ""
+    assert compare_pages(bare_old, bare_new)[0]["percent_change"] is None
     ambiguous = page_content(pricing(amount="1,000"), "pricing_page", "https://example.com/pricing")
     assert ambiguous["status"] == "unconfirmed"
 
