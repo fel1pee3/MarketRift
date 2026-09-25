@@ -14,6 +14,8 @@ export class PageScheduler {
 
   async tick(): Promise<'idle' | 'locked' | 'recovered' | 'scheduled' | 'limited'> {
     const client = await this.db.provisioning.connect();
+    const testTenant = process.env.MARKETRIFT_TEST_MODE === '1' ? process.env.PAGE_SCHEDULER_TEST_TENANT_ID : undefined;
+    const scope = testTenant ? [testTenant] : [];
     let pending: Pending | undefined;
     let outcome: 'idle' | 'locked' | 'recovered' | 'scheduled' | 'limited' = 'idle';
     try {
@@ -31,14 +33,16 @@ export class PageScheduler {
         + 'JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id '
         + "WHERE r.run_kind = 'web_page' AND r.status = 'pending' "
         + "AND s.monitoring_enabled AND s.enabled AND r.started_at < now() - interval '15 seconds' "
-        + 'ORDER BY r.started_at LIMIT 1 FOR UPDATE OF r SKIP LOCKED');
+        + (testTenant ? 'AND r.tenant_id = $1 ' : '')
+        + 'ORDER BY r.started_at LIMIT 1 FOR UPDATE OF r SKIP LOCKED', scope);
       if (oldPending.rows[0]) {
         pending = oldPending.rows[0]; outcome = 'recovered';
       } else {
-        await this.expireOneStaleRun(client);
+        await this.expireOneStaleRun(client, testTenant);
         const volume = await client.query<{ count: number }>(
           "SELECT count(*)::integer AS count FROM marketrift.source_runs "
-          + "WHERE run_kind = 'web_page' AND started_at > now() - interval '1 minute'");
+          + "WHERE run_kind = 'web_page' AND started_at > now() - interval '1 minute' "
+          + (testTenant ? 'AND tenant_id = $1' : ''), scope);
         if ((volume.rows[0]?.count ?? 0) >= GLOBAL_PAGE_CHECKS_PER_MINUTE) {
           outcome = 'limited';
         } else {
@@ -53,7 +57,8 @@ export class PageScheduler {
             + 'AND NOT EXISTS (SELECT 1 FROM marketrift.source_runs r WHERE r.tenant_id = s.tenant_id '
             + "AND r.source_id = s.id AND r.run_kind = 'web_page' "
             + "AND r.finished_at > now() - interval '1 minute') "
-            + 'ORDER BY s.next_check_at, s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED');
+            + (testTenant ? 'AND s.tenant_id = $1 ' : '')
+            + 'ORDER BY s.next_check_at, s.id LIMIT 1 FOR UPDATE OF s SKIP LOCKED', scope);
           if (due.rows[0]) {
             const source = due.rows[0];
             const inserted = await client.query<Pending>(
@@ -82,14 +87,15 @@ export class PageScheduler {
     return outcome;
   }
 
-  private async expireOneStaleRun(client: PoolClient): Promise<void> {
+  private async expireOneStaleRun(client: PoolClient, testTenant?: string): Promise<void> {
     const stale = await client.query<Pending>(
       "UPDATE marketrift.source_runs SET status = 'failed', error_code = 'worker_timeout', finished_at = now() "
       + 'WHERE id = (SELECT id FROM marketrift.source_runs '
       + "WHERE run_kind = 'web_page' AND status = 'running' "
       + "AND started_at < now() - interval '10 minutes' "
+      + (testTenant ? 'AND tenant_id = $1 ' : '')
       + 'ORDER BY started_at LIMIT 1 FOR UPDATE SKIP LOCKED) '
-      + 'RETURNING id, tenant_id, source_id');
+      + 'RETURNING id, tenant_id, source_id', testTenant ? [testTenant] : []);
     if (stale.rows[0]) {
       await client.query(
         "UPDATE marketrift.sources SET consecutive_failures = consecutive_failures + 1, "

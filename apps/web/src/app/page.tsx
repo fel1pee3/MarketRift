@@ -11,7 +11,7 @@ type Source = { id: string; product_id: string; source_type: string; url: string
 type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
-type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
+type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
 type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
 type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null; trigger_kind: 'manual' | 'scheduled' };
 type PagePlan = { name: string; amount: string | null; currency: string | null; period: string | null; conditions: string; confirmed: boolean; evidence: string };
@@ -261,6 +261,50 @@ export default function Home() {
             </li>;
           })}</ul>
         </section>
+        <section className="card wide"><h2>GitHub Discussions públicas</h2>
+          <p>Debates e feedback da comunidade em repositórios públicos. Autores não foram verificados como clientes. Esta fonte fica separada de Issues e reviews; não há análise automática por IA.</p>
+          <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('sources/github-discussions', session, { method: 'POST', body: JSON.stringify({
+              product_id: data.get('product_id'), repository: data.get('repository'),
+            }) });
+            form.reset(); await refresh(session);
+          })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>Repositório público com Discussions (owner/repo ou URL)<input name="repository" placeholder="owner/repo" required /></label>
+            <button disabled={busy || !canManage || !products.length}>Adicionar fonte Discussions</button></form>
+          <ul>{sources.filter(source => source.source_type === 'github_discussions').map(source => {
+            const latest = sourceRuns.find(item => item.source_id === source.id);
+            const reason: Record<string, string> = {
+              configuration_pending: 'Configure GITHUB_DISCUSSIONS_TOKEN no ambiente do worker e reinicie-o.',
+              repository_unavailable_or_private: 'Repositório indisponível, privado ou sem acesso público.',
+              discussions_disabled: 'Discussions não estão habilitadas neste repositório.',
+              github_unauthorized: 'GitHub recusou a credencial (401). Confira se o token está válido e reinicie o worker.',
+              github_access_denied: 'Credencial GitHub recusada ou sem permissão nesta execução antiga. Solicite nova coleta para obter a categoria específica.',
+              github_forbidden: 'GitHub recusou o acesso (403). Confira as permissões do token e as regras da conta.',
+              github_permission_denied: 'O token não tem permissão para esta consulta GraphQL. Confira o acesso a repositórios públicos e Discussions.',
+              rate_limited: 'Limite da API GitHub; aguarde o horário indicado.',
+              graphql_query_invalid: 'A consulta GraphQL tem um campo ou argumento inválido. Atualize o conector.',
+              graphql_error: 'A API GraphQL recusou a consulta por outro motivo. Consulte o código da execução no servidor.',
+              network_failure: 'Falha de rede.', upstream_failure: 'Falha transitória do GitHub.',
+            };
+            return <li key={source.id}><a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>
+              <p>Última coleta: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma; repositório ainda não validado pelo worker'}</p>
+              {latest && <p>Estado: <strong>{latest.status}</strong>; consultadas: {latest.documents_seen}; novas: {latest.documents_new}; atualizadas: {latest.documents_updated}; páginas: {latest.pages_fetched}.
+                {latest.scan_complete === false && <> Coleta parcial; outra execução continuará pelo cursor.</>}
+                {latest.error_code && <> {reason[latest.error_code] ?? `Falha: ${latest.error_code}.`}</>}
+                {latest.retry_after_at && <> Tente após {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+              {session.role !== 'viewer' && <form onSubmit={event => void run(async () => {
+                const data = formValues(event);
+                await api(`sources/${source.id}/sync`, session, { method: 'POST', body: JSON.stringify({
+                  max_pages: Number(data.get('max_pages')), max_items: Number(data.get('max_items')),
+                }) });
+                await refresh(session);
+              })}><label>Páginas (1–3)<input name="max_pages" type="number" min="1" max="3" defaultValue="1" required /></label>
+                <label>Discussions (1–50)<input name="max_items" type="number" min="1" max="50" defaultValue="5" required /></label>
+                <button className="small" disabled={busy || latest?.status === 'running'}>Coletar Discussions</button></form>}
+            </li>;
+          })}</ul>
+        </section>
         <section className="card wide"><h2>Avaliações de usuários do Steam</h2>
           <p>Piloto para produtos publicados no Steam. A coleta é manual e limitada. Recomendação positiva ou negativa é um dado da plataforma; a extração de problemas por IA exige escolher uma review depois.</p>
           <form onSubmit={event => void run(async () => {
@@ -364,8 +408,23 @@ export default function Home() {
               await api(`imports/${item.id}/requeue`, session, { method: 'POST' }); await refresh(session);
             })}>Reenfileirar</button>}</li>)}</ul> : <p className="empty">Nenhuma importação ainda.</p>}
         </section>
+        <section className="card wide"><h2>Discussions públicas coletadas</h2>
+          <p>Conversas da comunidade; o autor pode não ser cliente. Categoria e texto preservados para revisão humana. Sem classificação por IA e sem inclusão nas métricas de reviews.</p>
+          {documents.some(document => document.document_type === 'github_discussion') ?
+            <div className="documents">{documents.filter(document => document.document_type === 'github_discussion').map(document =>
+              <article key={document.id}><div className="meta"><span className="badge">Discussion pública do GitHub</span>
+                {document.source_created_at && <time>{new Date(document.source_created_at).toLocaleDateString('pt-BR')}</time>}</div>
+                <h3>{document.source_title}</h3>
+                <p>Produto: {document.product_name} · Repositório: {document.source_repository} · Categoria: {document.discussion_category} · Estado: {document.source_state}</p>
+                <p>Autor público: {document.discussion_author ?? 'não disponível'} (não verificado como cliente) · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecida'}</p>
+                <p>{document.source_body || 'Sem corpo publicado.'}</p>
+                {document.discussion_content_status === 'insufficient' && <p>Conteúdo insuficiente para inferir um problema.</p>}
+                {document.discussion_relevance === 'announcement' && <p>Categoria de anúncio; não classificada como feedback de produto.</p>}
+                <a href={document.source_url} target="_blank" rel="noreferrer">Abrir Discussion original ↗</a>
+              </article>)}</div> : <p className="empty">Nenhuma Discussion coletada nesta empresa.</p>}
+        </section>
         <section className="card wide"><h2>Documentos</h2><p>Reviews Steam e avaliações CSV são distintas de Issues públicas do GitHub. A análise de reviews Steam só começa após você selecionar uma review. Dados sintéticos não contam como avaliações reais.</p>
-          {documents.length ? <div className="documents">{documents.map(document => <article key={document.id}>
+          {documents.some(document => document.document_type !== 'github_discussion') ? <div className="documents">{documents.filter(document => document.document_type !== 'github_discussion').map(document => <article key={document.id}>
             <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.document_type === 'steam_review' && <span className="badge">Avaliação de usuário do Steam</span>}{document.synthetic && <span className="badge">SINTÉTICO</span>}
               {document.published_at && <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time>}<code>{document.external_key}</code></div>
             <p><strong>Produto associado:</strong> {document.product_name}</p>

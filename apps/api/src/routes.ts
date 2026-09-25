@@ -12,6 +12,7 @@ import { activeExtractorVersion, makeAnalysisJob } from './analysis-job';
 import { Accounts, Principal, Role } from './accounts';
 import { canonicalGitHubRepository } from './github-source';
 import { makeGitHubJob } from './github-job';
+import { makeGitHubDiscussionsJob } from './github-discussions-job';
 import { steamAppId, steamSourceUrl } from './steam-source';
 import { makeSteamJob } from './steam-job';
 
@@ -24,10 +25,10 @@ const steamSourceInput = z.object({ product_id: uuid, app: z.string().trim().min
 const githubSyncInput = z.object({ max_pages: z.number().int().min(1).max(3), max_items: z.number().int().min(1).max(50) }).strict();
 const csvRow = z.object({ external_key: z.string().trim().min(1).max(200), source_url: httpUrl, published_at: z.iso.datetime({ offset: true }), body: z.string().trim().min(1).max(10000), synthetic: z.enum(['true', 'false', '']).optional() }).strict();
 type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
-type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: 'manual_review' | 'github_issues' | 'steam_reviews'; url: string; last_checked_at?: Date | null };
+type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: 'manual_review' | 'github_issues' | 'github_discussions' | 'steam_reviews'; url: string; last_checked_at?: Date | null };
 type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
 type ImportRow = QueryResultRow & { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: Date; finished_at: Date | null };
-type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
+type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
 
 function input<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -106,6 +107,24 @@ export class ApiController {
     } catch (error) { return conflict(error); }
   }
 
+  @Post('sources/github-discussions')
+  async createDiscussionsSource(@Req() request: Request, @Body() body: unknown): Promise<SourceRow> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const data = input(githubSourceInput, body);
+    const url = canonicalGitHubRepository(data.repository);
+    try {
+      return await this.db.tenant(principal.tenantId, async client => {
+        const rows = await this.db.rows<SourceRow>(client,
+          "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url) "
+          + "SELECT $1, id, 'github_discussions', $3 FROM marketrift.products WHERE id = $2 "
+          + "RETURNING id, product_id, source_type, url, last_checked_at",
+          [principal.tenantId, data.product_id, url]);
+        if (!rows[0]) throw new NotFoundException('Product not found');
+        return rows[0];
+      });
+    } catch (error) { return conflict(error); }
+  }
+
   @Post('sources/steam-reviews')
   async createSteamSource(@Req() request: Request, @Body() body: unknown): Promise<SourceRow> {
     const principal = await this.principal(request, ['owner', 'admin']);
@@ -131,9 +150,9 @@ export class ApiController {
     const sourceId = input(uuid, idValue);
     const limits = input(githubSyncInput, body);
     const created = await this.db.tenant(principal.tenantId, async client => {
-      const source = await this.db.rows<{ id: string; source_type: 'github_issues' | 'steam_reviews' }>(client,
+      const source = await this.db.rows<{ id: string; source_type: 'github_issues' | 'github_discussions' | 'steam_reviews' }>(client,
         "SELECT id, source_type FROM marketrift.sources WHERE id = $1 "
-        + "AND source_type IN ('github_issues', 'steam_reviews') AND enabled = true FOR UPDATE", [sourceId]);
+        + "AND source_type IN ('github_issues', 'github_discussions', 'steam_reviews') AND enabled = true FOR UPDATE", [sourceId]);
       if (!source[0]) throw new NotFoundException('Collectible source not found');
       await client.query("UPDATE marketrift.source_runs SET status = 'failed', error_code = 'worker_timeout', finished_at = now() "
         + "WHERE source_id = $1 AND max_pages IS NOT NULL AND status = 'running' "
@@ -147,15 +166,18 @@ export class ApiController {
       const blocked = await this.db.rows<{ retry_after_at: Date }>(client,
         'SELECT retry_after_at FROM marketrift.source_runs WHERE source_id = $1 AND retry_after_at > now() ORDER BY retry_after_at DESC LIMIT 1', [sourceId]);
       if (blocked[0]) throw new ConflictException(`Source rate limit; retry after ${blocked[0].retry_after_at.toISOString()}`);
-      const previous = await this.db.rows<{ cursor_after: string | null }>(client,
-        "SELECT cursor_after FROM marketrift.source_runs WHERE source_id = $1 AND status = 'succeeded' AND max_pages IS NOT NULL ORDER BY finished_at DESC LIMIT 1", [sourceId]);
+      const previous = await this.db.rows<{ cursor_after: string | null; scan_complete: boolean | null }>(client,
+        "SELECT cursor_after, scan_complete FROM marketrift.source_runs WHERE source_id = $1 AND status = 'succeeded' AND max_pages IS NOT NULL ORDER BY finished_at DESC LIMIT 1", [sourceId]);
+      const cursor = source[0].source_type === 'github_discussions' && previous[0]?.scan_complete === false
+        ? previous[0].cursor_after : source[0].source_type === 'github_discussions' ? null : previous[0]?.cursor_after ?? null;
       const rows = await this.db.rows<{ id: string; status: string }>(client,
         "INSERT INTO marketrift.source_runs (tenant_id, source_id, status, cursor_before, max_pages, max_items) VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id, status",
-        [principal.tenantId, sourceId, previous[0]?.cursor_after ?? null, limits.max_pages, limits.max_items]);
+        [principal.tenantId, sourceId, cursor, limits.max_pages, limits.max_items]);
       return { run: rows[0]!, sourceType: source[0].source_type };
     });
     try {
       if (created.sourceType === 'steam_reviews') await this.jobs.publishSteam(makeSteamJob(principal.tenantId, sourceId, created.run.id));
+      else if (created.sourceType === 'github_discussions') await this.jobs.publishDiscussions(makeGitHubDiscussionsJob(principal.tenantId, sourceId, created.run.id));
       else await this.jobs.publishGitHub(makeGitHubJob(principal.tenantId, sourceId, created.run.id));
     }
     catch { /* Pending run can be retried with the same endpoint and job ID. */ }
@@ -166,7 +188,7 @@ export class ApiController {
   async sourceRuns(@Req() request: Request): Promise<SourceRunRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRunRow>(client,
-      "SELECT r.id, r.source_id, r.status, r.documents_seen, r.documents_new, r.documents_updated, r.documents_ignored, r.scan_complete, r.pages_fetched, r.pull_requests_skipped, r.error_code, r.retry_after_at, r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id WHERE s.source_type IN ('github_issues', 'steam_reviews') ORDER BY r.started_at DESC LIMIT 50"));
+      "SELECT r.id, r.source_id, r.status, r.documents_seen, r.documents_new, r.documents_updated, r.documents_ignored, r.scan_complete, r.pages_fetched, r.pull_requests_skipped, r.error_code, r.retry_after_at, r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id WHERE s.source_type IN ('github_issues', 'github_discussions', 'steam_reviews') ORDER BY r.started_at DESC LIMIT 50"));
   }
 
   @Post('imports/reviews')
@@ -238,7 +260,9 @@ export class ApiController {
     return this.db.tenant(principal.tenantId, client => this.db.rows<DocumentRow>(client,
       `SELECT d.id, d.source_id, s.product_id, p.name AS product_name, d.document_type, d.external_key,
         d.source_url, d.source_url_kind, d.body, d.steam_app_id, d.review_language, d.review_voted_up,
-        d.source_title, d.source_body, d.source_state, d.source_repository, d.source_created_at, d.source_updated_at,
+        d.source_title, d.source_body, d.source_state, d.source_repository,
+        d.discussion_category, d.discussion_author, d.discussion_content_status, d.discussion_relevance,
+        d.source_created_at, d.source_updated_at,
         d.published_at, d.collected_at, d.synthetic, a.status AS analysis_status,
         a.model_id AS analysis_model, a.last_error AS analysis_error,
         COALESCE((SELECT json_agg(json_build_object('category', i.category,

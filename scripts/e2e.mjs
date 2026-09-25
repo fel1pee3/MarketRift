@@ -21,8 +21,30 @@ let pagePrice = '10';
 let releaseVersion = 1;
 let flakyAttempts = 0;
 const pageRequests = [];
+let discussionBody = 'The integration fails when the account name has spaces.';
+let discussionUpdated = '2026-09-24T12:00:00Z';
+const discussionRequests = [];
 const steamMock = createServer((request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1');
+  if (url.pathname === '/graphql') {
+    let raw = '';
+    request.on('data', chunk => { raw += chunk; });
+    request.on('end', () => {
+      const variables = JSON.parse(raw).variables;
+      discussionRequests.push({ variables, authorized: request.headers.authorization === 'Bearer e2e-read-only-placeholder' });
+      const number = variables.after === 'cursor-one' ? 2 : 1;
+      const item = { id: `D_${number}`, number, title: number === 1 ? 'Integration feedback' : 'Community announcement',
+        body: number === 1 ? discussionBody : '', createdAt: '2026-09-01T10:00:00Z',
+        updatedAt: number === 1 ? discussionUpdated : '2026-09-02T10:00:00Z',
+        url: `https://github.com/example/repo/discussions/${number}`, closed: false,
+        category: { name: number === 1 ? 'Ideas' : 'Announcements' }, author: { login: 'public-user' } };
+      response.setHeader('Content-Type', 'application/json');
+      response.end(JSON.stringify({ data: { repository: { isPrivate: false, hasDiscussionsEnabled: true,
+        discussions: { nodes: [item], pageInfo: { endCursor: number === 1 ? 'cursor-one' : 'cursor-two',
+          hasNextPage: number === 1 } } } } }));
+    });
+    return;
+  }
   if (url.pathname.startsWith('/web-page/')) {
     pageRequests.push(url.pathname);
     if (url.pathname === '/web-page/robots.txt') { response.writeHead(404); response.end(); return; }
@@ -79,7 +101,9 @@ const python = join('apps', 'intelligence', '.venv', process.platform === 'win32
 const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
   env: { ...childEnv, ANALYSIS_PROVIDER: 'test', MARKETRIFT_TEST_MODE: '1',
     STEAM_REVIEW_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
-    WEB_PAGE_TEST_BASE_URL: `http://127.0.0.1:${steamPort}` },
+    WEB_PAGE_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    GITHUB_DISCUSSIONS_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    GITHUB_DISCUSSIONS_TOKEN: 'e2e-read-only-placeholder' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const webProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', 'apps/web', '-p', String(webPort)], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -93,7 +117,8 @@ for (const child of children) {
 }
 function launchScheduler() {
   const schedulerProcess = spawn(process.execPath, ['apps/api/dist/page-scheduler-main.js'], {
-    env: { ...childEnv, MARKETRIFT_TEST_MODE: '1', PAGE_SCHEDULER_TEST_POLL_MS: '200' },
+    env: { ...childEnv, MARKETRIFT_TEST_MODE: '1', PAGE_SCHEDULER_TEST_POLL_MS: '200',
+      PAGE_SCHEDULER_TEST_TENANT_ID: cleanupTenants[0] },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   schedulerProcess.stderr.on('data', chunk => { errors += String(chunk); });
@@ -252,6 +277,48 @@ try {
   assert.equal((await viewer.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await analyst.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await admin.call('sources', { method: 'POST', body: JSON.stringify({ product_id: competitor.body.id, url: 'https://example.invalid/other' }) })).status, 201);
+
+  const discussionSource = await a.call('sources/github-discussions', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, repository: 'Example/Repo' }) });
+  assert.equal(discussionSource.status, 201, JSON.stringify(discussionSource.body));
+  assert.equal(discussionSource.body.url, 'https://github.com/example/repo');
+  assert.equal((await b.call('sources/github-discussions', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, repository: 'Example/Repo' }) })).status, 404);
+  assert.equal((await analyst.call('sources/github-discussions', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, repository: 'Example/Repo' }) })).status, 403);
+  assert.equal((await viewer.call(`sources/${discussionSource.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 1 }) })).status, 403);
+  assert.equal((await b.call(`sources/${discussionSource.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 1 }) })).status, 404);
+  async function syncDiscussions(maxItems = 1) {
+    const queued = await analyst.call(`sources/${discussionSource.body.id}/sync`, { method: 'POST',
+      body: JSON.stringify({ max_pages: 2, max_items: maxItems }) });
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    return waitForSourceRun(analyst, queued.body.id);
+  }
+  const discussionFirst = await syncDiscussions();
+  assert.equal(discussionFirst.documents_new, 1);
+  assert.equal(discussionFirst.scan_complete, false);
+  const discussionSecond = await syncDiscussions();
+  assert.equal(discussionSecond.documents_new, 1);
+  assert.equal(discussionSecond.scan_complete, true);
+  const originalDiscussion = (await a.call('documents')).body.find(item => item.external_key === 'D_1');
+  assert.equal(originalDiscussion.document_type, 'github_discussion');
+  assert.equal(originalDiscussion.source_body, discussionBody);
+  assert.equal(originalDiscussion.discussion_category, 'Ideas');
+  assert.equal(originalDiscussion.analysis_status, null);
+  assert.equal((await a.call('documents')).body.find(item => item.external_key === 'D_2').discussion_relevance, 'announcement');
+  assert.equal((await b.call('documents')).body.length, 0);
+  discussionBody = 'Edited integration failure when the account name contains spaces.';
+  discussionUpdated = '2026-09-24T13:00:00Z';
+  const discussionThird = await syncDiscussions(2);
+  assert.equal(discussionThird.documents_new, 0);
+  assert.equal(discussionThird.documents_updated, 1);
+  assert.equal((await a.call('documents')).body.find(item => item.external_key === 'D_1').source_body, discussionBody);
+  assert.equal((await a.call('documents')).body.filter(item => item.document_type === 'github_discussion').length, 2);
+  assert.equal(discussionRequests.length, 4);
+  assert.equal(discussionRequests.every(item => item.authorized), true);
+  assert.deepEqual(discussionRequests.map(item => item.variables.after), [null, 'cursor-one', null, 'cursor-one']);
 
   const steamSource = await a.call('sources/steam-reviews', { method: 'POST',
     body: JSON.stringify({ product_id: competitor.body.id, app: '620' }) });
@@ -577,7 +644,7 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV, Steam, manual pages, two schedulers, restart, pause/resume, retry/backoff, conservative interpretation and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, CSV, Steam, GitHub Discussions GraphQL, pages, schedulers, retries, conservative interpretation and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;

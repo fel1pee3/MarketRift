@@ -1,4 +1,5 @@
 .env
+.env.worker.local
 node_modules/
 .next/
 .next-dev/

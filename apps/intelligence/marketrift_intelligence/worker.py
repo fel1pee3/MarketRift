@@ -6,6 +6,7 @@ import signal
 from bullmq import Worker
 
 from .analyze import analyze
+from .github_discussions import sync_github_discussions
 from .github_issues import sync_github_issues
 from .ingest import ingest, mark_failed
 from .steam_reviews import sync_steam_reviews
@@ -31,6 +32,14 @@ async def process_analysis(job, _token):
 
 async def process_github(job, _token):
     return await sync_github_issues(job.data)
+
+
+async def process_discussions(job, _token):
+    result = await sync_github_discussions(job.data)
+    if result.get("status") == "failed":
+        logger.warning("Discussion sync failed: run=%s source=%s code=%s",
+                       job.data.get("run_id"), job.data.get("source_id"), result.get("error_code"))
+    return result
 
 
 async def process_steam(job, _token):
@@ -61,12 +70,13 @@ async def main() -> None:
     worker = Worker("review-ingest", process, {"connection": os.environ["REDIS_URL"]})
     analysis_worker = Worker("review-analysis", process_analysis, {"connection": os.environ["REDIS_URL"]})
     github_worker = Worker("github-issues", process_github, {"connection": os.environ["REDIS_URL"]})
+    discussions_worker = Worker("github-discussions", process_discussions, {"connection": os.environ["REDIS_URL"]})
     steam_worker = Worker("steam-reviews", process_steam, {"connection": os.environ["REDIS_URL"]})
     web_page_worker = Worker("web-pages", process_web_page, {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
-        await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(),
+        await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(), discussions_worker.close(),
                              steam_worker.close(), web_page_worker.close())
 
 

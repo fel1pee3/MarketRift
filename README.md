@@ -76,7 +76,7 @@ Na pasta `apps/intelligence`, instale o pacote Python:
 .venv/Scripts/python.exe -m pip install -e ".[dev]"
 ```
 
-De volta à raiz, aplique as nove migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
+De volta à raiz, aplique as dez migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
 
 ```powershell
 npm run db:setup
@@ -156,7 +156,7 @@ Em banco existente, preserve o volume e aplique a migração aditiva:
 npm run db:migrate:github
 ```
 
-Em banco vazio, `npm run db:setup` aplica as nove migrações. Depois, inicie `npm run dev:api`, `npm run dev:web` e `npm run dev:worker` em terminais separados. O FastAPI de health não participa da coleta.
+Em banco vazio, `npm run db:setup` aplica as dez migrações. Depois, inicie `npm run dev:api`, `npm run dev:web` e `npm run dev:worker` em terminais separados. O FastAPI de health não participa da coleta.
 
 ### Primeiro conector de avaliações reais: Steam User Reviews
 
@@ -250,9 +250,34 @@ npm run test:e2e
 
 O E2E usa páginas locais simuladas para comprovar preço comparável, homepage editorial sem release, changelog explícito, deduplicação, dois agendadores, reinício, pausa/retomada, 503 com retry, RBAC e RLS. Ele não altera páginas reais nem faz chamada paga de IA. A consulta direta histórica à página PostgreSQL não gravou dados em tenant. Veja as ADRs [0009](docs/adr/0009-paginas-publicas.md) e [0010](docs/adr/0010-agendamento-e-interpretacao-paginas.md).
 
+### GitHub Discussions públicas
+
+Discussions são **conversas e feedback de uma comunidade**, não reviews de clientes verificados. Sua população é separada de CSV, Steam e Issues. O sistema não soma essas fontes em uma taxa de reclamação, não infere participação de mercado e não classifica Discussions com IA nesta entrega. A categoria, o título, o corpo original, o autor público quando disponível, as datas, o estado e o link ficam disponíveis para revisão humana. Um anúncio ou corpo curto recebe uma indicação de limitação; não vira “dor do cliente”. Comentários e respostas não são coletados.
+
+O GitHub exige autenticação para [GraphQL Discussions](https://docs.github.com/en/graphql/guides/using-the-graphql-api-for-discussions). Para teste local, crie uma credencial GitHub de leitura de repositórios públicos e coloque `GITHUB_DISCUSSIONS_TOKEN` **somente** em `.env.worker.local`, criado a partir de `.env.worker.example`. Esse arquivo é ignorado pelo Git e carregado apenas por `npm run dev:worker`; não coloque o token no `.env` compartilhado por API e web, nem na interface ou em jobs. A [documentação de autenticação GraphQL](https://docs.github.com/en/graphql/guides/forming-calls-with-graphql) explica PAT e GitHub App; o guia específico de Discussions menciona `public_repo` para PAT clássico. Escolha o menor acesso adequado e revise as permissões da sua credencial. Reinicie `npm run dev:worker` após configurar. Sem token, a execução termina em `failed` com `configuration_pending`, sem simular documentos. Um token que também permita repositórios privados **não** libera sua coleta: o worker verifica `isPrivate` antes de gravar. O cadastro cria uma fonte ainda não validada; a primeira coleta confirma existência pública e `hasDiscussionsEnabled`.
+
+O destino é fixo em `https://api.github.com/graphql`, com [paginação por cursor](https://docs.github.com/en/graphql/guides/using-pagination-in-the-graphql-api) e consulta apenas dos campos necessários. Uma execução aceita 1–3 páginas e 1–50 itens, com até 20 itens por requisição. Se a janela ficar incompleta, a próxima execução continua pelo cursor salvo; após completá-la, a execução seguinte recomeça nos itens recentemente atualizados para capturar edições. Ordenação por atualização pode mudar enquanto se pagina: `scan_complete=false` não prova cobertura histórica total. A [documentação de limites GraphQL](https://docs.github.com/en/graphql/overview/rate-limits-and-query-limits-for-the-graphql-api) descreve limites primários por pontos e secundários; o conector respeita `Retry-After` e `x-ratelimit-reset`, limita retries transitórios e não usa scraping. Erros GraphQL com HTTP 200 também são tratados como falha. Não há chamada à OpenAI na coleta. Veja [ADR 0011](docs/adr/0011-github-discussions-publicas.md).
+
+Se uma sincronização falhar, a interface separa `github_unauthorized` (credencial recusada), `github_forbidden` (HTTP 403), `github_permission_denied` (permissão insuficiente), `rate_limited` (aguardar o horário indicado), `graphql_query_invalid` (campo/argumento incompatível com o schema) e `graphql_error` (outro erro GraphQL). O banco guarda só o código, nunca a resposta completa ou o token. Em 2026-09-24, uma tentativa real com a query anterior retornou HTTP 200 e um erro de schema para `isClosed`; o campo correto da [Discussion](https://docs.github.com/en/graphql/reference/discussions) é `closed`. Após a correção, uma consulta direta de 1 página/5 itens a `vercel/next.js` retornou cinco Discussions, sem gravá-las nem enviar conteúdo à IA. As execuções antigas `graphql_error` permanecem no histórico; reinicie o worker e solicite uma nova coleta para verificar o fluxo pela interface.
+
+Em banco existente com 009 aplicada, preserve o volume e execute o comando verificado:
+
+```powershell
+npm run db:migrate:github-discussions
+```
+
+Para testar na interface:
+
+1. Inicie `npm run dev:api`, `npm run dev:web` e `npm run dev:worker` em terminais separados; mantenha PostgreSQL e Redis ativos. O scheduler de páginas não é necessário para uma coleta manual de Discussions.
+2. Entre como `owner` ou `admin`, escolha um produto em **GitHub Discussions públicas**, informe `owner/repo` de um repositório público com Discussions habilitadas e clique em **Adicionar fonte Discussions**. Para um teste pequeno, `vercel/next.js` [exibia Discussions públicas](https://github.com/vercel/next.js/discussions) na consulta documental de 2026-09-24; escolha-o apenas se fizer sentido para seu produto de teste. Não use URL de Discussion individual. Uma fonte recém-criada mostra “repositório ainda não validado pelo worker”.
+3. Clique em **Coletar Discussions** com **1 página e 5 itens**. O estado deve passar a `succeeded`; confira quantidade consultada, novas/atualizadas, data da última coleta e, na seção **Discussions públicas coletadas**, categoria, título, corpo, data, estado e link. Se aparecer `configuration_pending`, configure o token no worker e reinicie-o. Se aparecer `discussions_disabled` ou `repository_unavailable_or_private`, escolha outra origem pública adequada.
+4. Clique novamente em **Coletar Discussions**. Itens já vistos devem ter `novas: 0`; uma Discussion editada pode aparecer em `atualizadas`. Se `scan_complete=false`, repita para continuar a janela pelo cursor. O usuário `analyst` pode solicitar coleta, `viewer` apenas ler; ao trocar de empresa, fontes e documentos da outra não devem aparecer.
+
+O teste direto posterior confirmou cinco itens reais em memória, sem gravação no tenant. O E2E usa respostas GraphQL controladas e verifica API → BullMQ → worker → PostgreSQL → API sem chamar GitHub ou OpenAI.
+
 ### Migrações
 
-São **nove migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação; `006_github_issues.sql` acrescenta fonte, documentos e estado de coleta de Issues; `007_steam_reviews.sql` acrescenta fonte e metadados de reviews Steam; `008_web_pages.sql` acrescenta capturas de páginas; `009_page_monitoring.sql` acrescenta agendamento persistente e estado versionado da interpretação. `db:setup` aplica 001 a 009 somente em banco novo. Os comandos `db:migrate:*` aplicam somente a migração respectiva em banco existente, na ordem.
+São **dez migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação; `006_github_issues.sql` acrescenta fonte, documentos e estado de coleta de Issues; `007_steam_reviews.sql` acrescenta fonte e metadados de reviews Steam; `008_web_pages.sql` acrescenta capturas de páginas; `009_page_monitoring.sql` acrescenta agendamento persistente e estado versionado da interpretação; `010_github_discussions.sql` acrescenta Discussions como tipo de fonte e documento independente. `db:setup` aplica 001 a 010 somente em banco novo. Os comandos `db:migrate:*` aplicam somente a migração respectiva em banco existente, na ordem.
 
 ## Ordem de construção
 
@@ -264,6 +289,6 @@ O código, a documentação e as fixtures sintéticas deste repositório são di
 
 ## Estado atual
 
-Em 2026-09-24, `001` a `009` estavam aplicadas no PostgreSQL local com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, falha do provedor, mudança de versão, Issues, reviews Steam, capturas e backoff de páginas. O E2E usa API → agendador → BullMQ → Python → PostgreSQL → API com páginas e Steam HTTP simulados, além de verificar que a web é servida; ainda não automatiza cliques no navegador. Veja [ADR 0010](docs/adr/0010-agendamento-e-interpretacao-paginas.md) para limites e decisões atuais. Os resultados de lint, build e testes desta entrega são registrados na resposta de encerramento.
+Em 2026-09-24, `001` a `010` estavam aplicadas no PostgreSQL local com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, falha do provedor, mudança de versão, Issues, reviews Steam, capturas, backoff de páginas e Discussions. O E2E usa API → agendador → BullMQ → Python → PostgreSQL → API com páginas, Steam e GraphQL simulados, além de verificar que a web é servida; ainda não automatiza cliques no navegador. Veja [ADR 0010](docs/adr/0010-agendamento-e-interpretacao-paginas.md) e [ADR 0011](docs/adr/0011-github-discussions-publicas.md). Os resultados de lint, build e testes desta entrega são registrados na resposta de encerramento.
 
 Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, avaliação humana da interpretação em páginas reais autorizadas, conectores adicionais permitidos, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é selecionar páginas de preço e release notes de um segmento B2B com acesso permitido, rotular mudanças observadas e medir falsos positivos/negativos antes de gerar alertas.

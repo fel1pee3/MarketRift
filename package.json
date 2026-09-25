@@ -6,7 +6,7 @@
   "scripts": {
     "dev:api": "npm run dev -w @marketrift/api",
     "dev:web": "npm run dev -w @marketrift/web",
-    "dev:worker": "node --env-file=.env scripts/run-python.mjs worker",
+    "dev:worker": "node --env-file=.env --env-file-if-exists=.env.worker.local scripts/run-python.mjs worker",
     "dev:scheduler": "node --env-file=.env --import tsx apps/api/src/page-scheduler-main.ts",
     "start:scheduler": "node --env-file=.env apps/api/dist/page-scheduler-main.js",
     "dev:intelligence-http": "node --env-file=.env scripts/run-python.mjs http",
@@ -26,7 +26,8 @@
     "db:migrate:github": "node --env-file=.env scripts/migrate-github.mjs",
     "db:migrate:steam": "node --env-file=.env scripts/migrate-steam.mjs",
     "db:migrate:web-pages": "node --env-file=.env scripts/migrate-web-pages.mjs",
-    "db:migrate:page-monitoring": "node --env-file=.env scripts/migrate-page-monitoring.mjs"
+    "db:migrate:page-monitoring": "node --env-file=.env scripts/migrate-page-monitoring.mjs",
+    "db:migrate:github-discussions": "node --env-file=.env scripts/migrate-github-discussions.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }
