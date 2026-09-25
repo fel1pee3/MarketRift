@@ -510,6 +510,14 @@ try {
   assert.equal(indexedAnswer.body.cost_usd, 0);
   assert.ok(completedB2B.body.includes(indexedAnswer.body.citations[0].quote));
   assert.ok(indexedAnswer.body.answer.includes(indexedAnswer.body.citations[0].id));
+  const indexStatusA = await viewer.call('evidence/index-status');
+  assert.equal(indexStatusA.status, 200);
+  assert.equal(indexStatusA.body.model, 'controlled-hash-TESTE');
+  assert.ok(indexStatusA.body.sources.some(item => item.source_id === b2bSource.body.id
+    && item.state === 'complete' && item.ready_chunks === 1 && item.total_chunks === 1));
+  const indexStatusB = await b.call('evidence/index-status');
+  assert.equal(indexStatusB.status, 200);
+  assert.ok(indexStatusB.body.sources.every(item => item.source_id !== b2bSource.body.id));
   console.log(`Controlled retrieval E2E latency: ${indexedAnswer.body.elapsed_ms} ms (test fixture, not a production SLA)`);
   const indexDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
   await indexDb.connect();

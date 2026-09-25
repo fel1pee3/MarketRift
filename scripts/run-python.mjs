@@ -5,7 +5,8 @@ const target = process.argv[2];
 const args = target === 'worker'
   ? ['-m', 'marketrift_intelligence.worker']
   : target === 'http'
-    ? ['-m', 'uvicorn', 'marketrift_intelligence.http:app', '--host', '127.0.0.1', '--port', '8000']
+    ? ['-m', 'uvicorn', 'marketrift_intelligence.http:app', '--host', '127.0.0.1',
+      '--port', process.env.INTELLIGENCE_HTTP_PORT ?? '8000']
     : target === 'evaluate' && process.argv[3] === 'test'
       ? ['-m', 'marketrift_intelligence.evaluation', '--provider', process.argv[3]]
     : target === 'quality'
@@ -16,6 +17,12 @@ const args = target === 'worker'
       ? ['-m', 'marketrift_intelligence.b2b_eval_cli', ...process.argv.slice(3)]
     : target === 'prepare-embeddings'
       ? ['-m', 'marketrift_intelligence.prepare_embeddings']
+    : target === 'retrieval-eval'
+      ? ['-m', 'marketrift_intelligence.retrieval_eval', ...process.argv.slice(3)]
+    : target === 'retrieval-label'
+      ? ['-m', 'marketrift_intelligence.retrieval_label', ...process.argv.slice(3)]
+    : target === 'local-smoke'
+      ? ['-m', 'marketrift_intelligence.local_smoke', ...process.argv.slice(3)]
     : null;
 if (!args) throw new Error('Expected worker, http, quality, steam-eval, b2b-eval or evaluate test');
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');

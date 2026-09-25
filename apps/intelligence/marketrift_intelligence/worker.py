@@ -6,6 +6,7 @@ import signal
 from bullmq import Worker
 
 from .analyze import analyze
+from .embeddings import embed
 from .evidence_index import index_source
 from .evidence_queue import publish_index
 from .g2_reviews import sync_g2_reviews
@@ -82,6 +83,8 @@ async def process_index(job, _token):
 
 
 async def main() -> None:
+    if os.getenv("EMBEDDING_PROVIDER") == "local":
+        embed("MarketRift local model warmup")
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for event in (signal.SIGINT, signal.SIGTERM):

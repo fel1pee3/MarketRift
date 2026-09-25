@@ -21,6 +21,13 @@ def test_controlled_embedding_is_deterministic_and_test_only(monkeypatch):
     assert embed("falha de cobrança") != embed("bom suporte")
 
 
+def test_local_mode_fails_clearly_without_pinned_weights(monkeypatch, tmp_path):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "local")
+    monkeypatch.setenv("EMBEDDING_MODEL_PATH", str(tmp_path / "absent"))
+    with pytest.raises(RuntimeError, match="local_embedding_model_missing"):
+        embed("suporte demorou")
+
+
 def test_chunks_are_literal_and_bounded():
     text = "Primeira frase.\n" + "falha na exportação de faturas " * 100
     result = chunks(text)

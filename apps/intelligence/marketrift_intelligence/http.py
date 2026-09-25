@@ -1,12 +1,22 @@
 import os
 import secrets
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
-from .embeddings import DIMENSIONS, embed, identity
+from .embeddings import DIMENSIONS, embed, identity, verify_local_model
 
-app = FastAPI(title="MarketRift Intelligence Internal")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    if os.getenv("EMBEDDING_PROVIDER") == "local":
+        verify_local_model()
+        embed("MarketRift local model warmup")
+    yield
+
+
+app = FastAPI(title="MarketRift Intelligence Internal", lifespan=lifespan)
 
 
 @app.get("/health")
@@ -18,12 +28,29 @@ class EmbeddingRequest(BaseModel):
     text: str = Field(min_length=1, max_length=1000)
 
 
-@app.post("/internal/embeddings")
-def embedding(request: EmbeddingRequest, x_internal_token: str = Header(default="")) -> dict:
+def authorize(x_internal_token: str) -> None:
     expected = os.getenv("EMBEDDING_INTERNAL_TOKEN", "")
     if not expected or (os.getenv('NODE_ENV') == 'production' and
                         (len(expected) < 32 or expected.startswith('replace-with-'))) or not secrets.compare_digest(x_internal_token, expected):
         raise HTTPException(status_code=401, detail="internal_auth_required")
+
+
+@app.get("/internal/embeddings/status")
+def embedding_status(x_internal_token: str = Header(default="")) -> dict:
+    authorize(x_internal_token)
+    try:
+        model, version = identity()
+        if os.getenv("EMBEDDING_PROVIDER", "controlled") == "local":
+            verify_local_model()
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=503, detail=str(error)) from None
+    return {"model": model, "version": version, "dimensions": DIMENSIONS,
+            "test_only": model.startswith("controlled-")}
+
+
+@app.post("/internal/embeddings")
+def embedding(request: EmbeddingRequest, x_internal_token: str = Header(default="")) -> dict:
+    authorize(x_internal_token)
     try:
         model, version = identity()
         vector = embed(request.text)

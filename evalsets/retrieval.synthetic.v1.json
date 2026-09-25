@@ -1,0 +1,20 @@
+{
+  "version": "retrieval.synthetic.v1",
+  "origin": "synthetic",
+  "index_version": "evidence_chunks/013/exact-cosine/chunks-v1",
+  "documents": [
+    {"id": "support-slow", "source_type": "b2b_review", "text": "Exemplo sintético: o suporte demorou quatro dias para responder ao chamado sobre acesso.", "synthetic": true},
+    {"id": "support-fast", "source_type": "b2b_review", "text": "Synthetic example: support answered our access request within one hour.", "synthetic": true},
+    {"id": "billing-double", "source_type": "b2b_review", "text": "Exemplo sintético: a fatura cobrou duas vezes a mesma assinatura mensal.", "synthetic": true},
+    {"id": "usability-positive", "source_type": "b2b_review", "text": "Exemplo sintético: a navegação é simples e encontrei os relatórios rapidamente.", "synthetic": true},
+    {"id": "export-missing", "source_type": "github_discussion", "text": "Synthetic community feedback: CSV export is missing from the dashboard.", "synthetic": true}
+  ],
+  "questions": [
+    {"id": "pt-support-paraphrase", "text": "Quem esperou vários dias para obter ajuda com o acesso?", "relevant_ids": ["support-slow"]},
+    {"id": "en-support-paraphrase", "text": "Which evidence says customer service took days to reply?", "relevant_ids": ["support-slow"]},
+    {"id": "pt-billing", "text": "Há uma cobrança repetida da assinatura?", "relevant_ids": ["billing-double"]},
+    {"id": "pt-export-cross-language", "text": "Alguém pediu exportação CSV no painel?", "relevant_ids": ["export-missing"]},
+    {"id": "pt-fast-decoy", "text": "Qual suporte respondeu em menos de uma hora?", "relevant_ids": ["support-fast"]},
+    {"id": "irrelevant", "text": "Qual é o desconto educacional disponível?", "relevant_ids": []}
+  ]
+}

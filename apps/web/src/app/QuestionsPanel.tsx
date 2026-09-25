@@ -1,6 +1,6 @@
 'use client';
 
-import React, { FormEvent, useState } from 'react';
+import React, { FormEvent, useEffect, useState } from 'react';
 
 type Product = { id: string; name: string };
 type Source = { id: string; source_type: string; url: string; product_id: string };
@@ -9,6 +9,13 @@ type Citation = { id: string; source_type: string; product_name: string; source_
   ambiguous_association: boolean; distance: number };
 type Answer = { answer: string; citations: Citation[]; model: string; model_version: string;
   test_only: boolean; elapsed_ms: number; cost_usd: number };
+type IndexStatus = { model: string; model_version: string; test_only: boolean; sources: {
+  source_id: string; state: 'complete' | 'partial' | 'not_indexed_for_model' | 'no_eligible_content' | 'disabled';
+  total_chunks: number; ready_chunks: number; controlled_test_chunks: number }[] };
+const indexLabels: Record<string, string> = { complete: 'Indexada para o modelo ativo',
+  partial: 'Indexação parcial; clique novamente para continuar',
+  not_indexed_for_model: 'Não indexada para o modelo ativo',
+  no_eligible_content: 'Sem conteúdo elegível', disabled: 'Fonte desativada' };
 
 const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const labels: Record<string, string> = {
@@ -32,6 +39,36 @@ export default function QuestionsPanel({ products, sources, csrfToken, role }:
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [queued, setQueued] = useState('');
+  const [selectedSource, setSelectedSource] = useState(indexableSources[0]?.id ?? '');
+  const [indexStatus, setIndexStatus] = useState<IndexStatus | null>(null);
+  const [statusError, setStatusError] = useState('');
+  const sourceIds = indexableSources.map(source => source.id).join(',');
+  async function refreshStatus(): Promise<void> {
+    try {
+      const response = await fetch(`${apiBase}/v1/evidence/index-status`,
+        { credentials: 'include', cache: 'no-store' });
+      if (!response.ok) throw new Error('Estado do índice indisponível; confira o serviço local de embeddings.');
+      setIndexStatus(await response.json() as IndexStatus); setStatusError('');
+    } catch (cause) { setStatusError(cause instanceof Error ? cause.message : String(cause)); }
+  }
+  useEffect(() => {
+    if (!indexableSources.some(source => source.id === selectedSource))
+      setSelectedSource(indexableSources[0]?.id ?? '');
+    void refreshStatus();
+    // Source IDs change when the active tenant changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sourceIds]);
+  useEffect(() => {
+    if (!queued) return;
+    let checks = 0;
+    const timer = setInterval(() => {
+      void refreshStatus();
+      if (++checks >= 12) clearInterval(timer);
+    }, 3000);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queued, sourceIds]);
+  const selectedStatus = indexStatus?.sources.find(source => source.source_id === selectedSource);
   async function post<T>(path: string, body: object): Promise<T> {
     const response = await fetch(`${apiBase}/v1/evidence/${path}`, {
       method: 'POST', credentials: 'include', cache: 'no-store',
@@ -52,7 +89,7 @@ export default function QuestionsPanel({ products, sources, csrfToken, role }:
       setResult(await post<Answer>('questions', {
         question: form.get('question'), product_id: form.get('product_id') || undefined,
         source_type: form.get('source_type') || undefined, from: form.get('from') || undefined,
-        to: form.get('to') || undefined, include_synthetic: form.get('include_synthetic') === 'on', limit: 5,
+        to: form.get('to') || undefined, include_synthetic: form.get('include_synthetic') === 'on', limit: 1,
       }));
     } catch (cause) { setError(cause instanceof Error ? cause.message : String(cause)); }
     finally { setBusy(false); }
@@ -68,13 +105,22 @@ export default function QuestionsPanel({ products, sources, csrfToken, role }:
   }
   return <section className="card wide">
     <h2>Perguntas sobre evidências</h2>
-    <p>Busca por similaridade e resposta extrativa: cada frase cita um trecho recuperado. Reviews, Issues, Discussions e páginas são populações distintas. Não calcula opinião do mercado. O modo controlado é TESTE e não mede qualidade semântica.</p>
+    <p>Busca por similaridade e resposta extrativa: a resposta mostra somente o melhor trecho recuperado, com citação literal. Confirme se ele realmente responde à pergunta. Reviews, Issues, Discussions e páginas são populações distintas. Não calcula opinião do mercado. O modo controlado é TESTE e não mede qualidade semântica.</p>
     {role !== 'viewer' && <form onSubmit={event => void index(event)}>
-      <label>Preparar índice de uma fonte<select name="source_id" required>
+      <label>Preparar índice de uma fonte<select name="source_id" value={selectedSource}
+        onChange={event => setSelectedSource(event.target.value)} required>
         {indexableSources.map(source =>
           <option key={source.id} value={source.id}>{products.find(p => p.id === source.product_id)?.name}: {source.url}</option>)}
-      </select></label><button disabled={busy || !indexableSources.length}>Indexar fonte</button>
+      </select></label><button disabled={busy || !indexableSources.length}>Indexar/continuar fonte (até 16 trechos)</button>
     </form>}
+    {indexStatus && <p role="status">Modelo ativo: {indexStatus.model} ({indexStatus.model_version}).
+      {selectedStatus && <> {indexLabels[selectedStatus.state]}: {selectedStatus.ready_chunks}/{selectedStatus.total_chunks} trechos.
+        {selectedStatus.controlled_test_chunks > 0 && indexStatus.model !== 'controlled-hash-TESTE' &&
+          <> Há {selectedStatus.controlled_test_chunks} vetores controlled-hash-TESTE separados; eles não entram nesta busca.</>}</>}
+      {indexStatus.sources.some(source => source.state === 'partial' || source.state === 'not_indexed_for_model') &&
+        <> Cobertura da empresa parcial para o modelo ativo.</>}
+    </p>}
+    {statusError && <p role="alert">{statusError}</p>}
     {queued && <p role="status">{queued}</p>}
     <form onSubmit={event => void ask(event)}>
       <label>Pergunta<input name="question" minLength={3} maxLength={500} required placeholder="Quais problemas aparecem neste produto?" /></label>
@@ -88,7 +134,7 @@ export default function QuestionsPanel({ products, sources, csrfToken, role }:
     </form>
     {error && <p role="alert" className="error">{error}</p>}
     {result && <div aria-live="polite">
-      <p>{result.test_only ? 'TESTE, sem avaliação de qualidade' : 'Resposta extrativa local'} · modelo: {result.model} ({result.model_version}) · {result.elapsed_ms} ms nesta consulta · custo de IA externa USD {result.cost_usd}</p>
+      <p>{result.test_only ? 'TESTE, sem avaliação de qualidade' : 'Resposta extrativa local'} · modelo: {result.model} ({result.model_version}) · {result.elapsed_ms} ms nesta consulta · custo de IA externa USD {result.cost_usd}. Consulte a cobertura acima antes de interpretar ausência de evidência.</p>
       <p style={{ whiteSpace: 'pre-wrap' }}>{result.answer}</p>
       {result.citations.map(citation => <article key={citation.id}>
         <strong>{labels[citation.source_type] ?? citation.source_type}</strong> · {citation.product_name} · {new Date(citation.observed_at).toLocaleDateString('pt-BR')}

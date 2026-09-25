@@ -9,6 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .embeddings import DIMENSIONS, embed, identity
 
+MAX_CHUNKS_PER_JOB = 16
+
 
 class IndexJob(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -119,15 +121,18 @@ async def index_source(payload: object) -> dict[str, int]:
             for chunk_id, document_id, snapshot_id, number, digest, old_content_version, old_model, old_version in existing:
                 key = ("document", str(document_id), number) if document_id else ("snapshot", str(snapshot_id), number)
                 target = desired.get(key)
-                if target and target[1] == digest and target[2] == old_content_version and old_model == model and old_version == version:
-                    unchanged.add(key)
+                if target and target[1] == digest and target[2] == old_content_version:
+                    # Keep valid vectors of the other model for an explicit baseline comparison.
+                    # Queries always require the exact active model AND revision.
+                    if old_model == model and old_version == version:
+                        unchanged.add(key)
                     continue
+                # A removed, edited or revoked source must not retain stale text in any model.
                 await connection.execute("DELETE FROM marketrift.evidence_chunks WHERE tenant_id = %s AND id = %s",
                                          (job.tenant_id, chunk_id))
                 removed += 1
-            for (kind, item_id, number), (text, digest, content_version, synthetic, source_type, product_id) in desired.items():
-                if (kind, item_id, number) in unchanged:
-                    continue
+            pending = [(key, value) for key, value in desired.items() if key not in unchanged]
+            for (kind, item_id, number), (text, digest, content_version, synthetic, source_type, product_id) in pending[:MAX_CHUNKS_PER_JOB]:
                 vector = "[" + ",".join(str(value) for value in embed(text)) + "]"
                 await connection.execute(
                     "INSERT INTO marketrift.evidence_chunks (tenant_id, source_id, product_id, document_id, "
@@ -138,4 +143,6 @@ async def index_source(payload: object) -> dict[str, int]:
                      item_id if kind == "snapshot" else None, source_type, number, content_version, text, digest,
                     model, version, DIMENSIONS, synthetic, vector))
                 indexed += 1
-    return {"indexed": indexed, "removed": removed, "unchanged": len(unchanged)}
+    return {"indexed": indexed, "removed": removed, "unchanged": len(unchanged),
+            "ready": len(unchanged) + indexed, "total": len(desired),
+            "remaining": len(pending) - indexed}

@@ -13,6 +13,6 @@ test('question panel renders source/product filters and an explicit synthetic te
   assert.match(html, /Perguntas sobre evidências/);
   assert.match(html, /Produto de teste/);
   assert.match(html, /Incluir dados sintéticos só para TESTE/);
-  assert.match(html, /Indexar fonte/);
+  assert.match(html, /Indexar\/continuar fonte \(até 16 trechos\)/);
   assert.match(html, /Discussion pública/);
 });

@@ -1,10 +1,11 @@
-import { BadRequestException, Body, Controller, Inject, Post, Req, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Body, Controller, Get, Inject, Post, Query, Req, ServiceUnavailableException } from '@nestjs/common';
 import { randomUUID } from 'node:crypto';
 import type { Request } from 'express';
 import type { QueryResultRow } from 'pg';
 import { z } from 'zod';
 import { Accounts } from './accounts';
 import { Db } from './db';
+import { sourceIndexStatus, type SourceIndexStatus } from './index-status';
 import { Jobs } from './queue';
 
 const uuid = z.uuid();
@@ -13,7 +14,7 @@ const questionSchema = z.object({ question: z.string().trim().min(3).max(500),
   source_type: z.enum(['review', 'b2b_review', 'github_issue', 'github_discussion',
     'pricing_page', 'release_notes']).optional(),
   from: z.iso.date().optional(), to: z.iso.date().optional(),
-  include_synthetic: z.boolean().default(false), limit: z.number().int().min(1).max(10).default(5),
+  include_synthetic: z.boolean().default(false), limit: z.literal(1).default(1),
 }).strict().refine(value => !value.from || !value.to || value.from <= value.to,
   { message: 'Invalid period' });
 
@@ -27,6 +28,11 @@ type Citation = { id: string; source_type: string; product_name: string; source_
   observed_at: Date; quote: string; synthetic: boolean; data_status: string | null;
   ambiguous_association: boolean; distance: number };
 type Embedding = { model: string; version: string; dimensions: number; vector: number[]; test_only: boolean };
+type ModelStatus = Omit<Embedding, 'vector'>;
+const localModel = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2';
+const localRevision = 'e8f8c211226b894fcb81acc59f3b34ba3efd5f42';
+const statusSchema = z.object({ model: z.string(), version: z.string(), dimensions: z.literal(384),
+  test_only: z.boolean() });
 
 function input(value: unknown): SearchInput {
   const result = questionSchema.safeParse(value);
@@ -44,25 +50,55 @@ export function extractiveAnswer(citations: Citation[], selectedIds: string[]): 
   }).join('\n');
 }
 
-async function embeddingFor(text: string): Promise<Embedding> {
+async function internalEmbedding(path: string, text?: string): Promise<unknown> {
   const token = process.env.EMBEDDING_INTERNAL_TOKEN;
   const base = process.env.EMBEDDING_INTERNAL_URL ?? 'http://127.0.0.1:8000';
   if (!token || (process.env.NODE_ENV === 'production' && (token.length < 32 || token.startsWith('replace-with-')))
     || !/^http:\/\/(127\.0\.0\.1|localhost):\d{2,5}$/.test(base))
     throw new ServiceUnavailableException('Serviço de embeddings local não configurado');
   try {
-    const response = await fetch(`${base}/internal/embeddings`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Internal-Token': token },
-      body: JSON.stringify({ text }), signal: AbortSignal.timeout(5000),
+    const response = await fetch(`${base}${path}`, {
+      method: text === undefined ? 'GET' : 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Internal-Token': token },
+      body: text === undefined ? undefined : JSON.stringify({ text }),
+      signal: AbortSignal.timeout(60000),
     });
-    if (!response.ok) throw new Error('embedding_unavailable');
-    const value: unknown = await response.json();
-    const schema = z.object({ model: z.string(), version: z.string(), dimensions: z.literal(384),
-      vector: z.array(z.number().finite()).length(384), test_only: z.boolean() });
-    return schema.parse(value);
-  } catch {
-    throw new ServiceUnavailableException('Serviço de embeddings local indisponível');
+    if (!response.ok) {
+      const value: unknown = await response.json().catch(() => null);
+      if (response.status === 503 && typeof value === 'object' && value !== null && 'detail' in value &&
+        typeof value.detail === 'string' && value.detail.startsWith('local_embedding_'))
+        throw new ServiceUnavailableException('Modelo local ausente, incompleto ou incompatível; execute prepare:embeddings');
+      throw new Error('embedding_unavailable');
+    }
+    return await response.json();
+  } catch (error) {
+    if (error instanceof ServiceUnavailableException) throw error;
+    throw new ServiceUnavailableException(process.env.EMBEDDING_PROVIDER === 'local' ?
+      'Modelo local indisponível; confira prepare:embeddings e reinicie intelligence-http' :
+      'Serviço de embeddings local indisponível');
   }
+}
+
+export function assertActiveModel(value: ModelStatus): void {
+  const provider = process.env.EMBEDDING_PROVIDER ?? 'controlled';
+  const expected = provider === 'local' ? [localModel, localRevision] :
+    provider === 'controlled' ? ['controlled-hash-TESTE', '1'] : [];
+  if (value.model !== expected[0] || value.version !== expected[1] ||
+    value.test_only !== (provider === 'controlled'))
+    throw new ServiceUnavailableException('Versão do modelo de embeddings incompatível entre API e serviço local');
+}
+
+async function embeddingFor(text: string): Promise<Embedding> {
+  const value = statusSchema.extend({ vector: z.array(z.number().finite()).length(384) })
+    .parse(await internalEmbedding('/internal/embeddings', text));
+  assertActiveModel(value);
+  return value;
+}
+
+async function activeModelStatus(): Promise<ModelStatus> {
+  const value = statusSchema.parse(await internalEmbedding('/internal/embeddings/status'));
+  assertActiveModel(value);
+  return value;
 }
 
 const searchSql = `SELECT e.id, e.source_id, e.product_id, p.name AS product_name,
@@ -121,6 +157,19 @@ export class SemanticController {
   constructor(@Inject(Db) private readonly db: Db, @Inject(Accounts) private readonly accounts: Accounts,
     @Inject(Jobs) private readonly jobs: Jobs) {}
 
+  @Get('index-status')
+  async indexStatus(@Req() request: Request, @Query() query: unknown): Promise<{
+    model: string; model_version: string; test_only: boolean; sources: SourceIndexStatus[];
+  }> {
+    const principal = await this.accounts.principal(request);
+    const parsed = z.object({ source_id: uuid.optional() }).strict().safeParse(query);
+    if (!parsed.success) throw new BadRequestException('Invalid source_id');
+    const active = await activeModelStatus();
+    const sources = await this.db.tenant(principal.tenantId, client =>
+      sourceIndexStatus(this.db, client, active.model, active.version, parsed.data.source_id));
+    return { model: active.model, model_version: active.version, test_only: active.test_only, sources };
+  }
+
   @Post('reindex')
   async requestIndex(@Req() request: Request, @Body() body: unknown): Promise<{ status: 'queued' }> {
     const principal = await this.accounts.principal(request, ['owner', 'admin', 'analyst']);
@@ -161,7 +210,7 @@ export class SemanticController {
         distance: row.distance });
       if (citations.length >= f.limit) break;
     }
-    const answer = extractiveAnswer(citations, citations.slice(0, 3).map(item => item.id));
+    const answer = extractiveAnswer(citations, citations.map(item => item.id));
     return { answer, citations, model: embedded.model, model_version: embedded.version,
       test_only: embedded.test_only || f.include_synthetic, elapsed_ms: Math.round(performance.now() - start),
       cost_usd: 0 };

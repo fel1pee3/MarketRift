@@ -6,6 +6,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from marketrift_intelligence import evidence_index
 from marketrift_intelligence.evidence_index import index_source
 
 pytestmark = pytest.mark.skipif(
@@ -22,6 +23,7 @@ def run(payload):
 
 def test_index_source_checks_tenant_and_rls(request, monkeypatch):
     monkeypatch.setenv("EMBEDDING_PROVIDER", "controlled")
+    monkeypatch.setattr(evidence_index, "MAX_CHUNKS_PER_JOB", 1)
     tenant_a, tenant_b = str(uuid4()), str(uuid4())
     source_a = str(uuid4())
 
@@ -45,12 +47,16 @@ def test_index_source_checks_tenant_and_rls(request, monkeypatch):
                        (source, tenant, product, f"https://example.invalid/{tenant}"))
             db.execute("INSERT INTO marketrift.documents (id, tenant_id, source_id, document_type, "
                        "external_key, source_url, body, synthetic, review_data_status) "
-                       "VALUES (%s, %s, %s, 'b2b_review', 'one', %s, 'Synthetic support delay.', true, "
-                       "'synthetic_fixture')", (document, tenant, source, f"https://example.invalid/{tenant}/1"))
+                       "VALUES (%s, %s, %s, 'b2b_review', 'one', %s, %s, true, "
+                       "'synthetic_fixture')", (document, tenant, source, f"https://example.invalid/{tenant}/1",
+                                               "Synthetic support delay. " * 30))
     job = {"contract_version": "index-evidence.v1", "tenant_id": tenant_a,
            "source_id": source_a, "idempotency_key": "index-integration-test"}
-    assert run(job)["indexed"] == 1
-    assert run(job)["unchanged"] == 1
+    first = run(job)
+    assert first["indexed"] == 1 and first["remaining"] > 0
+    resumed = run(job)
+    assert resumed["indexed"] == 1 and resumed["remaining"] == 0
+    assert run(job)["unchanged"] == 2
     with pytest.raises(ValueError, match="source_not_in_tenant"):
         run({**job, "tenant_id": tenant_b})
     with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as db:
@@ -58,4 +64,15 @@ def test_index_source_checks_tenant_and_rls(request, monkeypatch):
         assert db.execute("SELECT count(*) FROM marketrift.evidence_chunks").fetchone()[0] == 0
         db.commit()
         db.execute("SELECT set_config('app.tenant_id', %s, true)", (tenant_a,))
-        assert db.execute("SELECT count(*) FROM marketrift.evidence_chunks").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM marketrift.evidence_chunks").fetchone()[0] == 2
+
+    # A new model gets its own rows; the old controlled vectors are never used as local vectors.
+    monkeypatch.setattr(evidence_index, "identity", lambda: ("local-test-model", "fixed-revision"))
+    monkeypatch.setattr(evidence_index, "embed", lambda _: [1.0] + [0.0] * 383)
+    assert run(job)["remaining"] == 1
+    assert run(job)["remaining"] == 0
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as db:
+        assert db.execute("SELECT count(DISTINCT embedding_model) FROM marketrift.evidence_chunks "
+                          "WHERE tenant_id = %s", (tenant_a,)).fetchone()[0] == 2
+        db.execute("UPDATE marketrift.sources SET storage_permitted = false WHERE id = %s", (source_a,))
+    assert run(job)["removed"] == 4
