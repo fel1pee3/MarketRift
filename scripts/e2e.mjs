@@ -7,6 +7,7 @@ import pg from 'pg';
 
 const apiPort = Number(process.env.E2E_API_PORT ?? 3211);
 const webPort = Number(process.env.E2E_WEB_PORT ?? 3210);
+const embeddingPort = Number(process.env.E2E_EMBEDDING_PORT ?? 3212);
 const webOrigin = `http://localhost:${webPort}`;
 const apiBase = `http://localhost:${apiPort}/v1`;
 // Use a separate local Redis database so an already running development worker
@@ -121,7 +122,9 @@ const steamMock = createServer((request, response) => {
 await new Promise(resolve => steamMock.listen(0, '127.0.0.1', resolve));
 const steamPort = steamMock.address().port;
 const childEnv = { ...process.env, API_PORT: String(apiPort), WEB_ORIGIN: webOrigin,
-  REDIS_URL: e2eRedisUrl.toString() };
+  REDIS_URL: e2eRedisUrl.toString(), EMBEDDING_PROVIDER: 'controlled',
+  EMBEDDING_INTERNAL_TOKEN: 'e2e-internal-placeholder',
+  EMBEDDING_INTERNAL_URL: `http://127.0.0.1:${embeddingPort}` };
 const apiProcess = spawn(process.execPath, ['apps/api/dist/main.js'], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
@@ -134,8 +137,12 @@ const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
     G2_SYNDICATION_TOKEN: 'e2e-g2-placeholder' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
+const embeddingProcess = spawn(python, ['-m', 'uvicorn', 'marketrift_intelligence.http:app',
+  '--host', '127.0.0.1', '--port', String(embeddingPort)], {
+  env: childEnv, stdio: ['ignore', 'pipe', 'pipe'],
+});
 const webProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', 'apps/web', '-p', String(webPort)], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
-const children = [apiProcess, workerProcess, webProcess];
+const children = [apiProcess, workerProcess, embeddingProcess, webProcess];
 let errors = '';
 const cleanupTenants = [];
 const cleanupEmails = [];
@@ -178,7 +185,8 @@ class Browser {
 }
 async function ready() {
   for (let attempt = 0; attempt < 100; attempt++) {
-    try { await fetch(`${apiBase}/me`); return; } catch { await delay(100); }
+    try { await Promise.all([fetch(`${apiBase}/me`), fetch(`http://127.0.0.1:${embeddingPort}/health`)]); return; }
+    catch { await delay(100); }
   }
   throw new Error(`API did not start: ${errors}`);
 }
@@ -484,12 +492,104 @@ try {
   assert.equal(b2bEvidence[0].analysis_model, 'controlled-test-fixture-v1');
   assert.equal(b2bEvidence[0].issues.length, 1);
   assert.ok(completedB2B.body.includes(b2bEvidence[0].issues[0].evidence_quote));
+  assert.equal((await viewer.call('evidence/reindex', { method: 'POST',
+    body: JSON.stringify({ source_id: b2bSource.body.id }) })).status, 403);
+  assert.equal((await b.call('evidence/reindex', { method: 'POST',
+    body: JSON.stringify({ source_id: b2bSource.body.id }) })).status, 400);
+  const question = { question: 'exportação faturas falhou', source_type: 'b2b_review' };
+  let indexedAnswer;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    indexedAnswer = await viewer.call('evidence/questions', { method: 'POST',
+      body: JSON.stringify({ ...question, include_synthetic: true }) });
+    if (indexedAnswer.body?.citations?.length) break;
+    await delay(200);
+  }
+  assert.equal(indexedAnswer.status, 201, JSON.stringify(indexedAnswer.body));
+  assert.equal(indexedAnswer.body.citations.length, 1, JSON.stringify(indexedAnswer.body));
+  assert.equal(indexedAnswer.body.test_only, true);
+  assert.equal(indexedAnswer.body.cost_usd, 0);
+  assert.ok(completedB2B.body.includes(indexedAnswer.body.citations[0].quote));
+  assert.ok(indexedAnswer.body.answer.includes(indexedAnswer.body.citations[0].id));
+  console.log(`Controlled retrieval E2E latency: ${indexedAnswer.body.elapsed_ms} ms (test fixture, not a production SLA)`);
+  const indexDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await indexDb.connect();
+  try {
+    const count = async () => Number((await indexDb.query(
+      'SELECT count(*)::integer AS n FROM marketrift.evidence_chunks WHERE tenant_id = $1 AND source_id = $2',
+      [registeredA.body.tenant_id, b2bSource.body.id])).rows[0].n);
+    const beforeReplay = await count();
+    assert.equal(beforeReplay, 1);
+    assert.equal((await analyst.call('evidence/reindex', { method: 'POST',
+      body: JSON.stringify({ source_id: b2bSource.body.id }) })).status, 201);
+    for (let attempt = 0; attempt < 50; attempt++) { await delay(100); }
+    assert.equal(await count(), beforeReplay);
+    await indexDb.query('UPDATE marketrift.documents SET body = $1 WHERE id = $2 AND tenant_id = $3',
+      ['Exemplo sintético: a integração falhou ao salvar.', b2bDocuments[0].id, registeredA.body.tenant_id]);
+    assert.equal((await viewer.call('evidence/questions', { method: 'POST',
+      body: JSON.stringify({ ...question, include_synthetic: true }) })).body.citations.length, 0);
+    assert.equal((await analyst.call('evidence/reindex', { method: 'POST',
+      body: JSON.stringify({ source_id: b2bSource.body.id }) })).status, 201);
+    let changed;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      changed = await viewer.call('evidence/questions', { method: 'POST',
+        body: JSON.stringify({ question: 'integração falhou', source_type: 'b2b_review',
+          include_synthetic: true }) });
+      if (changed.body?.citations?.length) break;
+      await delay(100);
+    }
+    assert.equal(changed.body.citations.length, 1, JSON.stringify(changed.body));
+    assert.ok(changed.body.citations[0].quote.includes('integração falhou'));
+    assert.equal(await count(), 1);
+  } finally { await indexDb.end(); }
+  const defaultAnswer = await viewer.call('evidence/questions', { method: 'POST', body: JSON.stringify(question) });
+  assert.equal(defaultAnswer.body.citations.length, 0);
+  assert.match(defaultAnswer.body.answer, /Não há evidência suficiente/);
+  const sharedSource = await a.call('sources/b2b-csv', { method: 'POST',
+    body: JSON.stringify({ ...b2bFixture, product_id: product.body.id }) });
+  assert.equal(sharedSource.status, 201);
+  const sharedCsv = new FormData(); sharedCsv.set('source_id', sharedSource.body.id);
+  sharedCsv.set('file', new File([
+    'external_key,source_url,published_at,body,language,rating,synthetic\n'
+    + 'b2b-test-1,https://example.invalid/reviews/1,2026-09-01T10:00:00Z,Exemplo sintético: a integração falhou ao salvar.,,,true\n',
+  ], 'shared.csv', { type: 'text/csv' }));
+  const sharedImport = await analyst.call('imports/b2b-reviews', { method: 'POST', body: sharedCsv });
+  assert.equal(sharedImport.status, 201);
+  await waitForImport(a, sharedImport.body.id);
+  let sharedAnswer;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    sharedAnswer = await viewer.call('evidence/questions', { method: 'POST',
+      body: JSON.stringify({ question: 'integração falhou', source_type: 'b2b_review',
+        include_synthetic: true }) });
+    if (sharedAnswer.body?.citations?.[0]?.ambiguous_association) break;
+    await delay(100);
+  }
+  assert.equal(sharedAnswer.body.citations.length, 1);
+  assert.equal(sharedAnswer.body.citations[0].ambiguous_association, true);
+  assert.equal((await a.call(`sources/${sharedSource.body.id}/revoke-review-rights`, {
+    method: 'POST' })).body.documents_removed, 1);
+  assert.equal((await b.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify({ ...question, include_synthetic: true }) })).body.citations.length, 0);
+  assert.equal((await viewer.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify({ ...question, product_id: registeredB.body.tenant_id,
+      include_synthetic: true }) })).body.citations.length, 0);
+  assert.equal((await fetch(`http://127.0.0.1:${embeddingPort}/internal/embeddings`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ text: 'segredo' }),
+  })).status, 401);
   assert.equal((await b.call('evidence/search?source_type=b2b_review')).body.total, 0);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 1);
   assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/analyze`, { method: 'POST' })).status, 404);
   assert.equal((await viewer.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 403);
   assert.equal((await b.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
   assert.equal((await a.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).body.documents_removed, 1);
+  const purgeDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await purgeDb.connect();
+  try {
+    assert.equal(Number((await purgeDb.query('SELECT count(*)::integer AS n FROM marketrift.evidence_chunks WHERE source_id = $1',
+      [b2bSource.body.id])).rows[0].n), 0);
+  } finally { await purgeDb.end(); }
+  assert.equal((await viewer.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify({ ...question, include_synthetic: true }) })).body.citations.length, 0);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 0);
   const realRightsSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify({
     product_id: competitor.body.id, url: 'https://authorized-vendor.io/reviews',
@@ -865,6 +965,17 @@ try {
   const foreignImport = await b.call('imports/reviews', { method: 'POST', body: foreignForm });
   assert.equal(foreignImport.status, 201);
   await waitForImport(b, foreignImport.body.id);
+  const foreignQuestion = { question: 'Foreign tenant only', source_type: 'review',
+    product_id: foreignProduct.body.id, include_synthetic: true };
+  let foreignAnswer;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    foreignAnswer = await b.call('evidence/questions', { method: 'POST', body: JSON.stringify(foreignQuestion) });
+    if (foreignAnswer.body?.citations?.length) break;
+    await delay(100);
+  }
+  assert.equal(foreignAnswer.body.citations.length, 1);
+  assert.equal((await a.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify(foreignQuestion) })).body.citations.length, 0);
   assert.equal((await b.call('evidence/search')).body.total, 1);
   assert.equal((await a.call('evidence/search?q=Foreign%20tenant%20only')).body.total, 0);
   assert.equal((await b.call(`evidence/search?product_id=${competitor.body.id}`)).body.total, 0);
@@ -902,11 +1013,15 @@ try {
   assert.equal((await oldSession.call('auth/session')).status, 401);
   assert.equal((await analyst.call(`imports/${first.body.id}`)).status, 404);
   assert.equal((await upload(analyst, source.body.id)).status, 403);
+  assert.equal((await analyst.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify(foreignQuestion) })).body.citations.length, 1);
   assert.equal((await analyst.call('auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: randomUUID() }) })).status, 403);
   const switched = await analyst.call('auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: registeredA.body.tenant_id }) });
   assert.equal(switched.status, 200, JSON.stringify(switched.body));
   assert.equal(switched.body.role, 'analyst');
   assert.equal((await analyst.call('documents')).body.filter(document => document.external_key === externalKey).length, 1);
+  assert.equal((await analyst.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify(foreignQuestion) })).body.citations.length, 0);
 
   assert.equal((await viewer.call('auth/logout', { method: 'POST', withoutCsrf: true })).status, 403);
   assert.equal((await viewer.call('auth/logout', { method: 'POST' })).status, 204);
@@ -917,6 +1032,8 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
+  assert.equal((await admin.call('evidence/questions', { method: 'POST',
+    body: JSON.stringify(foreignQuestion) })).status, 401);
   console.log('E2E passed: sessions, RBAC, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
@@ -932,7 +1049,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

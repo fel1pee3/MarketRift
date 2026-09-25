@@ -39,6 +39,15 @@ export class Jobs implements OnModuleDestroy {
   private readonly webPageQueue = new Queue<CheckWebPageJobV1>('web-pages', {
     connection: this.connection,
   });
+  private readonly evidenceQueue = new Queue<{ contract_version: 'index-evidence.v1'; tenant_id: string;
+    source_id: string; idempotency_key: string }>('evidence-index', { connection: this.connection });
+
+  async publishEvidenceIndex(tenantId: string, sourceId: string, key: string): Promise<void> {
+    const job = { contract_version: 'index-evidence.v1' as const, tenant_id: tenantId,
+      source_id: sourceId, idempotency_key: key };
+    await this.evidenceQueue.add('index-evidence.v1', job, { jobId: key, attempts: 3,
+      backoff: { type: 'exponential', delay: 1000 }, removeOnComplete: true, removeOnFail: true });
+  }
 
   async publish(job: IngestReviewJobV1): Promise<void> {
     const existing = await this.queue.getJob(job.idempotency_key);
@@ -100,5 +109,5 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close()]); }
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.evidenceQueue.close()]); }
 }

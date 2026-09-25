@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "index-evidence.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["contract_version", "tenant_id", "source_id", "idempotency_key"],
+  "properties": {
+    "contract_version": { "const": "index-evidence.v1" },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "source_id": { "type": "string", "format": "uuid" },
+    "idempotency_key": { "type": "string", "minLength": 8, "maxLength": 150 }
+  }
+}

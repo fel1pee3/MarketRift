@@ -5,6 +5,7 @@ node_modules/
 .next-dev/
 dist/
 .venv/
+.models/
 __pycache__/
 *.pyc
 .pytest_cache/

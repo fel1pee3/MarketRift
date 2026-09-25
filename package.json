@@ -10,6 +10,7 @@
     "dev:scheduler": "node --env-file=.env --import tsx apps/api/src/page-scheduler-main.ts",
     "start:scheduler": "node --env-file=.env apps/api/dist/page-scheduler-main.js",
     "dev:intelligence-http": "node --env-file=.env scripts/run-python.mjs http",
+    "prepare:embeddings": "node --env-file=.env scripts/run-python.mjs prepare-embeddings",
     "eval:analysis:test": "node --env-file=.env scripts/run-python.mjs evaluate test",
     "eval:analysis:openai": "node --env-file=.env scripts/run-python.mjs quality --provider openai",
     "eval:quality": "node --env-file=.env scripts/run-python.mjs quality",
@@ -30,7 +31,8 @@
     "db:migrate:page-monitoring": "node --env-file=.env scripts/migrate-page-monitoring.mjs",
     "db:migrate:github-discussions": "node --env-file=.env scripts/migrate-github-discussions.mjs",
     "db:migrate:b2b-reviews": "node --env-file=.env scripts/migrate-b2b-reviews.mjs",
-    "db:migrate:b2b-analysis": "node --env-file=.env scripts/migrate-b2b-analysis.mjs"
+    "db:migrate:b2b-analysis": "node --env-file=.env scripts/migrate-b2b-analysis.mjs",
+    "db:migrate:evidence-chunks": "node --env-file=.env scripts/migrate-evidence-chunks.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }
