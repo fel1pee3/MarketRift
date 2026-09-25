@@ -5,13 +5,16 @@ import asyncio
 import json
 import os
 import re
+from contextvars import ContextVar
 from decimal import Decimal
 from pathlib import Path
 
 from pydantic import ValidationError
 
 from .extract import extract_review
+from .b2b_eval import extract_with_current_rights
 from .quality_eval import EvalSettings, evaluate_quality, load_dataset
+from .steam_eval import private_path
 
 DEFAULT_DATASET = Path(__file__).resolve().parents[3] / "evalsets/review-quality.synthetic.v1.json"
 
@@ -50,6 +53,9 @@ def render_markdown(report: dict) -> str:
         (f"Selected: {dataset['selected_examples']} ({dataset['selected_real']} real, "
          f"{dataset['selected_synthetic']} synthetic); scored: {run['scored']}; "
          f"attempted API calls: {run['api_calls_attempted']}; stopped: {run['stopped'] or 'no'}"),
+        (f"Scored real reviews: {metrics['scored_real_examples']}; "
+         f"scored synthetic: {metrics['scored_synthetic_examples']}. "
+         "Synthetic scores do not measure quality on real B2B customers."),
         (f"Model: {run['provider']}/{run['model']}; prompt: {run['prompt_version']}; "
          f"schema: {run['schema_version']}; taxonomy: {run['taxonomy_version']}"),
         (f"Tokens reported: {run['reported_input_tokens']} input, {run['reported_output_tokens']} output; "
@@ -63,6 +69,7 @@ def render_markdown(report: dict) -> str:
          f"{metrics['missing_evidence_responses']}, invented evidence="
          f"{metrics['invalid_evidence_quotes']}, "
          f"provider={metrics['provider_failures']}; unscored={metrics['unscored_examples']}"),
+        f"Rights denied before call: {metrics['rights_denied_examples']}",
         (f"Evidence aligned with gold: {metrics['evidence_aligned_with_gold']}/"
          f"{metrics['literal_evidence_issues']}; severity correct on aligned: "
          f"{metrics['severity_correct_on_aligned']}/{metrics['severity_scored_on_aligned']}"),
@@ -113,6 +120,13 @@ async def main(argv: list[str] | None = None) -> None:
             output_usd_per_million=args.output_usd_per_million,
         )
         dataset, sha256 = load_dataset(args.dataset)
+        if dataset.dataset_id.startswith("b2b-") and any(
+                item.source.kind != "b2b_csv" for item in dataset.examples):
+            raise ValueError("B2B datasets require B2B source scope")
+        if any(item.source.kind == "b2b_csv" for item in dataset.examples):
+            private_path(args.dataset)
+            if args.provider == "openai" and any(item.synthetic for item in dataset.examples):
+                raise ValueError("synthetic B2B data require the controlled test provider")
     except (ValidationError, ValueError, OSError) as error:
         # Validation errors can embed the review text. Never print their messages.
         raise SystemExit(f"Invalid evaluation configuration or dataset ({type(error).__name__})") from None
@@ -121,11 +135,24 @@ async def main(argv: list[str] | None = None) -> None:
     if settings.provider == "test":
         os.environ["MARKETRIFT_TEST_MODE"] = "1"
 
+    active_example = ContextVar("active_quality_example", default=None)
+
+    async def before_extract(example):
+        active_example.set(example)
+
     async def production_extractor(text: str):
         # Same production pipeline, with retries disabled and output capped for this evaluation.
-        return await extract_review(text, max_output_tokens=settings.max_output_tokens, max_retries=0)
+        async def call(body: str):
+            return await extract_review(body, max_output_tokens=settings.max_output_tokens, max_retries=0)
 
-    report = await evaluate_quality(dataset, sha256, settings, production_extractor)
+        example = active_example.get()
+        if example and example.source.kind == "b2b_csv" and not example.synthetic:
+            if settings.provider != "openai":
+                raise PermissionError("ExternalAIRightsUnavailable")
+            return await extract_with_current_rights(example, call)
+        return await call(text)
+
+    report = await evaluate_quality(dataset, sha256, settings, production_extractor, before_extract)
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

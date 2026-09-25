@@ -47,5 +47,14 @@
     "text": "O atendimento talvez esteja lento, mas não usei o suporte ainda.",
     "expected_categories": [],
     "test_response": {"issues": []}
+  },
+  {
+    "id": "b2b-import-fixture",
+    "synthetic": true,
+    "text": "Exemplo sintético: a exportação de faturas falhou duas vezes.",
+    "expected_categories": ["features"],
+    "test_response": {"issues": [
+      {"category": "features", "sentiment": "negative", "severity": "medium", "description": "A exportação de faturas falhou em duas tentativas.", "evidence_quote": "a exportação de faturas falhou duas vezes"}
+    ]}
   }
 ]

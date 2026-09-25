@@ -9,7 +9,9 @@ type EvidenceItem = { item_id: string; source_type: SourceType; product_name: st
   product_ids: string[]; product_names: string[]; source_url: string; title: string | null;
   excerpt: string; observed_at: string; collected_at: string; synthetic: boolean; data_status: string | null;
   interpretation_status: string | null; interpretation_reason: string | null;
-  content_status: string | null; association_count: number; duplicate_rows: number };
+  content_status: string | null; association_count: number; duplicate_rows: number;
+  analysis_status: string | null; analysis_model: string | null;
+  issues: { category: string; severity: string; description: string; evidence_quote: string }[] };
 type SourceCount = { source_type: SourceType; count: number; ambiguous_count: number;
   first_at: string; last_at: string };
 type PartialSource = { source_id: string; source_type: string; product_name: string; last_run_at: string };
@@ -143,6 +145,19 @@ export default function EvidencePanel({ products }: { products: Product[] }) {
         <p><strong>{item.title ?? item.product_name}</strong> · produto associado: {item.product_names.join(', ')}</p>
         {item.association_count > 1 && <p className="evidence-warning">Associação ambígua: {item.association_count} produtos usam esta origem. Contada uma vez no total geral.</p>}
         <p>{item.excerpt}</p>
+        {item.source_type === 'b2b_review' && <div className="analysis">
+          <strong>Análise desta review:</strong> {item.analysis_status === 'completed' ?
+            item.issues.length ? <ul>{item.issues.map((issue, index) => <li key={`${item.item_id}-${index}`}>
+              {categoryLabels[issue.category] ?? issue.category} · gravidade {issue.severity} · {issue.description}
+              <blockquote>“{issue.evidence_quote}”</blockquote>
+            </li>)}</ul> : <p>Nenhum problema nas categorias atuais; isso não comprova satisfação.</p> :
+            <p>{item.analysis_status === 'processing' ? 'Em andamento' :
+              item.analysis_status === 'failed' ? 'Falhou, sem insight publicado' :
+                item.analysis_status === 'unavailable' ? 'Indisponível; confira direitos e configuração' :
+                  item.analysis_status === 'pending' ? 'Na fila' : 'Não solicitada'}</p>}
+          {item.analysis_model === 'controlled-test-fixture-v1' &&
+            <small>Resultado controlado de TESTE, não produzido por IA.</small>}
+        </div>}
         {item.interpretation_status && <p>Interpretação da captura: {item.interpretation_status} ({item.interpretation_reason ?? 'sem motivo'}). Captura não confirmada não vira mudança confirmada.</p>}
         {item.content_status === 'insufficient' && <p>Conteúdo insuficiente para inferir problema.</p>}
         {validLink(item.source_url) && !new URL(item.source_url).hostname.endsWith('.invalid') ?

@@ -56,10 +56,10 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async publishAnalysis(job: AnalyzeDocumentJobV1): Promise<void> {
+  async publishAnalysis(job: AnalyzeDocumentJobV1, attempts = 3): Promise<void> {
     await this.analysisQueue.add('analyze-document.v1', job, {
       jobId: job.idempotency_key,
-      attempts: 3,
+      attempts,
       backoff: { type: 'exponential', delay: 1000 },
       removeOnComplete: true,
       removeOnFail: true,

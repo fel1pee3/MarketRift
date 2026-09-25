@@ -65,42 +65,45 @@ def provider_name() -> str:
     return os.getenv("ANALYSIS_PROVIDER", "disabled")
 
 
-def model_id() -> str:
-    provider = provider_name()
+def model_id(provider_override: str | None = None, model_override: str | None = None) -> str:
+    provider = provider_override or provider_name()
     if provider == "openai":
-        return os.getenv("ANALYSIS_MODEL", "gpt-5-nano")
+        return model_override or os.getenv("ANALYSIS_MODEL", "gpt-5-nano")
     if provider == "test":
         return "controlled-test-fixture-v1"
     return "unconfigured"
 
 
-def provider_available() -> bool:
-    provider = provider_name()
+def provider_available(provider_override: str | None = None, controlled_test_allowed: bool = False) -> bool:
+    provider = provider_override or provider_name()
     if provider == "openai":
         return bool(os.getenv("OPENAI_API_KEY"))
     if provider == "test":
-        return os.getenv("MARKETRIFT_TEST_MODE") == "1"
+        return controlled_test_allowed or os.getenv("MARKETRIFT_TEST_MODE") == "1"
     return False
 
 
 async def extract_review(
     body: str, *, max_output_tokens: int | None = None, max_retries: int = 1,
+    provider_override: str | None = None, model_override: str | None = None,
+    controlled_test_allowed: bool = False,
 ) -> ReviewAnalysis:
-    provider = provider_name()
-    if provider == "test" and provider_available():
+    provider = provider_override or provider_name()
+    available = provider_available(provider, controlled_test_allowed)
+    if provider == "test" and available:
         fixture_path = Path(__file__).resolve().parents[3] / "fixtures/review-analysis.synthetic.json"
         examples = json.loads(fixture_path.read_text(encoding="utf-8"))
         match = next((example for example in examples if example["text"] == body), None)
         if match is None:
             raise ValueError("NoControlledFixture")
         return validate_extraction(body, match["test_response"])
-    if provider != "openai" or not provider_available():
+    if provider != "openai" or not available:
         raise RuntimeError("AnalysisProviderUnavailable")
     # The structured output API returns a Pydantic object; still validate literal evidence in our code.
     from langchain_core.messages import HumanMessage, SystemMessage
     from langchain_openai import ChatOpenAI
 
-    model_options = {"model": model_id(), "timeout": 30, "max_retries": max_retries}
+    model_options = {"model": model_id(provider, model_override), "timeout": 30, "max_retries": max_retries}
     if max_output_tokens is not None:
         model_options["max_tokens"] = max_output_tokens
     chat = ChatOpenAI(**model_options)

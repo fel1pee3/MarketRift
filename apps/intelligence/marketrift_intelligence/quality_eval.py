@@ -13,6 +13,7 @@ from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from langchain_core.callbacks import get_usage_metadata_callback
 from langchain_core.exceptions import OutputParserException
@@ -49,6 +50,11 @@ class Source(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     voted_up: bool | None = None
+    kind: Literal["b2b_csv"] | None = None
+    tenant_id: UUID | None = None
+    source_id: UUID | None = None
+    document_id: UUID | None = None
+    external_key: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class GoldIssue(BaseModel):
@@ -221,6 +227,7 @@ def _evidence_agreement(example: EvalExample, analysis: ReviewAnalysis) -> tuple
 
 async def evaluate_quality(
     dataset: EvalDataset, dataset_sha256: str, settings: EvalSettings, extractor: Extractor,
+    before_extract: Callable[[EvalExample], Awaitable[None]] | None = None,
 ) -> dict:
     if not dataset.examples:
         raise ValueError("dataset has no labeled examples")
@@ -236,6 +243,7 @@ async def evaluate_quality(
     missing_usage = 0
     measured_cost = gate_used = Decimal(0)
     stopped = None
+    rights_denied = 0
     for position, example in enumerate(selected):
         reserved = (estimated_usd(estimate_input_tokens(example.text), settings.max_output_tokens, settings)
                     if settings.provider == "openai" else Decimal(0))
@@ -251,7 +259,6 @@ async def evaluate_quality(
                              "status": "budget_skipped", "tokens": {"input": None, "output": None},
                              "reserved_usd": 0.0, "estimated_cost_usd": None})
             break
-        gate_used += reserved
         row = {"id": example.id, "synthetic": example.synthetic, "case_type": example.case_type,
                "expected_decision": example.gold.decision,
                "expected_categories": sorted({issue.category for issue in example.gold.issues
@@ -259,11 +266,19 @@ async def evaluate_quality(
                "expected_out_of_taxonomy": any(issue.category == "out_of_taxonomy"
                                                for issue in example.gold.issues),
                "reserved_usd": float(reserved)}
-        if settings.provider == "openai":
-            real_calls += 1
         with get_usage_metadata_callback() as callback:
             try:
+                if before_extract is not None:
+                    await before_extract(example)
+                gate_used += reserved
+                if settings.provider == "openai":
+                    real_calls += 1
                 analysis = validate_extraction(example.text, await extractor(example.text))
+            except PermissionError:
+                rights_denied += 1
+                row.update(status="rights_denied", error_code="ExternalAIRightsUnavailable")
+                analysis = None
+                stopped = "rights_denied"
             except InvalidEvidence as error:
                 invalid_evidence += error.count
                 row.update(status="invalid_evidence", error_code="InvalidEvidence",
@@ -289,6 +304,8 @@ async def evaluate_quality(
         row["tokens"] = {"input": input_tokens, "output": output_tokens}
         if settings.provider == "test":
             row["estimated_cost_usd"] = 0.0
+        elif row.get("status") == "rights_denied":
+            row["estimated_cost_usd"] = None
         elif input_tokens is None or output_tokens is None:
             missing_usage += 1
             row["estimated_cost_usd"] = None
@@ -301,6 +318,17 @@ async def evaluate_quality(
             row["estimated_cost_usd"] = float(call_cost)
         if analysis is None:
             rows.append(row)
+            if stopped == "rights_denied":
+                for skipped in selected[position + 1:]:
+                    rows.append({"id": skipped.id, "synthetic": skipped.synthetic,
+                                 "case_type": skipped.case_type, "expected_decision": skipped.gold.decision,
+                                 "expected_categories": sorted({issue.category for issue in skipped.gold.issues
+                                                                if issue.category in CATEGORIES}),
+                                 "expected_out_of_taxonomy": any(issue.category == "out_of_taxonomy"
+                                                                 for issue in skipped.gold.issues),
+                                 "status": "rights_skipped", "tokens": {"input": None, "output": None},
+                                 "reserved_usd": 0.0, "estimated_cost_usd": None})
+                break
             continue
         scored += 1
         actual = {issue.category for issue in analysis.issues}
@@ -345,7 +373,7 @@ async def evaluate_quality(
                 "prompt_version": PROMPT_VERSION, "schema_version": SCHEMA_VERSION,
                 "taxonomy_version": TAXONOMY_VERSION, "max_examples": settings.max_examples,
                 "max_output_tokens": settings.max_output_tokens, "api_calls_attempted": real_calls,
-                "evaluated": len(rows) - sum(row["status"] == "budget_skipped" for row in rows),
+                "evaluated": len(rows) - sum(row["status"] in ("budget_skipped", "rights_skipped") for row in rows),
                 "scored": scored, "stopped": stopped,
                 "input_usd_per_million": float(settings.input_usd_per_million or 0),
                 "output_usd_per_million": float(settings.output_usd_per_million or 0),
@@ -356,8 +384,11 @@ async def evaluate_quality(
                 "calls_without_token_usage": missing_usage,
                 "usage_based_estimated_cost_usd": float(measured_cost) if not missing_usage else None},
         "metrics": {"scored_examples": scored,
+                    "scored_real_examples": sum(row["status"] == "scored" and not row["synthetic"] for row in rows),
+                    "scored_synthetic_examples": sum(row["status"] == "scored" and row["synthetic"] for row in rows),
                     "unscored_examples": sum(row["status"] not in ("scored", "budget_skipped") for row in rows),
                     "budget_skipped_examples": sum(row["status"] == "budget_skipped" for row in rows),
+                    "rights_denied_examples": rights_denied,
                     "format_failures": format_failures, "invalid_evidence_quotes": invalid_evidence,
                     "missing_evidence_responses": missing_evidence,
                     "provider_failures": provider_failures, "problem_presence": _scores(presence),

@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Controller, Get, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, ConflictException, Controller, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
@@ -26,7 +26,7 @@ const githubSourceInput = z.object({ product_id: uuid, repository: z.string().tr
 const steamSourceInput = z.object({ product_id: uuid, app: z.string().trim().min(1).max(300) }).strict();
 const b2bSourceInput = z.object({ product_id: uuid, url: httpUrl,
   rights_reference: z.string().trim().min(8).max(300), storage_permitted: z.literal(true),
-  external_ai_permitted: z.boolean().default(false), synthetic_only: z.boolean().default(false) }).strict();
+  external_ai_permitted: z.literal(false).default(false), synthetic_only: z.boolean().default(false) }).strict();
 const g2SourceInput = z.object({ product_id: uuid, g2_product_id: z.string().trim().regex(/^[A-Za-z0-9-]{1,80}$/),
   product_url: z.url().refine(value => /^https:\/\/www\.g2\.com\/products\/[a-z0-9-]+\/?$/i.test(value), 'G2 product URL required'),
   environment: z.enum(['sandbox', 'production']) }).strict();
@@ -34,6 +34,17 @@ const rightsInput = z.object({ rights_reference: z.string().trim().min(8).max(30
   storage_permitted: z.literal(true), external_ai_permitted: z.boolean().default(false),
   rights_expires_at: z.iso.datetime({ offset: true }) }).strict().refine(data =>
     new Date(data.rights_expires_at).getTime() > Date.now(), 'Rights expiry must be in the future');
+const b2bAIRightsInput = z.object({ provider: z.literal('openai'),
+  rights_reference: z.string().trim().min(8).max(300), external_ai_permitted: z.literal(true),
+  rights_expires_at: z.iso.datetime({ offset: true }) }).strict().refine(data =>
+    new Date(data.rights_expires_at).getTime() > Date.now(), 'AI rights expiry must be in the future');
+const b2bAnalysisInput = z.discriminatedUnion('provider', [
+  z.object({ provider: z.literal('test') }).strict(),
+  z.object({ provider: z.literal('openai'), allow_paid: z.literal(true), max_items: z.literal(1),
+    model: z.string().regex(/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,99}$/),
+    max_output_tokens: z.number().int().min(128).max(512),
+    budget_usd: z.number().min(0.0001).max(0.05) }).strict(),
+]);
 const githubSyncInput = z.object({ max_pages: z.number().int().min(1).max(3), max_items: z.number().int().min(1).max(50) }).strict();
 const csvRow = z.object({ external_key: z.string().trim().min(1).max(200), source_url: httpUrl, published_at: z.iso.datetime({ offset: true }), body: z.string().trim().min(1).max(10000), synthetic: z.enum(['true', 'false', '']).optional() }).strict();
 const b2bCsvRow = z.object({ external_key: z.string().trim().min(1).max(200),
@@ -57,13 +68,23 @@ function isTestHost(host: string): boolean {
       .some(suffix => normalized.endsWith(suffix));
 }
 function isG2Host(host: string): boolean { return host === 'g2.com' || host.endsWith('.g2.com'); }
+function b2bPaidRates(): { input: number; output: number } {
+  const inputRate = Number(process.env.B2B_INPUT_USD_PER_MILLION);
+  const outputRate = Number(process.env.B2B_OUTPUT_USD_PER_MILLION);
+  if (process.env.B2B_PAID_ANALYSIS_ENABLED !== '1' || !Number.isFinite(inputRate)
+    || !Number.isFinite(outputRate) || inputRate <= 0 || outputRate <= 0)
+    throw new BadRequestException('Paid B2B analysis is not configured with verified token rates');
+  return { input: inputRate, output: outputRate };
+}
 type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: string; url: string; last_checked_at?: Date | null;
   external_product_id?: string | null; access_environment?: string | null; access_status?: string;
-  rights_recorded?: boolean; rights_expires_at?: Date | null; storage_permitted?: boolean; external_ai_permitted?: boolean };
+  rights_recorded?: boolean; rights_expires_at?: Date | null; storage_permitted?: boolean; external_ai_permitted?: boolean;
+  ai_rights_recorded?: boolean; ai_provider?: string | null; ai_rights_expires_at?: Date | null;
+  ai_rights_revoked_at?: Date | null };
 type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
 type ImportRow = QueryResultRow & { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: Date; finished_at: Date | null };
-type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
+type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
 
 function input<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -123,7 +144,43 @@ export class ApiController {
   async sources(@Req() request: Request): Promise<SourceRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRow>(client,
-      'SELECT id, product_id, source_type, url, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted FROM marketrift.sources ORDER BY id'));
+      'SELECT id, product_id, source_type, url, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at FROM marketrift.sources ORDER BY id'));
+  }
+
+  @Post('sources/b2b-csv/:id/ai-rights')
+  @HttpCode(200)
+  async declareB2BAIRights(@Req() request: Request, @Param('id') idValue: string,
+    @Body() body: unknown): Promise<{ status: 'declared' }> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, idValue);
+    const data = input(b2bAIRightsInput, body);
+    const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<{ id: string }>(client,
+      "UPDATE marketrift.sources SET external_ai_permitted = true, ai_provider = $2, ai_rights_reference = $3, "
+      + "ai_rights_attested_at = now(), ai_rights_expires_at = $4, ai_rights_revoked_at = NULL "
+      + "WHERE id = $1 AND source_type = 'b2b_csv_review' AND access_environment = 'production' "
+      + "AND enabled AND storage_permitted AND rights_reference IS NOT NULL RETURNING id",
+      [id, data.provider, data.rights_reference, data.rights_expires_at]));
+    if (!rows[0]) throw new NotFoundException('Eligible B2B source not found');
+    return { status: 'declared' };
+  }
+
+  @Post('sources/b2b-csv/:id/revoke-ai-rights')
+  @HttpCode(200)
+  async revokeB2BAIRights(@Req() request: Request, @Param('id') idValue: string): Promise<{ status: 'revoked' }> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, idValue);
+    await this.db.tenant(principal.tenantId, async client => {
+      const source = await this.db.rows<{ id: string }>(client,
+        "SELECT id FROM marketrift.sources WHERE id = $1 AND source_type = 'b2b_csv_review' FOR UPDATE", [id]);
+      if (!source[0]) throw new NotFoundException('B2B source not found');
+      await client.query("UPDATE marketrift.sources SET external_ai_permitted = false, "
+        + "ai_rights_revoked_at = now() WHERE id = $1", [id]);
+      await client.query("UPDATE marketrift.document_analyses SET status = 'unavailable', "
+        + "last_error = 'ExternalAIRightsRevoked', completed_at = now() "
+        + "WHERE requested_provider = 'openai' AND status IN ('pending', 'processing') "
+        + "AND document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)", [id]);
+    });
+    return { status: 'revoked' };
   }
 
   @Post('sources/b2b-csv')
@@ -189,7 +246,9 @@ export class ApiController {
       const deleted = await client.query('DELETE FROM marketrift.documents WHERE source_id = $1', [id]);
       await client.query('DELETE FROM marketrift.imports WHERE source_id = $1', [id]);
       await client.query("UPDATE marketrift.sources SET enabled = false, storage_permitted = false, "
-        + "external_ai_permitted = false, access_status = 'denied', rights_expires_at = now() WHERE id = $1", [id]);
+        + "external_ai_permitted = false, access_status = 'denied', rights_expires_at = now(), "
+        + "ai_rights_revoked_at = CASE WHEN source_type = 'b2b_csv_review' THEN now() ELSE ai_rights_revoked_at END "
+        + "WHERE id = $1", [id]);
       return { status: 'purged', documents_removed: deleted.rowCount ?? 0 };
     });
   }
@@ -409,6 +468,20 @@ export class ApiController {
         d.source_created_at, d.source_updated_at,
         d.published_at, d.collected_at, d.synthetic, a.status AS analysis_status,
         a.model_id AS analysis_model, a.last_error AS analysis_error,
+        CASE WHEN d.document_type = 'g2_review' THEN 'g2_blocked'
+          WHEN d.document_type = 'b2b_review' AND NOT s.enabled THEN 'source_disabled'
+          WHEN d.document_type = 'b2b_review' AND d.synthetic
+            AND d.review_data_status = 'synthetic_fixture' AND s.access_environment = 'sandbox'
+            AND s.storage_permitted
+            THEN 'controlled_test'
+          WHEN d.document_type = 'b2b_review' AND d.synthetic THEN 'synthetic_not_eligible'
+          WHEN d.document_type = 'b2b_review' AND d.review_data_status = 'declared_real'
+            AND s.access_environment = 'production' AND s.storage_permitted
+            AND s.external_ai_permitted AND s.ai_provider = 'openai'
+            AND s.ai_rights_reference IS NOT NULL AND s.ai_rights_expires_at > now()
+            AND s.ai_rights_revoked_at IS NULL THEN 'paid_opt_in'
+          WHEN d.document_type = 'b2b_review' THEN 'external_ai_rights_missing'
+          ELSE NULL END AS analysis_eligibility,
         COALESCE((SELECT json_agg(json_build_object('category', i.category,
           'sentiment', i.sentiment, 'severity', i.severity, 'description', i.pain_point,
           'evidence_quote', i.evidence_quote) ORDER BY i.issue_index)
@@ -420,6 +493,74 @@ export class ApiController {
         LEFT JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id
           AND a.document_id = d.id AND a.extractor_version = $1
         ORDER BY d.collected_at DESC, d.id LIMIT 100`, [activeExtractorVersion]));
+  }
+
+  @Post('documents/:id/analyze-b2b')
+  @HttpCode(200)
+  async analyzeB2B(@Req() request: Request, @Param('id') idValue: string,
+    @Body() body: unknown): Promise<{ status: string; estimated_max_cost_usd: number }> {
+    const principal = await this.principal(request, ['owner', 'admin', 'analyst']);
+    const id = input(uuid, idValue);
+    const operation = input(b2bAnalysisInput, body);
+    const queued = await this.db.tenant(principal.tenantId, async client => {
+      const rows = await this.db.rows<{ body: string; synthetic: boolean; review_data_status: string;
+        access_environment: string; storage_permitted: boolean; external_ai_permitted: boolean;
+        ai_provider: string | null; ai_rights_reference: string | null;
+        ai_rights_expires_at: Date | null; ai_rights_revoked_at: Date | null }>(client,
+        "SELECT d.body, d.synthetic, d.review_data_status, s.access_environment, "
+        + "s.storage_permitted, s.external_ai_permitted, s.ai_provider, s.ai_rights_reference, "
+        + "s.ai_rights_expires_at, s.ai_rights_revoked_at FROM marketrift.documents d "
+        + "JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id "
+        + "WHERE d.id = $1 AND d.document_type = 'b2b_review' AND s.source_type = 'b2b_csv_review' "
+        + "AND s.enabled FOR SHARE OF d, s", [id]);
+      const review = rows[0];
+      if (!review) throw new NotFoundException('B2B review not found');
+      let estimated = 0;
+      if (review.synthetic) {
+        if (operation.provider !== 'test' || review.access_environment !== 'sandbox'
+          || review.review_data_status !== 'synthetic_fixture' || !review.storage_permitted)
+          throw new ForbiddenException('Synthetic B2B reviews only allow controlled testing');
+      } else {
+        if (operation.provider !== 'openai' || review.review_data_status !== 'declared_real'
+          || review.access_environment !== 'production' || !review.storage_permitted
+          || !review.external_ai_permitted || review.ai_provider !== 'openai'
+          || !review.ai_rights_reference || !review.ai_rights_expires_at
+          || review.ai_rights_expires_at <= new Date() || review.ai_rights_revoked_at)
+          throw new ForbiddenException('Current external AI rights are required for this B2B review');
+        if (operation.model !== (process.env.ANALYSIS_MODEL ?? 'gpt-5-nano'))
+          throw new BadRequestException('Model must match the configured analysis model');
+        const rates = b2bPaidRates();
+        estimated = ((4 * Buffer.byteLength(review.body, 'utf8') + 12000) * rates.input
+          + operation.max_output_tokens * rates.output) / 1_000_000;
+        if (estimated > operation.budget_usd)
+          throw new BadRequestException('Estimated call exceeds the requested budget');
+      }
+      await client.query('INSERT INTO marketrift.document_analyses (tenant_id, document_id, extractor_version) '
+        + 'VALUES ($1, $2, $3) ON CONFLICT (tenant_id, document_id, extractor_version) DO NOTHING',
+      [principal.tenantId, id, activeExtractorVersion]);
+      const existing = await this.db.rows<{ status: string; requested_provider: string | null; attempt_count: number }>(client,
+        'SELECT status, requested_provider, attempt_count FROM marketrift.document_analyses '
+        + 'WHERE document_id = $1 AND extractor_version = $2 FOR UPDATE', [id, activeExtractorVersion]);
+      if (existing[0]!.status === 'completed' || existing[0]!.status === 'processing')
+        return { status: existing[0]!.status, estimated: 0, publish: false };
+      if (existing[0]!.status === 'pending' && existing[0]!.requested_provider !== null)
+        return { status: 'queued', estimated: 0, publish: true };
+      if (operation.provider === 'openai' && existing[0]!.attempt_count >= 2)
+        throw new ConflictException('Paid B2B analysis retry limit reached for this extractor version');
+      await client.query('UPDATE marketrift.document_analyses SET status = \'pending\', '
+        + 'requested_provider = $3, requested_model = $4, max_output_tokens = $5, budget_usd = $6, '
+        + 'estimated_max_cost_usd = $7, paid_approved_at = $8, last_error = NULL, queued_at = now() '
+        + 'WHERE document_id = $1 AND extractor_version = $2',
+      [id, activeExtractorVersion, operation.provider,
+        operation.provider === 'test' ? 'controlled-test-fixture-v1' : operation.model,
+        operation.provider === 'test' ? null : operation.max_output_tokens,
+        operation.provider === 'test' ? null : operation.budget_usd,
+        operation.provider === 'test' ? null : estimated.toFixed(4),
+        operation.provider === 'test' ? null : new Date()]);
+      return { status: 'queued', estimated, publish: true };
+    });
+    if (queued.publish) await this.jobs.publishAnalysis(makeAnalysisJob(principal.tenantId, id), 1);
+    return { status: queued.status, estimated_max_cost_usd: queued.estimated };
   }
 
   @Post('documents/:id/analyze')

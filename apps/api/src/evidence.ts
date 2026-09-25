@@ -26,6 +26,8 @@ type EvidenceRow = QueryResultRow & {
   observed_at: Date; collected_at: Date; synthetic: boolean; data_status: string | null;
   interpretation_status: string | null; interpretation_reason: string | null;
   content_status: string | null; association_count: number; duplicate_rows: number;
+  analysis_status: string | null; analysis_model: string | null;
+  issues: { category: string; severity: string; description: string; evidence_quote: string }[];
 };
 type CountRow = QueryResultRow & { source_type: string; count: number; ambiguous_count: number;
   first_at: Date; last_at: Date };
@@ -189,9 +191,19 @@ export class EvidenceController {
         SELECT d.item_id, d.source_id, d.source_type, d.product_id, d.product_name,
           a.product_ids, a.product_names, d.origin_key, d.source_url, d.title, d.excerpt,
           d.observed_at, d.collected_at, a.any_synthetic AS synthetic, d.data_status, d.interpretation_status,
-          d.interpretation_reason, d.content_status, a.association_count, a.duplicate_rows
+          d.interpretation_reason, d.content_status, a.association_count, a.duplicate_rows,
+          analysis.status AS analysis_status, analysis.model_id AS analysis_model,
+          COALESCE((SELECT json_agg(json_build_object('category', i.category,
+            'severity', i.severity, 'description', i.pain_point, 'evidence_quote', i.evidence_quote)
+            ORDER BY i.issue_index) FROM marketrift.insights i
+            WHERE i.tenant_id = analysis.tenant_id AND i.analysis_id = analysis.id
+              AND analysis.status = 'completed'), '[]'::json) AS issues
         FROM dedup d JOIN associations a USING (source_type, origin_key)
-        ORDER BY d.observed_at DESC, d.item_id LIMIT $6 OFFSET $7`, [...args, f.limit, f.offset]);
+        LEFT JOIN marketrift.document_analyses analysis ON d.source_type = 'b2b_review'
+          AND analysis.tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid
+          AND analysis.document_id = d.item_id AND analysis.extractor_version = $8
+        ORDER BY d.observed_at DESC, d.item_id LIMIT $6 OFFSET $7`,
+      [...args, f.limit, f.offset, activeExtractorVersion]);
       const partialSources = await this.db.rows<PartialRow>(client, `WITH latest AS (
         SELECT DISTINCT ON (r.source_id) r.source_id, r.scan_complete, r.finished_at,
           s.source_type, p.name AS product_name

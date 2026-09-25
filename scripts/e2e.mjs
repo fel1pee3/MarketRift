@@ -388,6 +388,10 @@ try {
   assert.equal(g2Before.review_data_status, 'sandbox_test');
   assert.equal(g2Before.synthetic, true);
   assert.equal(g2Before.analysis_status, null);
+  assert.equal(g2Before.analysis_eligibility, 'g2_blocked');
+  assert.equal((await a.call(`documents/${g2Before.id}/analyze-b2b`, { method: 'POST',
+    body: JSON.stringify({ provider: 'test' }) })).status, 404);
+  assert.equal((await a.call(`documents/${g2Before.id}/analyze`, { method: 'POST' })).status, 404);
   assert.equal(JSON.stringify(g2Before).includes('must-not-be-stored'), false);
   const g2Repeat = await syncG2(2, 2);
   assert.equal(g2Repeat.documents_new, 0);
@@ -429,7 +433,7 @@ try {
   assert.equal((await b.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify(b2bFixture) })).status, 404);
   const b2bSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify(b2bFixture) });
   assert.equal(b2bSource.status, 201, JSON.stringify(b2bSource.body));
-  const b2bCsv = 'external_key,source_url,published_at,body,language,rating,synthetic\nb2b-test-1,https://example.invalid/reviews/1,2026-09-01T10:00:00Z,Synthetic B2B fixture.,,,true\n';
+  const b2bCsv = 'external_key,source_url,published_at,body,language,rating,synthetic\nb2b-test-1,https://example.invalid/reviews/1,2026-09-01T10:00:00Z,Exemplo sintético: a exportação de faturas falhou duas vezes.,,,true\n';
   async function importB2B(csv) {
     const body = new FormData(); body.set('source_id', b2bSource.body.id);
     body.set('file', new Blob([csv], { type: 'text/csv' }), 'test.csv');
@@ -447,6 +451,39 @@ try {
   assert.equal(b2bDocuments[0].review_data_status, 'synthetic_fixture');
   assert.equal(b2bDocuments[0].review_rating, null);
   assert.equal(b2bDocuments[0].analysis_status, null);
+  assert.equal(b2bDocuments[0].analysis_eligibility, 'controlled_test');
+  assert.equal((await viewer.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, { method: 'POST',
+    body: JSON.stringify({ provider: 'test' }) })).status, 403);
+  assert.equal((await b.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, { method: 'POST',
+    body: JSON.stringify({ provider: 'test' }) })).status, 404);
+  assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, { method: 'POST',
+    body: JSON.stringify({ provider: 'openai', allow_paid: true, max_items: 1,
+      model: 'gpt-5-nano', max_output_tokens: 128, budget_usd: 0.05 }) })).status, 403);
+  assert.equal((await a.call(`sources/b2b-csv/${b2bSource.body.id}/ai-rights`, { method: 'POST',
+    body: JSON.stringify({ provider: 'openai', rights_reference: 'synthetic-test-only',
+      external_ai_permitted: true, rights_expires_at: '2030-01-01T00:00:00Z' }) })).status, 404);
+  const b2bAnalysis = await analyst.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, {
+    method: 'POST', body: JSON.stringify({ provider: 'test' }),
+  });
+  assert.equal(b2bAnalysis.status, 200, JSON.stringify(b2bAnalysis.body));
+  const completedB2B = await waitForAnalysis(a, b2bDocuments[0].id);
+  assert.equal(completedB2B.analysis_model, 'controlled-test-fixture-v1');
+  assert.equal(completedB2B.issues.length, 1);
+  assert.ok(completedB2B.body.includes(completedB2B.issues[0].evidence_quote));
+  assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, {
+    method: 'POST', body: JSON.stringify({ provider: 'test' }),
+  })).body.status, 'completed');
+  const b2bAfter = (await a.call('documents')).body.filter(item => item.id === b2bDocuments[0].id);
+  assert.equal(b2bAfter.length, 1);
+  assert.equal(b2bAfter[0].issues.length, 1);
+  const b2bSignals = (await a.call('evidence/signals?source_type=b2b_review')).body;
+  assert.ok(b2bSignals.review_buckets.some(item => item.synthetic && item.analyzed_reviews === 1));
+  const b2bEvidence = (await a.call('evidence/search?source_type=b2b_review')).body.items;
+  assert.equal(b2bEvidence.length, 1);
+  assert.equal(b2bEvidence[0].analysis_status, 'completed');
+  assert.equal(b2bEvidence[0].analysis_model, 'controlled-test-fixture-v1');
+  assert.equal(b2bEvidence[0].issues.length, 1);
+  assert.ok(completedB2B.body.includes(b2bEvidence[0].issues[0].evidence_quote));
   assert.equal((await b.call('evidence/search?source_type=b2b_review')).body.total, 0);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 1);
   assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/analyze`, { method: 'POST' })).status, 404);
@@ -454,6 +491,29 @@ try {
   assert.equal((await b.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
   assert.equal((await a.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).body.documents_removed, 1);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 0);
+  const realRightsSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, url: 'https://authorized-vendor.io/reviews',
+    rights_reference: 'E2E storage permission declaration', storage_permitted: true,
+    external_ai_permitted: false, synthetic_only: false,
+  }) });
+  assert.equal(realRightsSource.status, 201, JSON.stringify(realRightsSource.body));
+  const aiRightsPath = `sources/b2b-csv/${realRightsSource.body.id}/ai-rights`;
+  const aiRights = { provider: 'openai', rights_reference: 'E2E external processing declaration',
+    external_ai_permitted: true, rights_expires_at: '2030-01-01T00:00:00Z' };
+  assert.equal((await viewer.call(aiRightsPath, { method: 'POST', body: JSON.stringify(aiRights) })).status, 403);
+  assert.equal((await analyst.call(aiRightsPath, { method: 'POST', body: JSON.stringify(aiRights) })).status, 403);
+  assert.equal((await b.call(aiRightsPath, { method: 'POST', body: JSON.stringify(aiRights) })).status, 404);
+  assert.equal((await a.call(aiRightsPath, { method: 'POST', body: JSON.stringify({
+    ...aiRights, rights_expires_at: '2020-01-01T00:00:00Z',
+  }) })).status, 400);
+  assert.equal((await a.call(aiRightsPath, { method: 'POST', body: JSON.stringify(aiRights) })).status, 200);
+  assert.equal((await analyst.call(`sources/b2b-csv/${realRightsSource.body.id}/revoke-ai-rights`, {
+    method: 'POST',
+  })).status, 403);
+  assert.equal((await a.call(`sources/b2b-csv/${realRightsSource.body.id}/revoke-ai-rights`, {
+    method: 'POST',
+  })).status, 200);
+  assert.equal((await a.call('sources')).body.find(item => item.id === realRightsSource.body.id).external_ai_permitted, false);
 
   const steamSource = await a.call('sources/steam-reviews', { method: 'POST',
     body: JSON.stringify({ product_id: competitor.body.id, app: '620' }) });

@@ -1,5 +1,7 @@
 # ADR 0013: reviews B2B com direitos declarados e candidato G2
 
+**Atualização de 2026-09-25:** o [ADR 0014](0014-analise-e-avaliacao-b2b.md) implementou análise individual de B2B e permissão de envio separada. As afirmações abaixo de que B2B não é analisado descrevem o estado histórico desta entrega. G2 continua bloqueado para IA.
+
 **Status:** piloto implementado em 2026-09-24. Sem acesso comprovado a reviews reais da G2.
 
 ## Evidência documental e decisão

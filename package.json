@@ -14,6 +14,7 @@
     "eval:analysis:openai": "node --env-file=.env scripts/run-python.mjs quality --provider openai",
     "eval:quality": "node --env-file=.env scripts/run-python.mjs quality",
     "eval:steam": "node --env-file=.env scripts/run-python.mjs steam-eval",
+    "eval:b2b": "node --env-file=.env scripts/run-python.mjs b2b-eval",
     "build": "npm run build -w @marketrift/api && npm run build -w @marketrift/web",
     "lint": "npm run lint -w @marketrift/api && npm run lint -w @marketrift/web",
     "test": "npm run test -w @marketrift/api",
@@ -28,7 +29,8 @@
     "db:migrate:web-pages": "node --env-file=.env scripts/migrate-web-pages.mjs",
     "db:migrate:page-monitoring": "node --env-file=.env scripts/migrate-page-monitoring.mjs",
     "db:migrate:github-discussions": "node --env-file=.env scripts/migrate-github-discussions.mjs",
-    "db:migrate:b2b-reviews": "node --env-file=.env scripts/migrate-b2b-reviews.mjs"
+    "db:migrate:b2b-reviews": "node --env-file=.env scripts/migrate-b2b-reviews.mjs",
+    "db:migrate:b2b-analysis": "node --env-file=.env scripts/migrate-b2b-analysis.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }

@@ -10,11 +10,13 @@ type Member = { user_id: string; email: string; display_name: string; role: Role
 type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null;
   external_product_id: string | null; access_environment: 'sandbox' | 'production' | null; access_status: string;
-  rights_recorded: boolean; rights_expires_at: string | null; storage_permitted: boolean; external_ai_permitted: boolean };
+  rights_recorded: boolean; rights_expires_at: string | null; storage_permitted: boolean; external_ai_permitted: boolean;
+  ai_rights_recorded: boolean; ai_provider: string | null; ai_rights_expires_at: string | null;
+  ai_rights_revoked_at: string | null };
 type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
-type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
+type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: Issue[] };
 type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
 type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null; trigger_kind: 'manual' | 'scheduled' };
 type PagePlan = { name: string; amount: string | null; currency: string | null; period: string | null; conditions: string; confirmed: boolean; evidence: string };
@@ -237,7 +239,7 @@ export default function Home() {
             <a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>}</li>)}</ul>
         </section>
         <section className="card wide"><h2>Avaliações B2B com permissão declarada</h2>
-          <p>Este caminho é separado do CSV sintético. Cadastre a origem e uma referência verificável da licença/autorização para guardar o texto. O MarketRift registra sua declaração; ainda não verifica contratos externos automaticamente. Nenhum texto é enviado à IA neste fluxo.</p>
+          <p>Este caminho é separado do CSV legado. Cadastre a origem e uma referência verificável da licença/autorização para guardar o texto. O MarketRift registra sua declaração; ainda não verifica contratos externos automaticamente. O envio à IA exige autorização adicional e uma ação por review.</p>
           {canManage && <form onSubmit={event => void run(async () => {
             const data = formValues(event); const form = event.currentTarget;
             await api('sources/b2b-csv', session, { method: 'POST', body: JSON.stringify({
@@ -257,11 +259,28 @@ export default function Home() {
             form.reset(); await refresh(session);
           })}><label>Origem autorizada<select name="source_id" required>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source =>
             <option key={source.id} value={source.id}>{products.find(p => p.id === source.product_id)?.name}: {source.url}</option>)}</select></label>
-            <label>CSV real autorizado<input name="file" type="file" accept=".csv,text/csv" required /></label>
+            <label>CSV autorizado (real ou sintético conforme a fonte)<input name="file" type="file" accept=".csv,text/csv" required /></label>
             <button disabled={busy || session.role === 'viewer' || !sources.some(source => source.source_type === 'b2b_csv_review')}>Importar avaliações B2B</button></form>
           <p>Colunas: <code>external_key,source_url,published_at,body</code>; opcionais: <code>language,rating,synthetic</code>. Até 100 linhas. Uma linha real com URL fictícia é recusada. Fonte de teste aceita apenas linhas <code>synthetic=true</code>. Reenviar o mesmo ID na mesma origem não duplica a review.</p>
           <ul>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source => <li key={source.id}>
             {products.find(p => p.id === source.product_id)?.name} · {source.url} · {source.access_environment === 'sandbox' ? 'TESTE, somente sintético' : 'direitos declarados'} · armazenamento declarado: {source.storage_permitted ? 'sim' : 'não'} · referência registrada: {source.rights_recorded ? 'sim' : 'não'}
+            {source.access_environment === 'production' && <p>Envio à IA externa: {source.external_ai_permitted && source.ai_rights_expires_at && new Date(source.ai_rights_expires_at) > new Date() && !source.ai_rights_revoked_at ?
+              `declarado para ${source.ai_provider} até ${new Date(source.ai_rights_expires_at).toLocaleDateString('pt-BR')}` :
+              source.ai_rights_revoked_at ? 'revogado' : 'não autorizado ou expirado'}. A declaração não verifica o contrato automaticamente.</p>}
+            {canManage && source.access_environment === 'production' && source.storage_permitted && <form onSubmit={event => void run(async () => {
+              const data = formValues(event); const form = event.currentTarget;
+              await api(`sources/b2b-csv/${source.id}/ai-rights`, session, { method: 'POST', body: JSON.stringify({
+                provider: 'openai', rights_reference: data.get('rights_reference'),
+                rights_expires_at: new Date(String(data.get('rights_expires_at'))).toISOString(),
+                external_ai_permitted: data.get('external_ai_permitted') === 'on',
+              }) }); form.reset(); await refresh(session);
+            })}><label>Referência da autorização específica para envio à OpenAI<input name="rights_reference" minLength={8} required /></label>
+              <label>Validade dessa autorização<input name="rights_expires_at" type="date" required /></label>
+              <label><input name="external_ai_permitted" type="checkbox" required /> Confirmo que o envio externo ao provedor está permitido, além do armazenamento.</label>
+              <button disabled={busy}>Registrar ou renovar direito de envio</button></form>}
+            {canManage && source.external_ai_permitted && <button className="small" disabled={busy} onClick={() => void run(async () => {
+              await api(`sources/b2b-csv/${source.id}/revoke-ai-rights`, session, { method: 'POST' }); await refresh(session);
+            })}>Revogar somente envio à IA</button>}
             {session.role === 'owner' && source.storage_permitted && <button className="small" disabled={busy} onClick={() => {
               if (!window.confirm('Revogar direitos e apagar os textos desta fonte? Esta ação não pode ser desfeita.')) return;
               void run(async () => { await api(`sources/${source.id}/revoke-review-rights`, session, { method: 'POST' }); await refresh(session); });
@@ -510,32 +529,56 @@ export default function Home() {
                 <a href={document.source_url} target="_blank" rel="noreferrer">Abrir Discussion original ↗</a>
               </article>)}</div> : <p className="empty">Nenhuma Discussion coletada nesta empresa.</p>}
         </section>
-        <section className="card wide"><h2>Documentos</h2><p>CSV de teste, CSV B2B com direitos declarados, G2, Steam e feedback GitHub são populações diferentes. Reviews B2B e G2 desta entrega não são enviadas automaticamente à IA; TESTE não conta como review real.</p>
+        <section className="card wide"><h2>Documentos</h2><p>CSV de teste, CSV B2B com direitos declarados, G2, Steam e feedback GitHub são populações diferentes. A análise B2B exige ação por review; TESTE não conta como review real. G2 continua bloqueado para IA.</p>
           {documents.some(document => document.document_type !== 'github_discussion') ? <div className="documents">{documents.filter(document => document.document_type !== 'github_discussion').map(document => <article key={document.id}>
             <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.document_type === 'steam_review' && <span className="badge">Avaliação de usuário do Steam</span>}{document.document_type === 'b2b_review' && <span className="badge">Review B2B importada · direitos declarados</span>}{document.document_type === 'g2_review' && <span className="badge">Review G2 via API oficial</span>}{document.synthetic && <span className="badge">{document.review_data_status === 'sandbox_test' ? 'TESTE / SANDBOX' : 'SINTÉTICO'}</span>}{document.review_data_status === 'unverified_legacy' && <span className="badge">Direitos não verificados</span>}
               {document.published_at && <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time>}<code>{document.external_key}</code></div>
             <p><strong>Produto associado:</strong> {document.product_name}</p>
-            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <><p>{document.body}</p>{document.document_type === 'steam_review' && <p>App ID: {document.steam_app_id} · Idioma: {document.review_language} · Recomendação no Steam: {document.review_voted_up ? 'positiva' : 'negativa'} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecida'}</p>}{['b2b_review', 'g2_review'].includes(document.document_type) && <p>Idioma: {document.review_language ?? 'não informado'} · nota: {document.review_rating ?? 'não informada'} · estado: {document.review_data_status === 'sandbox_test' ? 'TESTE, fora de métricas reais' : 'uso declarado, ainda sem análise de IA'}.</p>}</>}{isExampleAddress(document.source_url) ?
+            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <><p>{document.body}</p>{document.document_type === 'steam_review' && <p>App ID: {document.steam_app_id} · Idioma: {document.review_language} · Recomendação no Steam: {document.review_voted_up ? 'positiva' : 'negativa'} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecida'}</p>}{['b2b_review', 'g2_review'].includes(document.document_type) && <p>Idioma: {document.review_language ?? 'não informado'} · nota: {document.review_rating ?? 'não informada'} · origem: {document.review_data_status === 'sandbox_test' || document.review_data_status === 'synthetic_fixture' ? 'TESTE, fora de métricas reais' : document.review_data_status === 'declared_real' ? 'real segundo declaração da fonte' : 'direitos não verificados'}.</p>}</>}{isExampleAddress(document.source_url) ?
               <small>URL fictícia, sem página: {document.source_url}</small> :
               <a href={document.source_url} target="_blank" rel="noreferrer">{document.source_url_kind === 'product_reviews' ? 'Abrir página de avaliações do produto (não é link individual) ↗' : 'Abrir origem ↗'}</a>}
-            {['review', 'steam_review'].includes(document.document_type) && <div className="analysis">
+            {['review', 'steam_review', 'b2b_review'].includes(document.document_type) && <div className="analysis">
               <h3>Problemas extraídos</h3>
               {document.analysis_model === 'controlled-test-fixture-v1' && <p className="test-label">Resultado controlado de teste; não é uma análise feita por IA.</p>}
               {document.analysis_status === 'completed' ? document.issues.length ?
                 <ul className="issue-list">{document.issues.map((issue, index) => <li key={`${document.id}-${index}`}>
                   <strong>{categoryNames[issue.category] ?? issue.category}</strong> · gravidade {severityNames[issue.severity] ?? issue.severity}
                   <p>{issue.description}</p><blockquote>“{issue.evidence_quote}”</blockquote>
-                </li>)}</ul> : <p>{document.document_type === 'steam_review' ?
-                  'Nenhum problema nas categorias atuais. Isso não comprova ausência de reclamação no texto.' :
+                </li>)}</ul> : <p>{document.document_type === 'steam_review' || document.document_type === 'b2b_review' ?
+                  'Nenhum problema nas categorias atuais. Isso não comprova satisfação nem ausência de reclamação no texto.' :
                   'Nenhum problema identificado nesta avaliação.'}</p> :
-                <p>{document.analysis_status === 'unavailable' ? 'Análise indisponível: configure um provedor real para processar esta avaliação.' :
+                <p>{document.analysis_status === 'unavailable' ? (document.document_type === 'b2b_review' ? 'Análise indisponível: verifique direitos de envio, validade e configuração da operação.' : 'Análise indisponível: configure um provedor para processar esta avaliação.') :
                   document.analysis_status === 'failed' ? `Análise falhou (${document.analysis_error ?? 'erro desconhecido'}).` :
                     document.analysis_status === 'processing' ? 'Análise em andamento…' :
-                      document.document_type === 'steam_review' && document.analysis_status === null ? 'Análise não solicitada.' : 'Análise aguardando processamento.'}</p>}
-              {session.role !== 'viewer' && ['pending', 'failed', 'unavailable', null].includes(document.analysis_status) &&
+                      (document.document_type === 'steam_review' || document.document_type === 'b2b_review') && document.analysis_status === null ? 'Análise não solicitada.' : 'Análise aguardando processamento.'}</p>}
+              {document.document_type === 'b2b_review' && document.analysis_status !== 'completed' &&
+                <p>{document.analysis_eligibility === 'controlled_test' ? 'Somente provedor controlado: resultado de TESTE, sem chamada à OpenAI.' :
+                  document.analysis_eligibility === 'paid_opt_in' ? 'Envio externo declarado; cada chamada paga exige confirmação e orçamento.' :
+                    'Análise bloqueada: direito de envio externo ausente, expirado, revogado ou fonte desativada.'}</p>}
+              {session.role !== 'viewer' && document.document_type !== 'b2b_review' && ['pending', 'failed', 'unavailable', null].includes(document.analysis_status) &&
                 <button className="small" disabled={busy} onClick={() => void run(async () => {
                   await api(`documents/${document.id}/analyze`, session, { method: 'POST' }); await refresh(session);
                 })}>{document.document_type === 'steam_review' ? 'Analisar esta review (1 item)' : 'Reenfileirar análise'}</button>}
+              {session.role !== 'viewer' && document.document_type === 'b2b_review' && document.analysis_eligibility === 'controlled_test'
+                && ['pending', 'failed', 'unavailable', null].includes(document.analysis_status) &&
+                <button className="small" disabled={busy} onClick={() => void run(async () => {
+                  await api(`documents/${document.id}/analyze-b2b`, session, { method: 'POST',
+                    body: JSON.stringify({ provider: 'test' }) }); await refresh(session);
+                })}>Analisar esta review (TESTE controlado)</button>}
+              {session.role !== 'viewer' && document.document_type === 'b2b_review' && document.analysis_eligibility === 'paid_opt_in'
+                && ['pending', 'failed', 'unavailable', null].includes(document.analysis_status) &&
+                <form onSubmit={event => void run(async () => {
+                  const data = formValues(event);
+                  await api(`documents/${document.id}/analyze-b2b`, session, { method: 'POST', body: JSON.stringify({
+                    provider: 'openai', allow_paid: data.get('allow_paid') === 'on', max_items: 1,
+                    model: data.get('model'), max_output_tokens: Number(data.get('max_output_tokens')),
+                    budget_usd: Number(data.get('budget_usd')),
+                  }) }); await refresh(session);
+                })}><label>Modelo configurado no servidor<input name="model" defaultValue="gpt-5-nano" required /></label>
+                  <label>Máximo de tokens de saída<input name="max_output_tokens" type="number" min="128" max="512" defaultValue="512" required /></label>
+                  <label>Orçamento estimado máximo (USD, até 0,05)<input name="budget_usd" type="number" min="0.0001" max="0.05" step="0.0001" defaultValue="0.05" required /></label>
+                  <label><input name="allow_paid" type="checkbox" required /> Autorizo esta chamada paga de uma review.</label>
+                  <button disabled={busy}>Analisar esta review (1 chamada paga)</button></form>}
             </div>}</article>)}</div> :
             <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}
         </section>
