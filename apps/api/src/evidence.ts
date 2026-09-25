@@ -6,7 +6,7 @@ import { Accounts } from './accounts';
 import { activeExtractorVersion } from './analysis-job';
 import { Db } from './db';
 
-const sourceType = z.enum(['csv_review', 'steam_review', 'github_issue', 'github_discussion',
+const sourceType = z.enum(['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion',
   'pricing_page', 'release_notes']);
 const date = z.iso.date();
 const filtersSchema = z.object({
@@ -23,16 +23,16 @@ type EvidenceRow = QueryResultRow & {
   item_id: string; source_id: string; source_type: z.infer<typeof sourceType>;
   product_id: string; product_name: string; product_ids: string[]; product_names: string[];
   origin_key: string; source_url: string; title: string | null; excerpt: string;
-  observed_at: Date; collected_at: Date; synthetic: boolean;
+  observed_at: Date; collected_at: Date; synthetic: boolean; data_status: string | null;
   interpretation_status: string | null; interpretation_reason: string | null;
   content_status: string | null; association_count: number; duplicate_rows: number;
 };
 type CountRow = QueryResultRow & { source_type: string; count: number; ambiguous_count: number;
   first_at: Date; last_at: Date };
 type PartialRow = QueryResultRow & { source_id: string; source_type: string; product_name: string; last_run_at: Date };
-type ReviewBucket = QueryResultRow & { source_type: 'csv_review' | 'steam_review'; synthetic: boolean;
+type ReviewBucket = QueryResultRow & { source_type: 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review'; synthetic: boolean; data_status: string;
   total_reviews: number; analyzed_reviews: number; documents_without_analysis: number };
-type CategoryRow = QueryResultRow & { source_type: 'csv_review' | 'steam_review'; synthetic: boolean;
+type CategoryRow = QueryResultRow & { source_type: 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review'; synthetic: boolean; data_status: string;
   category: string; documents_with_problem: number };
 type PageEvent = QueryResultRow & { id: string; source_type: 'pricing_page' | 'release_notes';
   product_id: string; product_name: string; product_ids: string[]; source_url: string;
@@ -55,20 +55,21 @@ const evidenceBase = `WITH raw AS (
       WHEN 'steam_review' THEN jsonb_build_array(d.steam_app_id, d.external_key)::text
       WHEN 'github_issue' THEN jsonb_build_array(coalesce(d.source_repository, s.url), d.external_key)::text
       WHEN 'github_discussion' THEN jsonb_build_array(coalesce(d.source_repository, s.url), d.external_key)::text
+      WHEN 'g2_review' THEN jsonb_build_array(s.external_product_id, s.access_environment, d.external_key)::text
       ELSE jsonb_build_array(d.source_url, d.external_key)::text END AS origin_key,
     d.source_url, d.source_title AS title, left(d.body, 500) AS excerpt,
     d.body AS search_text, coalesce(d.published_at, d.source_created_at, d.collected_at) AS observed_at,
-    d.collected_at, d.synthetic, NULL::text AS interpretation_status,
+    d.collected_at, d.synthetic, d.review_data_status AS data_status, NULL::text AS interpretation_status,
     NULL::text AS interpretation_reason, d.discussion_content_status AS content_status
   FROM marketrift.documents d
   JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id
   JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
-  WHERE d.document_type IN ('review', 'steam_review', 'github_issue', 'github_discussion')
+  WHERE d.document_type IN ('review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion')
   UNION ALL
   SELECT ss.id, ss.source_id, s.product_id, p.name, s.source_type,
     jsonb_build_array(coalesce(ss.final_url, s.url), ss.content_sha256)::text,
     coalesce(ss.final_url, s.url), NULL::text, left(ss.normalized_text, 500),
-    ss.normalized_text, ss.fetched_at, ss.fetched_at, false,
+    ss.normalized_text, ss.fetched_at, ss.fetched_at, false, NULL::text,
     ss.interpretation_status, ss.interpretation_reason, NULL::text
   FROM marketrift.source_snapshots ss
   JOIN marketrift.sources s ON s.tenant_id = ss.tenant_id AND s.id = ss.source_id
@@ -94,10 +95,13 @@ const evidenceBase = `WITH raw AS (
 
 const reviewsBase = `WITH all_reviews AS (
   SELECT d.id, s.product_id,
-    CASE WHEN d.document_type = 'review' THEN 'csv_review' ELSE 'steam_review' END AS source_type,
+    CASE WHEN d.document_type = 'review' THEN 'csv_review' ELSE d.document_type END AS source_type,
     CASE WHEN d.document_type = 'steam_review' THEN jsonb_build_array(d.steam_app_id, d.external_key)::text
+      WHEN d.document_type = 'g2_review' THEN jsonb_build_array(s.external_product_id, s.access_environment, d.external_key)::text
       ELSE jsonb_build_array(d.source_url, d.external_key)::text END AS origin_key,
-    d.synthetic, d.body, d.source_updated_at, d.collected_at,
+    d.synthetic, coalesce(d.review_data_status,
+      CASE WHEN d.document_type = 'steam_review' THEN 'steam_public' ELSE 'unverified_legacy' END) AS data_status,
+    d.body, d.source_updated_at, d.collected_at,
     coalesce(d.published_at, d.source_created_at, d.collected_at) AS observed_at,
     coalesce(a.status = 'completed' AND a.model_id IS NOT NULL
       AND (d.synthetic OR a.model_id <> 'controlled-test-fixture-v1'), false) AS analyzed
@@ -105,7 +109,7 @@ const reviewsBase = `WITH all_reviews AS (
   JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id
   LEFT JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id
     AND a.document_id = d.id AND a.extractor_version = $5
-  WHERE d.document_type IN ('review', 'steam_review')
+  WHERE d.document_type IN ('review', 'b2b_review', 'g2_review', 'steam_review')
 ), origin_flags AS (
   SELECT source_type, origin_key, bool_or(synthetic) AS any_synthetic
   FROM all_reviews GROUP BY source_type, origin_key
@@ -184,7 +188,7 @@ export class EvidenceController {
       const items = await this.db.rows<EvidenceRow>(client, `${evidenceBase}
         SELECT d.item_id, d.source_id, d.source_type, d.product_id, d.product_name,
           a.product_ids, a.product_names, d.origin_key, d.source_url, d.title, d.excerpt,
-          d.observed_at, d.collected_at, a.any_synthetic AS synthetic, d.interpretation_status,
+          d.observed_at, d.collected_at, a.any_synthetic AS synthetic, d.data_status, d.interpretation_status,
           d.interpretation_reason, d.content_status, a.association_count, a.duplicate_rows
         FROM dedup d JOIN associations a USING (source_type, origin_key)
         ORDER BY d.observed_at DESC, d.item_id LIMIT $6 OFFSET $7`, [...args, f.limit, f.offset]);
@@ -199,6 +203,7 @@ export class EvidenceController {
           AND ($2::text IS NULL OR s.source_type = CASE $2::text
             WHEN 'csv_review' THEN 'manual_review' WHEN 'steam_review' THEN 'steam_reviews'
             WHEN 'github_issue' THEN 'github_issues' WHEN 'github_discussion' THEN 'github_discussions'
+            WHEN 'g2_review' THEN 'g2' WHEN 'b2b_review' THEN 'b2b_csv_review'
             ELSE $2 END)
         ORDER BY r.source_id, r.finished_at DESC, r.id DESC
       ) SELECT source_id, source_type, product_name, finished_at AS last_run_at
@@ -222,19 +227,19 @@ export class EvidenceController {
     const args = [f.product_id ?? null, f.source_type ?? null, f.from ?? null, f.to ?? null, activeExtractorVersion];
     return this.db.tenant(principal.tenantId, async client => {
       const reviewBuckets = await this.db.rows<ReviewBucket>(client, `${reviewsBase}
-        SELECT source_type, synthetic_group AS synthetic, count(*)::integer AS total_reviews,
+        SELECT source_type, synthetic_group AS synthetic, data_status, count(*)::integer AS total_reviews,
           count(*) FILTER (WHERE analyzed)::integer AS analyzed_reviews,
           count(*) FILTER (WHERE NOT analyzed)::integer AS documents_without_analysis
-        FROM dedup GROUP BY source_type, synthetic_group ORDER BY source_type, synthetic_group`, args);
+        FROM dedup GROUP BY source_type, synthetic_group, data_status ORDER BY source_type, synthetic_group, data_status`, args);
       const categories = await this.db.rows<CategoryRow>(client, `${reviewsBase}
-        SELECT d.source_type, d.synthetic_group AS synthetic, i.category,
+        SELECT d.source_type, d.synthetic_group AS synthetic, d.data_status, i.category,
           count(DISTINCT d.id)::integer AS documents_with_problem
         FROM dedup d JOIN marketrift.insights i ON i.document_id = d.id
           AND i.extractor_version = $5 AND i.analysis_id IS NOT NULL
         WHERE d.analyzed AND i.sentiment = 'negative' AND i.evidence_quote IS NOT NULL
           AND strpos(d.body, i.evidence_quote) > 0
-        GROUP BY d.source_type, d.synthetic_group, i.category
-        ORDER BY d.source_type, d.synthetic_group, i.category`, args);
+        GROUP BY d.source_type, d.synthetic_group, d.data_status, i.category
+        ORDER BY d.source_type, d.synthetic_group, d.data_status, i.category`, args);
       const events = await this.db.rows<PageEvent>(client, `${pageEventsBase}
         SELECT m.id, m.source_type, m.product_id, m.product_name, a.product_ids,
           m.source_url, m.previous_url, m.current_url, m.previous_at, m.current_at,

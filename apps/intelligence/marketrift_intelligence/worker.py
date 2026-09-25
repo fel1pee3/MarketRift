@@ -7,6 +7,7 @@ from bullmq import Worker
 
 from .analyze import analyze
 from .github_discussions import sync_github_discussions
+from .g2_reviews import sync_g2_reviews
 from .github_issues import sync_github_issues
 from .ingest import ingest, mark_failed
 from .steam_reviews import sync_steam_reviews
@@ -50,6 +51,14 @@ async def process_steam(job, _token):
     return result
 
 
+async def process_g2(job, _token):
+    result = await sync_g2_reviews(job.data)
+    if result.get("status") == "failed":
+        logger.warning("G2 sync failed: run=%s source=%s code=%s",
+                       job.data.get("run_id"), job.data.get("source_id"), result.get("error_code"))
+    return result
+
+
 async def process_web_page(job, _token):
     fetcher = e2e_fetch_public_page if os.getenv("MARKETRIFT_TEST_MODE") == "1" and os.getenv("WEB_PAGE_TEST_BASE_URL") else None
     result = await check_web_page(job.data, fetcher=fetcher) if fetcher else await check_web_page(job.data)
@@ -72,12 +81,13 @@ async def main() -> None:
     github_worker = Worker("github-issues", process_github, {"connection": os.environ["REDIS_URL"]})
     discussions_worker = Worker("github-discussions", process_discussions, {"connection": os.environ["REDIS_URL"]})
     steam_worker = Worker("steam-reviews", process_steam, {"connection": os.environ["REDIS_URL"]})
+    g2_worker = Worker("g2-reviews", process_g2, {"connection": os.environ["REDIS_URL"]})
     web_page_worker = Worker("web-pages", process_web_page, {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
         await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(), discussions_worker.close(),
-                             steam_worker.close(), web_page_worker.close())
+                             steam_worker.close(), g2_worker.close(), web_page_worker.close())
 
 
 if __name__ == "__main__":

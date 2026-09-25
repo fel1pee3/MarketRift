@@ -3,11 +3,11 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 
 type Product = { id: string; name: string };
-type SourceType = 'csv_review' | 'steam_review' | 'github_issue' | 'github_discussion' | 'pricing_page' | 'release_notes';
+type SourceType = 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review' | 'github_issue' | 'github_discussion' | 'pricing_page' | 'release_notes';
 type Filters = { product_id: string; source_type: string; from: string; to: string; q: string };
 type EvidenceItem = { item_id: string; source_type: SourceType; product_name: string;
   product_ids: string[]; product_names: string[]; source_url: string; title: string | null;
-  excerpt: string; observed_at: string; collected_at: string; synthetic: boolean;
+  excerpt: string; observed_at: string; collected_at: string; synthetic: boolean; data_status: string | null;
   interpretation_status: string | null; interpretation_reason: string | null;
   content_status: string | null; association_count: number; duplicate_rows: number };
 type SourceCount = { source_type: SourceType; count: number; ambiguous_count: number;
@@ -16,9 +16,9 @@ type PartialSource = { source_id: string; source_type: string; product_name: str
 type SearchResult = { items: EvidenceItem[]; counts: SourceCount[]; total: number; ambiguous_total: number;
   observed_from: string | null; observed_to: string | null; partial_sources: PartialSource[];
   limit: number; offset: number };
-type ReviewBucket = { source_type: 'csv_review' | 'steam_review'; synthetic: boolean;
+type ReviewBucket = { source_type: 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review'; synthetic: boolean; data_status: string;
   total_reviews: number; analyzed_reviews: number; documents_without_analysis: number };
-type Category = { source_type: ReviewBucket['source_type']; synthetic: boolean;
+type Category = { source_type: ReviewBucket['source_type']; synthetic: boolean; data_status: string;
   category: string; documents_with_problem: number };
 type PageDetail = { kind: string; name?: string; previous?: Record<string, string> | null;
   current?: Record<string, string> | null };
@@ -31,7 +31,8 @@ type Signals = { review_buckets: ReviewBucket[]; categories: Category[]; page_ev
 
 const initialFilters: Filters = { product_id: '', source_type: '', from: '', to: '', q: '' };
 const sourceLabels: Record<SourceType, string> = {
-  csv_review: 'Review CSV', steam_review: 'Review Steam', github_issue: 'Issue pública do GitHub',
+  csv_review: 'Review CSV legado/teste', b2b_review: 'Review B2B importada', g2_review: 'Review G2',
+  steam_review: 'Review Steam', github_issue: 'Issue pública do GitHub',
   github_discussion: 'Discussion pública do GitHub', pricing_page: 'Captura de preço',
   release_notes: 'Captura de changelog',
 };
@@ -102,7 +103,7 @@ export default function EvidencePanel({ products }: { products: Product[] }) {
   function submit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault(); setLoading(true); setOffset(0); setApplied({ ...draft });
   }
-  const activeTypes: SourceType[] = ['csv_review', 'steam_review', 'github_issue', 'github_discussion', 'pricing_page', 'release_notes'];
+  const activeTypes: SourceType[] = ['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion', 'pricing_page', 'release_notes'];
   return <section className="card wide evidence-panel" aria-label="Visão de evidências">
     <h2>Visão de evidências</h2>
     <p>Uma linha por documento de origem ou conteúdo distinto de página, mesmo após repetir a coleta. O filtro usa dias UTC da publicação original; quando ela falta, usa a data da coleta. Horários exibidos no fuso do navegador. Os totais descrevem apenas o material armazenado nesta empresa.</p>
@@ -135,6 +136,9 @@ export default function EvidencePanel({ products }: { products: Product[] }) {
       <div className="documents">{search.items.map(item => <article key={`${item.source_type}-${item.item_id}`}>
         <div className="meta"><span className="badge">{sourceLabels[item.source_type]}</span>
           {item.synthetic && <span className="badge">SINTÉTICO</span>}
+          {item.data_status === 'sandbox_test' && <span className="badge">TESTE / SANDBOX</span>}
+          {item.data_status === 'unverified_legacy' && <span className="badge">Direitos não verificados</span>}
+          {item.data_status === 'declared_real' && <span className="badge">Direitos declarados</span>}
           <time>{dateTime(item.observed_at)}</time></div>
         <p><strong>{item.title ?? item.product_name}</strong> · produto associado: {item.product_names.join(', ')}</p>
         {item.association_count > 1 && <p className="evidence-warning">Associação ambígua: {item.association_count} produtos usam esta origem. Contada uma vez no total geral.</p>}
@@ -156,12 +160,12 @@ export default function EvidencePanel({ products }: { products: Product[] }) {
       <h3>Problemas extraídos de reviews</h3>
       <p>Unidade: reviews distintas publicadas no período. Numerador: reviews com ao menos um problema da categoria e trecho literal no texto. Denominador: reviews com análise concluída na versão {signals.extractor_version}; sem análise fica fora do denominador. Repetir a coleta ou citar a categoria duas vezes na mesma review não aumenta o numerador. Esses rótulos automáticos ainda não foram validados em uma amostra humana de SaaS B2B.</p>
       {signals.review_buckets.length ? signals.review_buckets.map(bucket => <div className="signal-bucket" key={`${bucket.source_type}-${bucket.synthetic}`}>
-        <h4>{sourceLabels[bucket.source_type]} · {bucket.synthetic ? 'sintéticas (teste)' : 'reais coletadas'}</h4>
+        <h4>{sourceLabels[bucket.source_type]} · {bucket.data_status === 'sandbox_test' ? 'TESTE / sandbox' : bucket.data_status === 'unverified_legacy' ? 'direitos não verificados' : bucket.data_status === 'declared_real' ? 'direitos declarados' : bucket.synthetic ? 'sintéticas (teste)' : 'dados da origem'}</h4>
         <p>{bucket.total_reviews} reviews distintas · {bucket.analyzed_reviews} analisadas · {bucket.documents_without_analysis} sem análise válida para este indicador.
           {bucket.analyzed_reviews < 30 && ' Amostra pequena: não conclua uma tendência.'}</p>
-        {bucket.synthetic && <p>Resultados sintéticos não entram nos indicadores de dados reais.</p>}
-        {signals.categories.filter(row => row.source_type === bucket.source_type && row.synthetic === bucket.synthetic).length ?
-          <ul>{signals.categories.filter(row => row.source_type === bucket.source_type && row.synthetic === bucket.synthetic).map(row =>
+        {bucket.synthetic && <p>Resultados sintéticos e de sandbox não entram nos indicadores de dados reais.</p>}
+        {signals.categories.filter(row => row.source_type === bucket.source_type && row.synthetic === bucket.synthetic && row.data_status === bucket.data_status).length ?
+          <ul>{signals.categories.filter(row => row.source_type === bucket.source_type && row.synthetic === bucket.synthetic && row.data_status === bucket.data_status).map(row =>
             <li key={row.category}>{categoryLabels[row.category] ?? row.category}: <strong>{row.documents_with_problem}/{bucket.analyzed_reviews}</strong> reviews analisadas</li>)}</ul> :
           <p>Nenhuma categoria com evidência literal nas análises concluídas.</p>}
       </div>) : <p className="empty">Nenhuma review no produto/período selecionado.</p>}

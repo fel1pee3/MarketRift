@@ -1,5 +1,6 @@
 import os
 from typing import Any
+from urllib.parse import urlparse
 
 import psycopg
 
@@ -18,13 +19,17 @@ async def ingest(payload: object) -> dict[str, Any]:
             # RLS and explicit source/import checks must both succeed, including on replay.
             source = await (
                 await connection.execute(
-                    "SELECT id FROM marketrift.sources WHERE tenant_id = %s AND id = %s "
-                    "AND source_type = 'manual_review'",
+                    "SELECT source_type, storage_permitted, rights_reference, access_environment, url FROM marketrift.sources "
+                    "WHERE tenant_id = %s AND id = %s AND enabled "
+                    "AND source_type IN ('manual_review', 'b2b_csv_review') FOR UPDATE",
                     (job["tenant_id"], job["source_id"]),
                 )
             ).fetchone()
             if source is None:
                 raise ValueError("source does not belong to job tenant")
+            b2b = source[0] == "b2b_csv_review"
+            if b2b and (not source[1] or not source[2]):
+                raise ValueError("b2b source lacks declared storage rights")
             imported = await (
                 await connection.execute(
                     "SELECT source_id, status FROM marketrift.imports WHERE tenant_id = %s AND id = %s FOR UPDATE",
@@ -36,11 +41,16 @@ async def ingest(payload: object) -> dict[str, Any]:
             replayed = imported[1] == "completed"
             rows = await (
                 await connection.execute(
-                    "SELECT external_key, source_url, published_at, body, synthetic FROM marketrift.import_rows "
+                    "SELECT external_key, source_url, published_at, body, synthetic, review_language, review_rating "
+                    "FROM marketrift.import_rows "
                     "WHERE tenant_id = %s AND import_id = %s ORDER BY external_key",
                     (job["tenant_id"], job["import_id"]),
                 )
             ).fetchall()
+            if b2b and source[3] == "sandbox" and any(not row[4] for row in rows):
+                raise ValueError("sandbox source contains non-synthetic review")
+            if b2b and any(urlparse(row[1]).hostname != urlparse(source[4]).hostname for row in rows):
+                raise ValueError("review URL host differs from registered B2B source")
             new_documents = 0
             if not replayed:
                 await connection.execute(
@@ -48,14 +58,17 @@ async def ingest(payload: object) -> dict[str, Any]:
                     "WHERE tenant_id = %s AND id = %s",
                     (job["tenant_id"], job["import_id"]),
                 )
-                for external_key, source_url, published_at, body, synthetic in rows:
+                for external_key, source_url, published_at, body, synthetic, language, rating in rows:
                     cursor = await connection.execute(
                         "INSERT INTO marketrift.documents "
-                        "(tenant_id, source_id, document_type, external_key, source_url, published_at, body, synthetic) "
-                        "VALUES (%s, %s, 'review', %s, %s, %s, %s, %s) "
+                        "(tenant_id, source_id, document_type, external_key, source_url, published_at, body, synthetic, "
+                        "review_language, review_rating, review_data_status) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) "
                         "ON CONFLICT (tenant_id, source_id, external_key) DO NOTHING RETURNING id",
-                        (job["tenant_id"], job["source_id"], external_key, source_url, published_at,
-                         body, synthetic),
+                        (job["tenant_id"], job["source_id"], "b2b_review" if b2b else "review",
+                         external_key, source_url, published_at, body, synthetic, language, rating,
+                         ("synthetic_fixture" if synthetic else "declared_real") if b2b else
+                         ("synthetic_fixture" if synthetic else "unverified_legacy")),
                     )
                     if await cursor.fetchone() is not None:
                         new_documents += 1
@@ -69,13 +82,15 @@ async def ingest(payload: object) -> dict[str, Any]:
                 document = await (
                     await connection.execute(
                         "SELECT id FROM marketrift.documents WHERE tenant_id = %s AND source_id = %s "
-                        "AND external_key = %s AND document_type = 'review'",
-                        (job["tenant_id"], job["source_id"], external_key),
+                        "AND external_key = %s AND document_type = %s",
+                        (job["tenant_id"], job["source_id"], external_key, "b2b_review" if b2b else "review"),
                     )
                 ).fetchone()
                 if document is None:
                     raise ValueError("import row document missing")
                 document_id = str(document[0])
+                if b2b:
+                    continue  # Never send newly declared B2B text to a provider automatically.
                 await connection.execute(
                     "INSERT INTO marketrift.document_analyses (tenant_id, document_id, extractor_version) "
                     "VALUES (%s, %s, %s) ON CONFLICT (tenant_id, document_id, extractor_version) DO NOTHING",

@@ -24,8 +24,34 @@ const pageRequests = [];
 let discussionBody = 'The integration fails when the account name has spaces.';
 let discussionUpdated = '2026-09-24T12:00:00Z';
 const discussionRequests = [];
+let g2Body = 'The invoice export failed.';
+let g2Updated = '2026-09-02T12:00:00Z';
+let g2Public = true;
+const g2Requests = [];
 const steamMock = createServer((request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1');
+  if (url.pathname === '/api/2018-01-01/syndication/reviews') {
+    if (url.searchParams.get('filter[product_id]') === 'forbidden') {
+      response.writeHead(403, { 'Content-Type': 'application/json' });
+      response.end(JSON.stringify({ error: 'permission not granted' })); return;
+    }
+    g2Requests.push({ page: url.searchParams.get('page[number]'),
+      product: url.searchParams.get('filter[product_id]'),
+      credential: url.searchParams.get('api_token') === 'e2e-g2-placeholder' });
+    const page = Number(url.searchParams.get('page[number]'));
+    const id = page === 1 ? 'g2-1' : 'g2-2';
+    response.setHeader('Content-Type', 'application/json');
+    response.end(JSON.stringify({ data: [{ id, type: 'survey_responses', attributes: {
+      is_public: page === 1 ? g2Public : true,
+      title: 'Synthetic review for connector test',
+      url: `https://www.g2.com/products/example/reviews/${id}`,
+      published_at: '2026-09-01T12:00:00Z',
+      user_updated_at: page === 1 ? g2Updated : '2026-09-02T12:00:00Z',
+      star_rating: 3.5, answers: { hate: { value: page === 1 ? g2Body : 'The search failed.' } },
+      user: { name: 'must-not-be-stored' },
+    } }], links: { next: page === 1 ? 'https://data.g2.com/unsafe?api_token=do-not-follow' : null } }));
+    return;
+  }
   if (url.pathname === '/graphql') {
     let raw = '';
     request.on('data', chunk => { raw += chunk; });
@@ -103,7 +129,9 @@ const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
     STEAM_REVIEW_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     WEB_PAGE_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
-    GITHUB_DISCUSSIONS_TOKEN: 'e2e-read-only-placeholder' },
+    GITHUB_DISCUSSIONS_TOKEN: 'e2e-read-only-placeholder',
+    G2_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    G2_SYNDICATION_TOKEN: 'e2e-g2-placeholder' },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const webProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', 'apps/web', '-p', String(webPort)], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -182,6 +210,15 @@ async function waitForSourceRun(browser, id) {
     await delay(200);
   }
   throw new Error(`Source sync did not complete: ${errors}`);
+}
+async function waitForFailedSourceRun(browser, id) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = await browser.call('source-runs');
+    const run = result.body.find(item => item.id === id);
+    if (run?.status === 'failed') return run;
+    await delay(200);
+  }
+  throw new Error(`Expected source failure did not arrive: ${errors}`);
 }
 async function waitForPageRun(browser, id) {
   for (let attempt = 0; attempt < 100; attempt++) {
@@ -323,6 +360,100 @@ try {
   assert.equal(discussionRequests.length, 4);
   assert.equal(discussionRequests.every(item => item.authorized), true);
   assert.deepEqual(discussionRequests.map(item => item.variables.after), [null, 'cursor-one', null, 'cursor-one']);
+
+  const g2Registration = { product_id: competitor.body.id, g2_product_id: 'product-test-1',
+    product_url: 'https://www.g2.com/products/example', environment: 'sandbox' };
+  assert.equal((await analyst.call('sources/g2', { method: 'POST', body: JSON.stringify(g2Registration) })).status, 403);
+  assert.equal((await b.call('sources/g2', { method: 'POST', body: JSON.stringify(g2Registration) })).status, 404);
+  const g2Source = await a.call('sources/g2', { method: 'POST', body: JSON.stringify(g2Registration) });
+  assert.equal(g2Source.status, 201, JSON.stringify(g2Source.body));
+  assert.equal((await viewer.call(`sources/${g2Source.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 1 }) })).status, 403);
+  assert.equal((await b.call(`sources/${g2Source.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 1 }) })).status, 404);
+  async function syncG2(maxPages = 1, maxItems = 1) {
+    const queued = await analyst.call(`sources/${g2Source.body.id}/sync`, { method: 'POST',
+      body: JSON.stringify({ max_pages: maxPages, max_items: maxItems }) });
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    return waitForSourceRun(a, queued.body.id);
+  }
+  const g2First = await syncG2();
+  assert.equal(g2First.documents_new, 1);
+  assert.equal(g2First.scan_complete, false);
+  const g2Second = await syncG2();
+  assert.equal(g2Second.documents_new, 1);
+  assert.equal(g2Second.scan_complete, true);
+  const g2Before = (await a.call('documents')).body.find(item => item.external_key === 'g2-1');
+  assert.equal(g2Before.document_type, 'g2_review');
+  assert.equal(g2Before.review_data_status, 'sandbox_test');
+  assert.equal(g2Before.synthetic, true);
+  assert.equal(g2Before.analysis_status, null);
+  assert.equal(JSON.stringify(g2Before).includes('must-not-be-stored'), false);
+  const g2Repeat = await syncG2(2, 2);
+  assert.equal(g2Repeat.documents_new, 0);
+  assert.equal(g2Repeat.documents_updated, 0);
+  g2Body = 'The edited invoice export failed twice.';
+  g2Updated = '2026-09-03T12:00:00Z';
+  const g2Edited = await syncG2(2, 2);
+  assert.equal(g2Edited.documents_updated, 1, JSON.stringify({ run: g2Edited, pages: g2Requests.map(item => item.page) }));
+  assert.equal((await a.call('documents')).body.find(item => item.id === g2Before.id).body, g2Body);
+  g2Public = false;
+  await syncG2(2, 2);
+  assert.equal((await a.call('documents')).body.some(item => item.id === g2Before.id), false);
+  assert.equal(g2Requests.every(item => item.product === 'product-test-1' && item.credential), true);
+  assert.deepEqual(g2Requests.map(item => item.page), ['1', '2', '1', '2', '1', '2', '1', '2']);
+  assert.equal((await b.call('evidence/search?source_type=g2_review')).body.total, 0);
+  assert.equal((await a.call('evidence/search?source_type=g2_review')).body.total, 1);
+  assert.equal((await viewer.call(`sources/${g2Source.body.id}/revoke-review-rights`, { method: 'POST' })).status, 403);
+  assert.equal((await b.call(`sources/${g2Source.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
+  assert.equal((await a.call(`sources/${g2Source.body.id}/revoke-review-rights`, { method: 'POST' })).body.status, 'purged');
+  assert.equal((await a.call('evidence/search?source_type=g2_review')).body.total, 0);
+  const deniedG2 = await a.call('sources/g2', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, g2_product_id: 'forbidden',
+    product_url: 'https://www.g2.com/products/forbidden', environment: 'sandbox',
+  }) });
+  assert.equal(deniedG2.status, 201);
+  const deniedRun = await analyst.call(`sources/${deniedG2.body.id}/sync`, { method: 'POST',
+    body: JSON.stringify({ max_pages: 1, max_items: 5 }) });
+  assert.equal(deniedRun.status, 200);
+  assert.equal((await waitForFailedSourceRun(a, deniedRun.body.id)).error_code, 'scope_or_product_access_denied');
+  assert.equal((await a.call('sources')).body.find(item => item.id === deniedG2.body.id).access_status, 'denied');
+
+  const b2bFixture = { product_id: competitor.body.id, url: 'https://example.invalid/b2b-reviews',
+    rights_reference: 'E2E synthetic fixture only', storage_permitted: true,
+    external_ai_permitted: false, synthetic_only: true };
+  assert.equal((await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify({
+    ...b2bFixture, url: 'https://192.0.2.1/reviews', synthetic_only: false,
+  }) })).status, 400);
+  assert.equal((await analyst.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify(b2bFixture) })).status, 403);
+  assert.equal((await b.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify(b2bFixture) })).status, 404);
+  const b2bSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify(b2bFixture) });
+  assert.equal(b2bSource.status, 201, JSON.stringify(b2bSource.body));
+  const b2bCsv = 'external_key,source_url,published_at,body,language,rating,synthetic\nb2b-test-1,https://example.invalid/reviews/1,2026-09-01T10:00:00Z,Synthetic B2B fixture.,,,true\n';
+  async function importB2B(csv) {
+    const body = new FormData(); body.set('source_id', b2bSource.body.id);
+    body.set('file', new Blob([csv], { type: 'text/csv' }), 'test.csv');
+    return analyst.call('imports/b2b-reviews', { method: 'POST', body });
+  }
+  assert.equal((await importB2B(b2bCsv.replace('true', 'false'))).status, 400);
+  const b2bFirst = await importB2B(b2bCsv);
+  assert.equal(b2bFirst.status, 201, JSON.stringify(b2bFirst.body));
+  await waitForImport(a, b2bFirst.body.id);
+  const b2bSecond = await importB2B(b2bCsv);
+  assert.equal(b2bSecond.status, 201, JSON.stringify(b2bSecond.body));
+  await waitForImport(a, b2bSecond.body.id);
+  const b2bDocuments = (await a.call('documents')).body.filter(item => item.document_type === 'b2b_review');
+  assert.equal(b2bDocuments.length, 1);
+  assert.equal(b2bDocuments[0].review_data_status, 'synthetic_fixture');
+  assert.equal(b2bDocuments[0].review_rating, null);
+  assert.equal(b2bDocuments[0].analysis_status, null);
+  assert.equal((await b.call('evidence/search?source_type=b2b_review')).body.total, 0);
+  assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 1);
+  assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/analyze`, { method: 'POST' })).status, 404);
+  assert.equal((await viewer.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 403);
+  assert.equal((await b.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
+  assert.equal((await a.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).body.documents_removed, 1);
+  assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 0);
 
   const steamSource = await a.call('sources/steam-reviews', { method: 'POST',
     body: JSON.stringify({ product_id: competitor.body.id, app: '620' }) });
@@ -726,7 +857,7 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV, Steam, GitHub Discussions GraphQL, pages, evidence, signals, schedulers, retries and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;

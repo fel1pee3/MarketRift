@@ -8,11 +8,13 @@ type Tenant = { tenant_id: string; name: string; role: Role };
 type Session = { user_id: string; email: string; display_name: string; tenant_id: string; role: Role; tenants: Tenant[]; csrf_token: string };
 type Member = { user_id: string; email: string; display_name: string; role: Role };
 type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
-type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null };
+type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null;
+  external_product_id: string | null; access_environment: 'sandbox' | 'production' | null; access_status: string;
+  rights_recorded: boolean; rights_expires_at: string | null; storage_permitted: boolean; external_ai_permitted: boolean };
 type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
-type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
+type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
 type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
 type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null; trigger_kind: 'manual' | 'scheduled' };
 type PagePlan = { name: string; amount: string | null; currency: string | null; period: string | null; conditions: string; confirmed: boolean; evidence: string };
@@ -234,6 +236,88 @@ export default function Home() {
             <span>{source.url} <small>(endereço fictício, sem página)</small></span> :
             <a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>}</li>)}</ul>
         </section>
+        <section className="card wide"><h2>Avaliações B2B com permissão declarada</h2>
+          <p>Este caminho é separado do CSV sintético. Cadastre a origem e uma referência verificável da licença/autorização para guardar o texto. O MarketRift registra sua declaração; ainda não verifica contratos externos automaticamente. Nenhum texto é enviado à IA neste fluxo.</p>
+          {canManage && <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('sources/b2b-csv', session, { method: 'POST', body: JSON.stringify({
+              product_id: data.get('product_id'), url: data.get('url'),
+              rights_reference: data.get('rights_reference'), storage_permitted: data.get('storage_permitted') === 'on',
+              external_ai_permitted: false, synthetic_only: data.get('synthetic_only') === 'on',
+            }) }); form.reset(); await refresh(session);
+          })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>URL HTTPS da origem<input name="url" type="url" placeholder="https://fornecedor.example/reviews" required /></label>
+            <label>Referência da autorização de armazenamento<input name="rights_reference" placeholder="Contrato/licença e seção, sem segredo" minLength={8} required /></label>
+            <label><input name="synthetic_only" type="checkbox" /> Fonte somente de teste: todas as linhas deverão ter <code>synthetic=true</code>.</label>
+            <label><input name="storage_permitted" type="checkbox" required /> Confirmo que tenho permissão para armazenar estes textos.</label>
+            <button disabled={busy || !products.length}>Cadastrar origem B2B</button></form>}
+          <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('imports/b2b-reviews', session, { method: 'POST', body: data });
+            form.reset(); await refresh(session);
+          })}><label>Origem autorizada<select name="source_id" required>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source =>
+            <option key={source.id} value={source.id}>{products.find(p => p.id === source.product_id)?.name}: {source.url}</option>)}</select></label>
+            <label>CSV real autorizado<input name="file" type="file" accept=".csv,text/csv" required /></label>
+            <button disabled={busy || session.role === 'viewer' || !sources.some(source => source.source_type === 'b2b_csv_review')}>Importar avaliações B2B</button></form>
+          <p>Colunas: <code>external_key,source_url,published_at,body</code>; opcionais: <code>language,rating,synthetic</code>. Até 100 linhas. Uma linha real com URL fictícia é recusada. Fonte de teste aceita apenas linhas <code>synthetic=true</code>. Reenviar o mesmo ID na mesma origem não duplica a review.</p>
+          <ul>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source => <li key={source.id}>
+            {products.find(p => p.id === source.product_id)?.name} · {source.url} · {source.access_environment === 'sandbox' ? 'TESTE, somente sintético' : 'direitos declarados'} · armazenamento declarado: {source.storage_permitted ? 'sim' : 'não'} · referência registrada: {source.rights_recorded ? 'sim' : 'não'}
+            {session.role === 'owner' && source.storage_permitted && <button className="small" disabled={busy} onClick={() => {
+              if (!window.confirm('Revogar direitos e apagar os textos desta fonte? Esta ação não pode ser desfeita.')) return;
+              void run(async () => { await api(`sources/${source.id}/revoke-review-rights`, session, { method: 'POST' }); await refresh(session); });
+            }}>Revogar e apagar textos</button>}
+          </li>)}</ul>
+        </section>
+        <section className="card wide"><h2>G2: integração condicionada ao acesso</h2>
+          <p>Reviews G2 são uma fonte candidata de clientes B2B. Cadastrar um produto não prova acesso às reviews de concorrentes. Sem credencial específica de syndication e direitos documentados, a coleta real falha de modo explícito. Dados do transporte controlado de teste aparecem como TESTE; nenhuma review G2 é enviada à OpenAI.</p>
+          {canManage && <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('sources/g2', session, { method: 'POST', body: JSON.stringify({
+              product_id: data.get('product_id'), g2_product_id: data.get('g2_product_id'),
+              product_url: data.get('product_url'), environment: data.get('environment'),
+            }) }); form.reset(); await refresh(session);
+          })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>G2 Product ID (mapeamento oficial)<input name="g2_product_id" required /></label>
+            <label>URL pública do produto no G2<input name="product_url" type="url" placeholder="https://www.g2.com/products/exemplo" required /></label>
+            <label>Ambiente<select name="environment"><option value="sandbox">Teste / sandbox</option><option value="production">Produção, somente com acordo</option></select></label>
+            <button disabled={busy || !products.length}>Cadastrar fonte G2</button></form>}
+          <ul>{sources.filter(source => source.source_type === 'g2').map(source => {
+            const latest = sourceRuns.find(run => run.source_id === source.id);
+            const reasons: Record<string, string> = {
+              credential_missing: 'Credencial de syndication ausente no worker.', credential_invalid: 'G2 recusou a credencial (401).',
+              scope_or_product_access_denied: 'G2 recusou o escopo ou o acesso a este produto (403).',
+              product_not_found: 'Produto não encontrado (404).', rights_unconfirmed: 'Direito de armazenamento não confirmado ou integração de produção desabilitada.',
+              sandbox_endpoint_unconfirmed: 'O endpoint oficial de sandbox ainda não foi confirmado; não houve coleta.',
+              rate_limited: 'Limite da G2; aguarde o horário indicado.', upstream_failure: 'Falha transitória da G2.',
+            };
+            return <li key={source.id}><a href={source.url} target="_blank" rel="noreferrer">{source.url}</a> · {source.access_environment === 'sandbox' ? 'TESTE' : 'produção'} · acesso: {source.access_status}.
+              <p>Última coleta: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'}.</p>
+              {latest && <p>Execução: <strong>{latest.status}</strong> · consultadas: {latest.documents_seen} · novas: {latest.documents_new} · atualizadas: {latest.documents_updated} · páginas: {latest.pages_fetched}.
+                {latest.scan_complete === false && ' Cobertura parcial; outra execução continua pelo checkpoint.'}
+                {latest.error_code && ` ${reasons[latest.error_code] ?? latest.error_code}`}
+                {latest.retry_after_at && ` Tente após ${new Date(latest.retry_after_at).toLocaleString('pt-BR')}.`}</p>}
+              {source.access_environment === 'production' && <p>Direitos de armazenamento: {source.storage_permitted && source.rights_recorded ? 'declarados' : 'pendentes'} · validade: {source.rights_expires_at ? new Date(source.rights_expires_at).toLocaleDateString('pt-BR') : 'não registrada'}.</p>}
+              {session.role === 'owner' && source.access_environment === 'production' &&
+                <form onSubmit={event => void run(async () => {
+                  const data = formValues(event); const form = event.currentTarget;
+                  await api(`sources/g2/${source.id}/rights`, session, { method: 'POST', body: JSON.stringify({
+                    rights_reference: data.get('rights_reference'), rights_expires_at: new Date(String(data.get('rights_expires_at'))).toISOString(),
+                    storage_permitted: data.get('storage_permitted') === 'on', external_ai_permitted: false,
+                  }) }); form.reset(); await refresh(session);
+                })}><label>Referência do acordo G2 para armazenamento<input name="rights_reference" minLength={8} required /></label>
+                  <label>Validade do acordo<input name="rights_expires_at" type="date" required /></label>
+                  <label><input name="storage_permitted" type="checkbox" required /> Confirmo direito expresso de armazenamento.</label>
+                  <button disabled={busy}>{source.storage_permitted ? 'Atualizar declaração de direitos' : 'Registrar declaração de direitos'}</button></form>}
+              {session.role !== 'viewer' && <button className="small" disabled={busy || latest?.status === 'running' || latest?.status === 'pending'} onClick={() => void run(async () => {
+                await api(`sources/${source.id}/sync`, session, { method: 'POST', body: JSON.stringify({ max_pages: 1, max_items: 5 }) }); await refresh(session);
+              })}>Testar coleta limitada (1 página, 5 itens)</button>}
+              {session.role === 'owner' && source.access_status !== 'denied' && <button className="small" disabled={busy} onClick={() => {
+                if (!window.confirm('Revogar direitos e apagar os textos G2 desta fonte? Esta ação não pode ser desfeita.')) return;
+                void run(async () => { await api(`sources/${source.id}/revoke-review-rights`, session, { method: 'POST' }); await refresh(session); });
+              }}>Revogar e apagar textos</button>}
+            </li>;
+          })}</ul>
+        </section>
         <section className="card wide"><h2>Issues públicos do GitHub</h2>
           <p>Discussões públicas que podem incluir bugs e pedidos de funcionalidades. Issues não são avaliações de clientes nem representam todo o mercado. A coleta não envia textos para a OpenAI.</p>
           <form onSubmit={event => void run(async () => {
@@ -426,12 +510,12 @@ export default function Home() {
                 <a href={document.source_url} target="_blank" rel="noreferrer">Abrir Discussion original ↗</a>
               </article>)}</div> : <p className="empty">Nenhuma Discussion coletada nesta empresa.</p>}
         </section>
-        <section className="card wide"><h2>Documentos</h2><p>Reviews Steam e avaliações CSV são distintas de Issues públicas do GitHub. A análise de reviews Steam só começa após você selecionar uma review. Dados sintéticos não contam como avaliações reais.</p>
+        <section className="card wide"><h2>Documentos</h2><p>CSV de teste, CSV B2B com direitos declarados, G2, Steam e feedback GitHub são populações diferentes. Reviews B2B e G2 desta entrega não são enviadas automaticamente à IA; TESTE não conta como review real.</p>
           {documents.some(document => document.document_type !== 'github_discussion') ? <div className="documents">{documents.filter(document => document.document_type !== 'github_discussion').map(document => <article key={document.id}>
-            <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.document_type === 'steam_review' && <span className="badge">Avaliação de usuário do Steam</span>}{document.synthetic && <span className="badge">SINTÉTICO</span>}
+            <div className="meta">{document.document_type === 'github_issue' && <span className="badge">Issue público do GitHub</span>}{document.document_type === 'steam_review' && <span className="badge">Avaliação de usuário do Steam</span>}{document.document_type === 'b2b_review' && <span className="badge">Review B2B importada · direitos declarados</span>}{document.document_type === 'g2_review' && <span className="badge">Review G2 via API oficial</span>}{document.synthetic && <span className="badge">{document.review_data_status === 'sandbox_test' ? 'TESTE / SANDBOX' : 'SINTÉTICO'}</span>}{document.review_data_status === 'unverified_legacy' && <span className="badge">Direitos não verificados</span>}
               {document.published_at && <time>{new Date(document.published_at).toLocaleDateString('pt-BR')}</time>}<code>{document.external_key}</code></div>
             <p><strong>Produto associado:</strong> {document.product_name}</p>
-            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <><p>{document.body}</p>{document.document_type === 'steam_review' && <p>App ID: {document.steam_app_id} · Idioma: {document.review_language} · Recomendação no Steam: {document.review_voted_up ? 'positiva' : 'negativa'} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecida'}</p>}</>}{isExampleAddress(document.source_url) ?
+            {document.document_type === 'github_issue' ? <><h3>{document.source_title}</h3><p>Repositório: {document.source_repository} · Estado: {document.source_state} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecido'}</p><p>{document.source_body || 'Sem descrição.'}</p></> : <><p>{document.body}</p>{document.document_type === 'steam_review' && <p>App ID: {document.steam_app_id} · Idioma: {document.review_language} · Recomendação no Steam: {document.review_voted_up ? 'positiva' : 'negativa'} · Atualizada: {document.source_updated_at ? new Date(document.source_updated_at).toLocaleString('pt-BR') : 'desconhecida'}</p>}{['b2b_review', 'g2_review'].includes(document.document_type) && <p>Idioma: {document.review_language ?? 'não informado'} · nota: {document.review_rating ?? 'não informada'} · estado: {document.review_data_status === 'sandbox_test' ? 'TESTE, fora de métricas reais' : 'uso declarado, ainda sem análise de IA'}.</p>}</>}{isExampleAddress(document.source_url) ?
               <small>URL fictícia, sem página: {document.source_url}</small> :
               <a href={document.source_url} target="_blank" rel="noreferrer">{document.source_url_kind === 'product_reviews' ? 'Abrir página de avaliações do produto (não é link individual) ↗' : 'Abrir origem ↗'}</a>}
             {['review', 'steam_review'].includes(document.document_type) && <div className="analysis">

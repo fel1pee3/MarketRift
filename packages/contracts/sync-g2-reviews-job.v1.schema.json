@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marketrift.dev/contracts/sync-g2-reviews-job.v1.schema.json",
+  "title": "SyncG2ReviewsJobV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tenant_id", "source_id", "run_id", "idempotency_key"],
+  "properties": {
+    "version": { "const": 1 },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "source_id": { "type": "string", "format": "uuid" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "idempotency_key": { "type": "string", "pattern": "^g2-reviews-[0-9a-f-]+-v1$" }
+  }
+}

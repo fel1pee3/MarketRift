@@ -6,6 +6,7 @@ import { SyncGitHubIssuesJobV1 } from './github-job';
 import { SyncGitHubDiscussionsJobV1 } from './github-discussions-job';
 import { SyncSteamReviewsJobV1 } from './steam-job';
 import { CheckWebPageJobV1 } from './web-page-job';
+import { SyncG2ReviewsJobV1 } from './g2-job';
 
 @Injectable()
 export class Jobs implements OnModuleDestroy {
@@ -34,6 +35,7 @@ export class Jobs implements OnModuleDestroy {
   private readonly steamQueue = new Queue<SyncSteamReviewsJobV1>('steam-reviews', {
     connection: this.connection,
   });
+  private readonly g2Queue = new Queue<SyncG2ReviewsJobV1>('g2-reviews', { connection: this.connection });
   private readonly webPageQueue = new Queue<CheckWebPageJobV1>('web-pages', {
     connection: this.connection,
   });
@@ -86,11 +88,17 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
+  async publishG2(job: SyncG2ReviewsJobV1): Promise<void> {
+    await this.g2Queue.add('sync-g2-reviews.v1', job, {
+      jobId: job.idempotency_key, attempts: 1, removeOnComplete: true, removeOnFail: true,
+    });
+  }
+
   async publishWebPage(job: CheckWebPageJobV1): Promise<void> {
     await this.webPageQueue.add('check-web-page.v1', job, {
       jobId: job.idempotency_key, attempts: 1, removeOnComplete: true, removeOnFail: true,
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.webPageQueue.close()]); }
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close()]); }
 }

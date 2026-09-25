@@ -27,7 +27,8 @@
     "db:migrate:steam": "node --env-file=.env scripts/migrate-steam.mjs",
     "db:migrate:web-pages": "node --env-file=.env scripts/migrate-web-pages.mjs",
     "db:migrate:page-monitoring": "node --env-file=.env scripts/migrate-page-monitoring.mjs",
-    "db:migrate:github-discussions": "node --env-file=.env scripts/migrate-github-discussions.mjs"
+    "db:migrate:github-discussions": "node --env-file=.env scripts/migrate-github-discussions.mjs",
+    "db:migrate:b2b-reviews": "node --env-file=.env scripts/migrate-b2b-reviews.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }
