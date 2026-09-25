@@ -1,6 +1,6 @@
 # Conjuntos de avaliação de avaliações
 
-`review-quality.synthetic.v1.json` contém **seis textos criados para testes**: reclamação com dois problemas, cobrança, avaliação positiva, tentativa de instrução no texto, neutra e ambígua. Seus rótulos são sintéticos; uma pontuação perfeita nesse conjunto não mede precisão em clientes reais. `real.template.json` permanece vazio. A amostra privada Steam contém textos reais, mas recebeu **zero rótulos humanos** nesta entrega.
+`review-quality.synthetic.v1.json` contém **seis textos criados para testes**: reclamação com dois problemas, cobrança, avaliação positiva, tentativa de instrução no texto, neutra e ambígua. Seus rótulos são sintéticos; uma pontuação perfeita nesse conjunto não mede precisão em clientes reais. `real.template.json` permanece vazio. A amostra privada Steam contém textos reais; o operador informou ter rotulado três casos de Portal 2 para verificar a ferramenta. Isso não mede a qualidade para SaaS B2B.
 
 ## Piloto privado com reviews Steam já coletadas
 

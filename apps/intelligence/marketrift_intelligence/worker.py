@@ -9,6 +9,7 @@ from .analyze import analyze
 from .github_issues import sync_github_issues
 from .ingest import ingest, mark_failed
 from .steam_reviews import sync_steam_reviews
+from .web_pages import check_web_page, e2e_fetch_public_page
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +41,15 @@ async def process_steam(job, _token):
     return result
 
 
+async def process_web_page(job, _token):
+    fetcher = e2e_fetch_public_page if os.getenv("MARKETRIFT_TEST_MODE") == "1" and os.getenv("WEB_PAGE_TEST_BASE_URL") else None
+    result = await check_web_page(job.data, fetcher=fetcher) if fetcher else await check_web_page(job.data)
+    if result.get("status") == "failed":
+        logger.warning("Page check failed: run=%s source=%s code=%s",
+                       job.data.get("run_id"), job.data.get("source_id"), result.get("error_code"))
+    return result
+
+
 async def main() -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -52,10 +62,12 @@ async def main() -> None:
     analysis_worker = Worker("review-analysis", process_analysis, {"connection": os.environ["REDIS_URL"]})
     github_worker = Worker("github-issues", process_github, {"connection": os.environ["REDIS_URL"]})
     steam_worker = Worker("steam-reviews", process_steam, {"connection": os.environ["REDIS_URL"]})
+    web_page_worker = Worker("web-pages", process_web_page, {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
-        await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(), steam_worker.close())
+        await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(),
+                             steam_worker.close(), web_page_worker.close())
 
 
 if __name__ == "__main__":

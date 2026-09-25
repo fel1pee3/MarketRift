@@ -17,8 +17,20 @@ let steamBody = 'O suporte demorou três dias e o preço aumentou sem aviso.';
 let steamUpdated = 1780000000;
 let steamVotedUp = false;
 const steamRequests = [];
+let pagePrice = '10';
+const pageRequests = [];
 const steamMock = createServer((request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1');
+  if (url.pathname.startsWith('/web-page/')) {
+    pageRequests.push(url.pathname);
+    if (url.pathname === '/web-page/robots.txt') { response.writeHead(404); response.end(); return; }
+    if (url.pathname === '/web-page/pricing') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end(`<main><section class="plan"><h2>Pro</h2><p>USD ${pagePrice} per month</p><p>API access</p></section><footer>Updated today</footer></main>`);
+      return;
+    }
+    response.writeHead(404); response.end(); return;
+  }
   steamRequests.push(url);
   response.setHeader('Content-Type', 'application/json');
   if (url.pathname !== '/appreviews/620') {
@@ -40,7 +52,8 @@ const apiProcess = spawn(process.execPath, ['apps/api/dist/main.js'], { env: chi
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
 const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
   env: { ...childEnv, ANALYSIS_PROVIDER: 'test', MARKETRIFT_TEST_MODE: '1',
-    STEAM_REVIEW_TEST_BASE_URL: `http://127.0.0.1:${steamPort}` },
+    STEAM_REVIEW_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    WEB_PAGE_TEST_BASE_URL: `http://127.0.0.1:${steamPort}` },
   stdio: ['ignore', 'pipe', 'pipe'],
 });
 const webProcess = spawn(process.execPath, ['node_modules/next/dist/bin/next', 'start', 'apps/web', '-p', String(webPort)], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -108,6 +121,16 @@ async function waitForSourceRun(browser, id) {
     await delay(200);
   }
   throw new Error(`Source sync did not complete: ${errors}`);
+}
+async function waitForPageRun(browser, id) {
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const result = await browser.call('page-sources');
+    const run = result.body.runs.find(item => item.id === id);
+    if (run?.status === 'succeeded') return result.body;
+    if (run?.status === 'failed') throw new Error(`Page check failed: ${JSON.stringify(run)}`);
+    await delay(200);
+  }
+  throw new Error(`Page check did not complete: ${errors}`);
 }
 
 try {
@@ -242,6 +265,52 @@ try {
   assert.deepEqual(steamAnalyzed.issues, []);
   assert.equal(steamAnalyzed.analysis_model, 'controlled-test-fixture-v1');
 
+  const pageSource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'pricing_page',
+    url: 'https://example.com/pricing', check_interval_minutes: 1440,
+  }) });
+  assert.equal(pageSource.status, 201, JSON.stringify(pageSource.body));
+  assert.equal((await b.call('page-sources')).body.sources.length, 0);
+  assert.equal((await b.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'pricing_page',
+    url: 'https://example.com/other', check_interval_minutes: 1440,
+  }) })).status, 404);
+  assert.equal((await analyst.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'pricing_page',
+    url: 'https://example.com/other', check_interval_minutes: 1440,
+  }) })).status, 403);
+  assert.equal((await viewer.call(`page-sources/${pageSource.body.id}/check`, { method: 'POST' })).status, 403);
+  assert.equal((await b.call(`page-sources/${pageSource.body.id}/check`, { method: 'POST' })).status, 404);
+  async function checkPage() {
+    const queued = await analyst.call(`page-sources/${pageSource.body.id}/check`, { method: 'POST' });
+    assert.equal(queued.status, 200, JSON.stringify(queued.body));
+    return waitForPageRun(analyst, queued.body.id);
+  }
+  const pageFirst = await checkPage();
+  assert.equal(pageFirst.snapshots.filter(item => item.source_id === pageSource.body.id).length, 1);
+  assert.equal(pageFirst.changes.filter(item => item.source_id === pageSource.body.id).length, 0);
+  assert.equal((await analyst.call(`page-sources/${pageSource.body.id}/check`, { method: 'POST' })).status, 409);
+  async function clearPageCooldown() {
+    const client = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+    try {
+      await client.connect();
+      await client.query("UPDATE marketrift.source_runs SET finished_at = now() - interval '2 minutes' "
+        + "WHERE tenant_id = $1 AND source_id = $2 AND run_kind = 'web_page'",
+      [registeredA.body.tenant_id, pageSource.body.id]);
+    } finally { await client.end(); }
+  }
+  await clearPageCooldown();
+  const pageSecond = await checkPage();
+  assert.equal(pageSecond.snapshots.filter(item => item.source_id === pageSource.body.id).length, 1);
+  pagePrice = '12';
+  await clearPageCooldown();
+  const pageThird = await checkPage();
+  assert.equal(pageThird.snapshots.filter(item => item.source_id === pageSource.body.id).length, 2);
+  const priceChange = pageThird.changes.find(item => item.source_id === pageSource.body.id);
+  assert.equal(priceChange.change_details[0].percent_change, '20.00');
+  assert.equal(pageRequests.filter(path => path === '/web-page/pricing').length, 3);
+  assert.equal((await b.call('page-sources')).body.changes.length, 0);
+
   const externalKey = `synthetic-${suffix}`;
   const positiveKey = `positive-${suffix}`;
   const csv = `external_key,source_url,published_at,body,synthetic\n${externalKey},https://example.invalid/reviews/${externalKey},2026-09-01T10:00:00Z,O suporte demorou três dias e o preço aumentou sem aviso.,true\n${positiveKey},https://example.invalid/reviews/${positiveKey},2026-09-02T10:00:00Z,Gostei muito da facilidade de uso.,true\n`;
@@ -320,7 +389,7 @@ try {
   assert.equal((await viewer.call('auth/session')).body.role, 'viewer');
   assert.equal((await a.call(`members/${adminId}`, { method: 'DELETE' })).status, 204);
   assert.equal((await admin.call('auth/session')).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV ingest, controlled analysis, Steam source queue/worker/storage, sync replay/update and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, CSV, Steam and page checks through queue/worker, page dedup/change evidence, tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
@@ -335,7 +404,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['insights', 'document_analyses', 'import_rows', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

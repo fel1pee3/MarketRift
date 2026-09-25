@@ -7,3 +7,4 @@
 .issue-list p { margin: .35rem 0; }
 .issue-list blockquote { margin: .35rem 0; padding-left: .75rem; border-left: 3px solid #147770; color: #4a6168; }
 .test-label { color: #8a5200; font-weight: 600; }
+.page-history{margin-top:14px;padding:12px;border:1px solid #dce6e3;border-radius:8px}.page-history article{border-top:1px solid #dce6e3;padding:10px 0}.page-history p{overflow-wrap:anywhere}.page-history code{font-size:11px}

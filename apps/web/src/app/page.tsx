@@ -12,6 +12,22 @@ type SourceRun = { id: string; source_id: string; status: string; documents_seen
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
 type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'github_issue' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; issues: Issue[] };
+type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null };
+type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null };
+type PagePlan = { name: string; amount: string; currency: string; period: string | null; conditions: string; confirmed: boolean; evidence: string };
+type PageEntry = { title: string; date: string | null; url: string; evidence: string };
+type PageExtract = { kind: string; text: string; status: 'structured' | 'unconfirmed'; excerpt: string; plans?: PagePlan[]; entries?: PageEntry[] };
+type PageSnapshot = { id: string; source_id: string; version_no: number; final_url: string; content_sha256: string; normalized_text: string; extracted: PageExtract; fetched_at: string };
+type PageDetail = { kind: string; name?: string; previous?: string | PagePlan | PageEntry | null; current?: string | PagePlan | PageEntry | null; percent_change?: string | null };
+type PageChange = { id: string; source_id: string; previous_snapshot_id: string; current_snapshot_id: string; change_details: PageDetail[]; detected_at: string };
+type PageData = { sources: PageSource[]; runs: PageRun[]; snapshots: PageSnapshot[]; changes: PageChange[] };
+const emptyPageData: PageData = { sources: [], runs: [], snapshots: [], changes: [] };
+function pageEvidence(value: PageDetail['previous']): string {
+  if (!value) return 'ausente nesta versão';
+  if (typeof value === 'string') return value;
+  if ('amount' in value) return `${value.name}: ${value.currency} ${value.amount} / ${value.period ?? 'período não confirmado'}. Condições: ${value.conditions}. Trecho: “${value.evidence}”`;
+  return `${value.title}${value.date ? ` · ${value.date}` : ''}. Trecho: “${value.evidence}”`;
+}
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const categoryNames: Record<string, string> = {
   support: 'Suporte', price: 'Preço', billing: 'Cobrança', performance: 'Desempenho',
@@ -58,18 +74,20 @@ export default function Home() {
   const [sourceRuns, setSourceRuns] = useState<SourceRun[]>([]);
   const [imports, setImports] = useState<Import[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
+  const [pageData, setPageData] = useState<PageData>(emptyPageData);
   const [members, setMembers] = useState<Member[]>([]);
 
   const refresh = useCallback(async (current: Session) => {
-    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers] = await Promise.all([
+    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages] = await Promise.all([
       api<Product[]>('products', current), api<Source[]>('sources', current),
       api<SourceRun[]>('source-runs', current),
       api<Import[]>('imports', current), api<Document[]>('documents', current),
       api<Member[]>('members', current),
+      api<PageData>('page-sources', current),
     ]);
     if (sessionKey.current !== current.csrf_token) return;
     setProducts(nextProducts); setSources(nextSources); setSourceRuns(nextRuns); setImports(nextImports);
-    setDocuments(nextDocuments); setMembers(nextMembers);
+    setDocuments(nextDocuments); setMembers(nextMembers); setPageData(nextPages);
   }, []);
 
   useEffect(() => {
@@ -103,7 +121,7 @@ export default function Home() {
     finally { setBusy(false); }
   }
   function clearTenantData(): void {
-    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setDocuments([]); setMembers([]); setIssuedInvite('');
+    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setDocuments([]); setMembers([]); setPageData(emptyPageData); setIssuedInvite('');
   }
   async function switchTo(current: Session, tenantId: string): Promise<void> {
     const next = await api<Session>('auth/switch-tenant', current, {
@@ -246,6 +264,49 @@ export default function Home() {
                 <button className="small" disabled={busy || latest?.status === 'running'}>Coletar reviews</button></form>}
             </li>;
           })}</ul>
+        </section>
+        <section className="card wide"><h2>Páginas de preços e changelogs</h2>
+          <p>Verificação manual de uma página pública por vez. A periodicidade desejada fica registrada; o agendamento automático ainda não está ativo. Não há análise por IA neste fluxo.</p>
+          <form onSubmit={event => void run(async () => {
+            const data = formValues(event); const form = event.currentTarget;
+            await api('page-sources', session, { method: 'POST', body: JSON.stringify({
+              product_id: data.get('product_id'), url: data.get('url'), source_type: data.get('source_type'),
+              check_interval_minutes: Number(data.get('check_interval_minutes')),
+            }) });
+            form.reset(); await refresh(session);
+          })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
+            <label>Tipo<select name="source_type"><option value="pricing_page">Página de preços</option><option value="release_notes">Changelog</option></select></label>
+            <label>URL pública HTTPS, sem parâmetros<input name="url" type="url" placeholder="https://exemplo.com/pricing" required /></label>
+            <label>Periodicidade desejada<select name="check_interval_minutes"><option value="1440">Diária</option><option value="360">A cada 6 horas</option><option value="60">Horária</option><option value="10080">Semanal</option></select></label>
+            <button disabled={busy || !canManage || !products.length}>Adicionar página</button></form>
+          {pageData.sources.length ? <ul>{pageData.sources.map(source => {
+            const latest = pageData.runs.find(run => run.source_id === source.id);
+            const snapshots = pageData.snapshots.filter(snapshot => snapshot.source_id === source.id)
+              .sort((a, b) => b.version_no - a.version_no);
+            const changes = pageData.changes.filter(change => change.source_id === source.id);
+            return <li key={source.id}><strong>{source.product_name}</strong> · {source.source_type === 'pricing_page' ? 'Preços' : 'Changelog'} · <a href={source.url} target="_blank" rel="noreferrer">Página cadastrada ↗</a>
+              <p>Última verificação concluída: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'} · periodicidade desejada: {source.check_interval_minutes} min.</p>
+              {latest && <p>Execução: <strong>{latest.status}</strong> · novo snapshot: {latest.documents_new ? 'sim' : 'não'}
+                {latest.error_code && <> · motivo: {latest.error_code}</>}
+                {latest.retry_after_at && <> · aguarde até {new Date(latest.retry_after_at).toLocaleString('pt-BR')}</>}</p>}
+              {session.role !== 'viewer' && <button className="small" disabled={busy || latest?.status === 'running'} onClick={() => void run(async () => {
+                await api(`page-sources/${source.id}/check`, session, { method: 'POST' }); await refresh(session);
+              })}>Verificar agora (1 página)</button>}
+              {snapshots.length > 0 && <div className="page-history"><h3>Capturas verificáveis</h3><ul>{snapshots.slice(0, 5).map(snapshot => <li key={snapshot.id}>
+                Versão {snapshot.version_no} · {new Date(snapshot.fetched_at).toLocaleString('pt-BR')} · hash <code>{snapshot.content_sha256.slice(0, 12)}</code> · <a href={snapshot.final_url} target="_blank" rel="noreferrer">URL final ↗</a>
+                {snapshot.extracted.status === 'unconfirmed' && <p><strong>Não confirmado:</strong> {snapshot.extracted.excerpt}</p>}
+                {snapshot.extracted.plans?.map(plan => <p key={plan.name}><strong>{plan.name}</strong>: {plan.confirmed ? `${plan.currency} ${plan.amount} / ${plan.period}` : 'não confirmado'} · trecho: “{plan.evidence}”</p>)}
+                {snapshot.extracted.entries?.map((entry, index) => <p key={`${entry.url}-${index}`}><strong>{entry.title}</strong> · {entry.date ?? 'data não informada'} · <a href={entry.url} target="_blank" rel="noreferrer">entrada ↗</a></p>)}
+              </li>)}</ul></div>}
+              {changes.length > 0 && <div className="page-history"><h3>Mudanças observadas</h3>{changes.slice(0, 5).map(change => <article key={change.id}>
+                <p>{new Date(change.detected_at).toLocaleString('pt-BR')} · versões {snapshots.find(item => item.id === change.previous_snapshot_id)?.version_no ?? '?'} → {snapshots.find(item => item.id === change.current_snapshot_id)?.version_no ?? '?'}.
+                  <a href={snapshots.find(item => item.id === change.previous_snapshot_id)?.final_url ?? source.url} target="_blank" rel="noreferrer"> URL anterior ↗</a> ·
+                  <a href={snapshots.find(item => item.id === change.current_snapshot_id)?.final_url ?? source.url} target="_blank" rel="noreferrer"> URL atual ↗</a></p>
+                {change.change_details.map((detail, index) => <div key={index}><strong>{detail.kind}</strong>{detail.name && <> · {detail.name}</>}{detail.percent_change !== null && detail.percent_change !== undefined && <> · variação comparável: {detail.percent_change}%</>}
+                  <p>Antes: {pageEvidence(detail.previous)}</p><p>Depois: {pageEvidence(detail.current)}</p></div>)}
+              </article>)}</div>}
+            </li>;
+          })}</ul> : <p className="empty">Nenhuma página de preço ou changelog cadastrada.</p>}
         </section>
         <section className="card"><h2>Importar CSV</h2><p>Até 100 linhas. Colunas: external_key, source_url, published_at, body, synthetic.</p>
           <p>No campo Arquivo CSV, escolha <code>fixtures/reviews.example.csv</code> na pasta do projeto.</p>

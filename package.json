@@ -22,7 +22,8 @@
     "db:migrate:account": "node --env-file=.env scripts/migrate-account.mjs",
     "db:migrate:analysis": "node --env-file=.env scripts/migrate-analysis.mjs",
     "db:migrate:github": "node --env-file=.env scripts/migrate-github.mjs",
-    "db:migrate:steam": "node --env-file=.env scripts/migrate-steam.mjs"
+    "db:migrate:steam": "node --env-file=.env scripts/migrate-steam.mjs",
+    "db:migrate:web-pages": "node --env-file=.env scripts/migrate-web-pages.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }

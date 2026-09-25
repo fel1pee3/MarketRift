@@ -76,7 +76,7 @@ Na pasta `apps/intelligence`, instale o pacote Python:
 .venv/Scripts/python.exe -m pip install -e ".[dev]"
 ```
 
-De volta à raiz, aplique as sete migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
+De volta à raiz, aplique as oito migrações em um banco vazio e crie logins distintos de runtime e provisionamento:
 
 ```powershell
 npm run db:setup
@@ -134,7 +134,7 @@ Em 2026-09-24, o antigo comando de chamada direta ao OpenAI passou em quatro exe
 
 ### Avaliação reproduzível da qualidade
 
-`evalsets/review-quality.synthetic.v1.json` contém seis casos criados para teste; `evalsets/real.template.json` continua vazio. Há agora uma amostra **privada** de reviews Steam reais preparada para rotulagem, mas nenhum rótulo humano foi atribuído nesta entrega. O avaliador usa o mesmo `extract_review` do worker, não grava nas tabelas dos tenants e exporta somente IDs, rótulos, métricas, versões, tokens e custo estimado, sem texto, URLs ou trechos das avaliações.
+`evalsets/review-quality.synthetic.v1.json` contém seis casos criados para teste; `evalsets/real.template.json` continua vazio. Há uma amostra **privada** de reviews Steam reais; o operador informou ter rotulado três casos de Portal 2 para verificar a ferramenta, sem medir qualidade para SaaS B2B. O avaliador usa o mesmo `extract_review` do worker, não grava nas tabelas dos tenants e exporta somente IDs, rótulos, métricas, versões, tokens e custo estimado, sem texto, URLs ou trechos das avaliações.
 
 ```powershell
 npm run eval:quality -- --dataset evalsets/review-quality.synthetic.v1.json --max-examples 6 --output .tmp/quality-synthetic.json
@@ -180,7 +180,7 @@ npm run db:migrate:steam
 
 O E2E usa um servidor Steam simulado local e o provedor controlado de IA; não cobra OpenAI. Uma consulta direta real ao App ID `620` recebeu duas reviews em uma página. Um smoke test adicional consultou e persistiu **uma** review real em um tenant temporário, verificou `synthetic=false` e removeu o tenant e o documento em seguida; nenhum desses textos ficou em tenants de produção. Esses testes verificam acesso e armazenamento, não qualidade da IA nem permissão comercial ampla.
 
-Para medir extração em dados reais, primeiro confirme que pode obter, armazenar e enviar as reviews ao provedor escolhido. A amostra privada atual tem **30 reviews reais distintas do App ID 620**, com 15 recomendações positivas e 15 negativas; contém 14 textos curtos, 13 médios e três longos. Dez reviews distintas estavam nos documentos locais; a preparação consultou mais duas páginas recentes (40 respostas) e uma página com filtro negativo (20 respostas), sem IA. Um App ID associado a dois produtos de teste não gera duas entradas para o mesmo `recommendationid`. A amostra é uma seleção operacional, não representativa do mercado nem prova de que contém 15 problemas. **Rótulos humanos: 0; precisão em dados reais: não medida; custo de IA nesta preparação: USD 0.** Os textos ficam em `evalsets/private/`, ignorado pelo Git.
+Para medir extração em dados reais, primeiro confirme que pode obter, armazenar e enviar as reviews ao provedor escolhido. A amostra privada atual tem **30 reviews reais distintas do App ID 620**, com 15 recomendações positivas e 15 negativas; contém 14 textos curtos, 13 médios e três longos. Dez reviews distintas estavam nos documentos locais; a preparação consultou mais duas páginas recentes (40 respostas) e uma página com filtro negativo (20 respostas), sem IA. Um App ID associado a dois produtos de teste não gera duas entradas para o mesmo `recommendationid`. A amostra é uma seleção operacional, não representativa do mercado nem prova de que contém 15 problemas. **O operador informou ter rotulado três reviews de Portal 2 para verificar a ferramenta; isso não mede qualidade para SaaS B2B.** Os textos ficam em `evalsets/private/`, ignorado pelo Git.
 
 Na raiz do projeto, os comandos de preparação e validação executados foram:
 
@@ -191,7 +191,7 @@ npm run eval:steam -- sample --app-id 620 --limit 30 --balance-negative --max-pa
 npm run eval:steam -- validate
 ```
 
-**A próxima ação manual é rotular três reviews antes de ver previsões.** Confira sua base de uso/envio dos textos e descreva-a com suas palavras. O comando mostra uma review por vez, permite problema, ausência de problema ou evidência insuficiente, múltiplas categorias, tema fora da taxonomia, gravidade quando sustentada e trecho literal. Cada rótulo é salvo; `q` interrompe e a próxima execução retoma. Uma recomendação negativa do Steam não é automaticamente uma reclamação.
+Para continuar a rotulagem, confira sua base de uso/envio dos textos e descreva-a com suas palavras. O comando mostra uma review por vez, permite problema, ausência de problema ou evidência insuficiente, múltiplas categorias, tema fora da taxonomia, gravidade quando sustentada e trecho literal. Cada rótulo é salvo; `q` interrompe e a próxima execução retoma. Uma recomendação negativa do Steam não é automaticamente uma reclamação.
 
 ```powershell
 npm run eval:steam -- label --labeler human:felipe --rights-basis 'DESCREVA AQUI SUA BASE REAL DE USO E ENVIO' --max-items 3
@@ -209,9 +209,34 @@ Get-Content .tmp/quality-steam-3.json
 
 No relatório, confira `run.api_calls_attempted`, `run.stopped`, tokens, `run.usage_based_estimated_cost_usd`, `metrics` e o estado de cada exemplo **antes de ampliar**. O JSON e o terminal separam erros de provedor, formato, evidência ausente/inventada, falsos positivos/negativos por categoria e casos fora da taxonomia; não exportam textos nem URLs. Compare o custo estimado à cobrança real do provedor. Consulte [o guia de avaliação](evalsets/README.md), [ADR 0007](docs/adr/0007-steam-user-reviews.md) e [ADR 0008](docs/adr/0008-amostra-e-rotulagem-steam.md) para interpretar os resultados.
 
+### Monitoramento de páginas públicas de preços e changelogs
+
+O cadastro é separado das fontes de reviews. `owner` e `admin` podem cadastrar uma página vinculada a um produto; `owner`, `admin` e `analyst` podem pedir uma verificação; `viewer` consulta resultados. A API confirma a empresa ativa em cada operação. A periodicidade escolhida (1 h, 6 h, diária ou semanal) fica registrada como preferência; **ainda não há agendador**. Uma execução manual consulta `robots.txt` e uma página HTML/texto pública; segue no máximo dois redirecionamentos no mesmo host e só usa HTTPS. URLs com credenciais, parâmetros, portas diferentes de 443, IPs ou destinos DNS internos são recusadas. Cada conexão usa o IP público validado e TLS do host original. Há limite de 1 MB de resposta, 30 mil caracteres relevantes, um minuto entre verificações da mesma fonte e respeito a `Retry-After`/`crawl-delay` quando informados. Falhas como 403, 404, 429, CAPTCHA, página sem conteúdo ou `robots.txt` indisponível ficam no estado da execução; o sistema não contorna acesso nem inventa um snapshot.
+
+O worker remove navegação, rodapé, scripts, banners comuns e espaços triviais antes de gerar hash. Capturas iguais não criam outra versão. Em changelogs, título, data e link são extraídos de entradas `<article>` quando explícitos; em preços, plano, moeda, valor e período devem aparecer no texto. Campos incertos aparecem como **não confirmado** com trecho de origem. Entre duas versões, a interface mostra trechos anteriores e novos, URL final e hash. Percentual só aparece se plano, moeda, período e condições forem comparáveis; mudança observada não é recomendação estratégica. Não há IA neste coletor e páginas não são enviadas à OpenAI.
+
+Em um banco **existente** com `001` a `007`, aplique a migração aditiva uma vez e inicie API, web e worker em terminais separados:
+
+```powershell
+npm run db:migrate:web-pages
+npm run dev:api
+npm run dev:web
+npm run dev:worker
+```
+
+Para testar pela interface em `http://localhost:3000`:
+
+1. Entre com uma conta `owner` ou `admin` e confirme que há um produto concorrente em **Produtos**.
+2. Em **Páginas de preços e changelogs**, escolha o produto, tipo **Changelog**, URL `https://www.postgresql.org/docs/release/` e periodicidade **Diária**; clique em **Adicionar página**. É uma página pública oficial usada apenas para demonstrar a captura; a verificação direta de 2026-09-24 encontrou 3.746 caracteres relevantes e **zero** entradas estruturadas, portanto o resultado é **não confirmado**. Confirme as condições da origem antes de monitorá-la regularmente.
+3. Clique em **Verificar agora (1 página)**. A execução passa por `pending`/`running` e termina em `succeeded` ou mostra um motivo de falha. Em sucesso, confira **Última verificação**, **Capturas verificáveis**, hash, trecho e **URL final**. O primeiro snapshot não constitui mudança histórica.
+4. Uma segunda verificação imediata retorna conflito por intervalo mínimo de um minuto. Depois desse tempo, repita; se o conteúdo relevante for igual, a execução terá `novo snapshot: não` e o número de versões continuará igual. Se a origem mudar de fato, veja versões anterior/atual e os trechos em **Mudanças observadas**. Não altere páginas de terceiros para forçar o teste.
+5. Para verificar papéis, use um `analyst` da mesma empresa: ele consegue clicar **Verificar agora**, mas não cadastrar a fonte. Um `viewer` vê as capturas sem botão de verificação. Ao trocar para outra empresa, a fonte e suas capturas não devem aparecer.
+
+Os testes automatizados usam uma página local simulada para provar uma mudança de `USD 10 / month` para `USD 12 / month`, deduplicação, fila, RBAC e RLS; não alteram nem coletam preços reais. O E2E libera seu próprio intervalo mínimo no banco de teste para não esperar dois minutos. A consulta direta à página PostgreSQL não gravou dados em nenhum tenant. Veja [ADR 0009](docs/adr/0009-paginas-publicas.md).
+
 ### Migrações
 
-São **sete migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação; `006_github_issues.sql` acrescenta fonte, documentos e estado de coleta de Issues; `007_steam_reviews.sql` acrescenta fonte, metadados de reviews Steam e contagens de coleta. `db:setup` aplica 001 a 007 em banco novo e cria os logins limitados. `db:migrate:account`, `db:migrate:analysis`, `db:migrate:github` e `db:migrate:steam` aplicam somente a migração respectiva sobre um banco existente, na ordem.
+São **oito migrações do mesmo banco PostgreSQL**, não bancos alternativos. `001_initial.sql` cria a base; `002_full_product.sql` acrescenta o domínio do produto completo; `003_first_slice.sql` acrescenta senha, fontes manuais e marcação sintética; `004_account_security.sql` acrescenta sessões revogáveis e convites; `005_review_analysis.sql` acrescenta análises versionadas e múltiplos problemas por avaliação; `006_github_issues.sql` acrescenta fonte, documentos e estado de coleta de Issues; `007_steam_reviews.sql` acrescenta fonte, metadados de reviews Steam e contagens de coleta; `008_web_pages.sql` acrescenta verificações, capturas versionadas e mudanças de páginas públicas. `db:setup` aplica 001 a 008 em banco novo e cria os logins limitados. Os comandos `db:migrate:*` aplicam somente a migração respectiva em banco existente, na ordem.
 
 ## Ordem de construção
 
@@ -223,6 +248,6 @@ O código, a documentação e as fixtures sintéticas deste repositório são di
 
 ## Estado atual
 
-Em 2026-09-24, `001` a `007` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, ausência de reclamação, falha do provedor, mudança de versão e repetição/atualização de Issues e reviews Steam. O E2E de serviços passou no caminho API → BullMQ → Python → PostgreSQL → API com Steam HTTP simulado e provedor controlado de teste, além de verificar que a página web é servida. Ele não automatiza cliques no navegador. A avaliação de qualidade com provedor controlado pontuou os seis casos sintéticos sem chamada paga; veja [ADR 0004](docs/adr/0004-analise-de-avaliacoes.md), [ADR 0005](docs/adr/0005-avaliacao-qualidade-extracao.md), [ADR 0006](docs/adr/0006-github-issues-publicas.md) e [ADR 0007](docs/adr/0007-steam-user-reviews.md) para decisões e limites. Os resultados atuais de lint, build e testes são registrados na resposta de encerramento.
+Em 2026-09-24, `001` a `008` foram aplicadas em PostgreSQL 16 com pgvector. Os logins de runtime e provisionamento não têm `SUPERUSER` nem `BYPASSRLS`. Os testes de banco cobrem RLS, deduplicação, múltiplos problemas, ausência de reclamação, falha do provedor, mudança de versão, Issues, reviews Steam e capturas de páginas. O E2E de serviços passou no caminho API → BullMQ → Python → PostgreSQL → API com Steam e página de preços HTTP simulados e provedor controlado de teste, além de verificar que a página web é servida. Ele não automatiza cliques no navegador. A avaliação de qualidade com provedor controlado pontuou os seis casos sintéticos sem chamada paga; veja as ADRs [0004](docs/adr/0004-analise-de-avaliacoes.md), [0005](docs/adr/0005-avaliacao-qualidade-extracao.md), [0006](docs/adr/0006-github-issues-publicas.md), [0007](docs/adr/0007-steam-user-reviews.md) e [0009](docs/adr/0009-paginas-publicas.md) para decisões e limites. Os resultados atuais de lint, build e testes são registrados na resposta de encerramento.
 
-Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é rotular humanamente a amostra privada Steam, medir seus erros com orçamento limitado e decidir se a taxonomia precisa de revisão; depois ampliar para plataformas relevantes ao segmento B2B escolhido, mediante condições de coleta verificadas.
+Esta ainda é uma fatia do produto. Faltam recuperação de senha, entrega automática de convites, proteção contra tentativas repetidas, agendamento e conectores contínuos autorizados, avaliação da extração em dados reais rotulados por pessoas, sinais, alertas, recomendações, chat RAG, billing e operação SaaS. O próximo marco é validar o monitoramento em páginas de preços e changelogs de concorrentes escolhidos com acesso permitido e revisão humana; em paralelo, ampliar rótulos pertinentes ao segmento B2B antes de usar classificações para decisões.
