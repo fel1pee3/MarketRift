@@ -30,6 +30,14 @@ type SignalRow = QueryResultRow & { id: string; state: string; signal_type: Sign
   rule_version: string; test_data: boolean; read_at?: Date | null };
 
 function hash(value: unknown): string { return createHash('sha256').update(JSON.stringify(value)).digest('hex'); }
+type HistoricalKey = { id: string; fact_key: string; state: string;
+  evidence: Record<string, unknown>; updated_at: Date };
+export function signalKeyForHistory(baseKey: string, coverage: unknown, history: HistoricalKey[]): string {
+  const active = history.find(row => row.state !== 'obsolete' && row.evidence.coverage === coverage);
+  if (active) return active.fact_key;
+  const latest = history[0];
+  return latest ? hash([baseKey, latest.id, latest.updated_at, coverage]) : baseKey;
+}
 function object(value: unknown): Record<string, unknown> | null {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
@@ -160,8 +168,93 @@ export function activityFact(sources: PublicRow[], documents: DocumentRow[]): Fa
 export class ReviewableSignalsController {
   constructor(@Inject(Db) private readonly db: Db, @Inject(Accounts) private readonly accounts: Accounts) {}
 
-  private async facts(client: PoolClient): Promise<Fact[]> {
-    const pages = await this.db.rows<PageRow>(client, `SELECT c.id, c.source_id, s.product_id, s.source_type,
+  @Post('refresh')
+  async refresh(@Req() request: Request): Promise<{ candidates: number; new_candidates: number; obsolete: number }> {
+    const principal = await this.accounts.principal(request, ['owner', 'admin']);
+    return this.db.tenant(principal.tenantId, async client => {
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1, 7176166010))',
+        [principal.tenantId]);
+      const result = await reconcileSignals(this.db, client, principal.tenantId);
+      await client.query(`UPDATE marketrift.signal_reconcile_sources SET processed_revision=requested_revision,
+        last_reconciled_at=now(),last_error=NULL,attempts=0,next_attempt_at=now()
+        WHERE tenant_id=$1`, [principal.tenantId]);
+      return result;
+    });
+  }
+
+  @Get()
+  async list(@Req() request: Request): Promise<{ signals: SignalRow[]; alerts: SignalRow[];
+    real_count: number; test_count: number; reconciliation: { last_at: Date | null; pending: number;
+      failed: number; reasons: string[] } }> {
+    const principal = await this.accounts.principal(request);
+    return this.db.tenant(principal.tenantId, async client => {
+      const projection = `SELECT r.id,r.state,r.signal_type,r.source_type,r.summary,r.interpretation_limit,
+        r.evidence,r.observed_at,r.created_at,r.reviewed_at,r.review_reason,r.obsolete_reason,
+        r.rule_version,r.test_data,reads.read_at FROM marketrift.reviewable_signals r
+        LEFT JOIN marketrift.signal_alert_reads reads ON reads.tenant_id=r.tenant_id
+          AND reads.signal_id=r.id AND reads.user_id=$2`;
+      const rows = await this.db.rows<SignalRow>(client, `${projection}
+        WHERE r.tenant_id=$1 AND ($3::boolean=false OR r.state='approved')
+        ORDER BY r.observed_at DESC,r.id LIMIT 100`,
+      [principal.tenantId, principal.userId, principal.role === 'viewer']);
+      const alerts = await this.db.rows<SignalRow>(client, `${projection}
+        WHERE r.tenant_id=$1 AND r.state='approved' AND r.reviewed_at >= now() - interval '30 days'
+        ORDER BY r.reviewed_at DESC,r.id LIMIT 20`, [principal.tenantId, principal.userId]);
+      const counts = await this.db.rows<{ real_count: number; test_count: number }>(client, `SELECT
+        count(*) FILTER (WHERE NOT test_data AND state <> 'obsolete')::integer AS real_count,
+        count(*) FILTER (WHERE test_data AND state <> 'obsolete')::integer AS test_count
+        FROM marketrift.reviewable_signals WHERE tenant_id=$1`, [principal.tenantId]);
+      const reconciliation = await this.db.rows<{ last_at: Date | null; pending: number; failed: number }>(client,
+        `SELECT max(last_reconciled_at) AS last_at,
+          count(*) FILTER (WHERE requested_revision>processed_revision)::integer AS pending,
+          count(*) FILTER (WHERE requested_revision>processed_revision AND last_error IS NOT NULL)::integer AS failed
+          FROM marketrift.signal_reconcile_sources WHERE tenant_id=$1`, [principal.tenantId]);
+      const reasons = await this.db.rows<{ last_error: string }>(client,
+        `SELECT DISTINCT last_error FROM marketrift.signal_reconcile_sources
+          WHERE tenant_id=$1 AND requested_revision>processed_revision AND last_error IS NOT NULL LIMIT 3`,
+        [principal.tenantId]);
+      return { signals: rows, alerts, real_count: counts[0]?.real_count ?? 0,
+        test_count: counts[0]?.test_count ?? 0,
+        reconciliation: { last_at: reconciliation[0]?.last_at ?? null,
+          pending: reconciliation[0]?.pending ?? 0, failed: reconciliation[0]?.failed ?? 0,
+          reasons: reasons.map(row => row.last_error) } };
+    });
+  }
+
+  @Post(':id/review')
+  async review(@Req() request: Request, @Param('id') value: string, @Body() body: unknown): Promise<{ state: string }> {
+    const principal = await this.accounts.principal(request, ['owner', 'admin']);
+    const id = parse(uuid, value); const input = parse(decision, body);
+    return this.db.tenant(principal.tenantId, async client => {
+      const row = await this.db.rows<{ id: string; state: string }>(client, `UPDATE marketrift.reviewable_signals
+        SET state=$3,review_reason=$4,reviewed_by=$5,reviewed_at=now(),updated_at=now()
+        WHERE tenant_id=$1 AND id=$2 AND state='candidate' RETURNING id,state`,
+      [principal.tenantId, id, input.state, input.reason, principal.userId]);
+      if (!row[0]) throw new NotFoundException('Candidato inexistente, já revisado ou obsoleto nesta empresa');
+      return { state: row[0].state };
+    });
+  }
+
+  @Post(':id/read')
+  async read(@Req() request: Request, @Param('id') value: string, @Body() body: unknown): Promise<{ read: boolean }> {
+    const principal = await this.accounts.principal(request);
+    const id = parse(uuid, value); const input = parse(readInput, body);
+    return this.db.tenant(principal.tenantId, async client => {
+      const approved = await this.db.rows<{ id: string }>(client, `SELECT id FROM marketrift.reviewable_signals
+        WHERE tenant_id=$1 AND id=$2 AND state='approved'`, [principal.tenantId, id]);
+      if (!approved[0]) throw new NotFoundException('Alerta aprovado não encontrado nesta empresa');
+      if (input.read) await client.query(`INSERT INTO marketrift.signal_alert_reads (tenant_id,signal_id,user_id)
+        VALUES ($1,$2,$3) ON CONFLICT (tenant_id,signal_id,user_id) DO NOTHING`,
+      [principal.tenantId, id, principal.userId]);
+      else await client.query(`DELETE FROM marketrift.signal_alert_reads WHERE tenant_id=$1 AND signal_id=$2 AND user_id=$3`,
+      [principal.tenantId, id, principal.userId]);
+      return { read: input.read };
+    });
+  }
+}
+
+export async function signalFacts(db: Db, client: PoolClient): Promise<Fact[]> {
+    const pages = await db.rows<PageRow>(client, `SELECT c.id, c.source_id, s.product_id, s.source_type,
       s.url AS source_url, c.previous_snapshot_id, c.current_snapshot_id, c.change_details,
       prev.final_url AS previous_url, next.final_url AS current_url,
       prev.content_sha256 AS previous_hash, next.content_sha256 AS current_hash,
@@ -197,7 +290,7 @@ export class ReviewableSignalsController {
         evidence: { ...first.evidence, product_ids: products, source_ids: sourceIds,
           ambiguous_association: products.length > 1 } });
     }
-    const publicSources = await this.db.rows<PublicRow>(client, `SELECT s.id, s.product_id, s.source_type, s.url,
+    const publicSources = await db.rows<PublicRow>(client, `SELECT s.id, s.product_id, s.source_type, s.url,
       latest.id AS run_id, latest.scan_complete, latest.finished_at
       FROM marketrift.sources s LEFT JOIN LATERAL (
         SELECT r.id, r.scan_complete, r.finished_at FROM marketrift.source_runs r
@@ -214,7 +307,7 @@ export class ReviewableSignalsController {
     for (const group of groups.values()) {
       const first = group[0]; if (!first) continue;
       const sourceIds = group.map(source => source.id);
-      const rows = await this.db.rows<DocumentRow>(client, `SELECT id, source_id, external_key, source_url,
+      const rows = await db.rows<DocumentRow>(client, `SELECT id, source_id, external_key, source_url,
         source_title, source_created_at, source_updated_at, collected_at, source_repository, synthetic
         FROM marketrift.documents WHERE source_id = ANY($1::uuid[])
           AND document_type=$2 ORDER BY id LIMIT 5001`, [sourceIds,
@@ -225,94 +318,44 @@ export class ReviewableSignalsController {
     return facts;
   }
 
-  @Post('refresh')
-  async refresh(@Req() request: Request): Promise<{ candidates: number; new_candidates: number; obsolete: number }> {
-    const principal = await this.accounts.principal(request, ['owner', 'admin']);
-    return this.db.tenant(principal.tenantId, async client => {
-      const facts = await this.facts(client);
-      const keys = facts.map(fact => fact.key);
-      let inserted = 0;
-      for (const fact of facts) {
-        const evidenceHash = hash(fact.evidence);
-        const rows = await this.db.rows<{ id: string }>(client, `INSERT INTO marketrift.reviewable_signals
-          (tenant_id,fact_key,rule_version,signal_type,source_type,source_id,page_change_id,
-          previous_snapshot_id,current_snapshot_id,summary,interpretation_limit,evidence,evidence_hash,
-          observed_at,test_data)
-          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
-          ON CONFLICT (tenant_id,fact_key) DO NOTHING RETURNING id`,
-        [principal.tenantId, fact.key, signalRuleVersion, fact.type, fact.sourceType, fact.sourceId,
-          fact.pageChangeId, fact.previousSnapshotId, fact.currentSnapshotId, fact.summary, fact.limit,
-          fact.evidence, evidenceHash, fact.observedAt, fact.testData]);
-        inserted += rows.length;
-      }
-      const obsolete = await this.db.rows<{ id: string }>(client, `UPDATE marketrift.reviewable_signals
-        SET state='obsolete', obsolete_reason='evidence_changed_removed_or_source_disabled',
-          evidence=jsonb_build_object('withdrawn',true,'reason','evidence_changed_removed_or_source_disabled'),
-          summary='Sinal sem suporte atual',
-          interpretation_limit='Origem alterada, removida ou desativada; revise um novo candidato antes de concluir.',
-          updated_at=now()
-        WHERE tenant_id=$1 AND state <> 'obsolete' AND rule_version=$2
-          AND NOT (fact_key = ANY($3::char(64)[])) RETURNING id`,
-      [principal.tenantId, signalRuleVersion, keys]);
-      return { candidates: facts.length, new_candidates: inserted, obsolete: obsolete.length };
-    });
+export async function reconcileSignals(db: Db, client: PoolClient, tenantId: string):
+  Promise<{ candidates: number; new_candidates: number; obsolete: number }> {
+  const facts = await signalFacts(db, client);
+  const keys: string[] = [];
+  let inserted = 0;
+  for (const fact of facts) {
+    // An unchanged active fact keeps its approval. A coverage transition or a
+    // return after obsolescence creates another row and leaves history intact.
+    const history = await db.rows<HistoricalKey>(client,
+      `SELECT id,fact_key,state,evidence,updated_at FROM marketrift.reviewable_signals
+        WHERE tenant_id=$1 AND (fact_key=$2 OR evidence->>'base_fact_key'=$2)
+        ORDER BY created_at DESC,id DESC`, [tenantId, fact.key]);
+    const factKey = signalKeyForHistory(fact.key, fact.evidence.coverage, history);
+    const evidence = factKey === fact.key ? fact.evidence : { ...fact.evidence, base_fact_key: fact.key };
+    keys.push(factKey);
+    const rows = await db.rows<{ id: string }>(client, `INSERT INTO marketrift.reviewable_signals
+      (tenant_id,fact_key,rule_version,signal_type,source_type,source_id,page_change_id,
+      previous_snapshot_id,current_snapshot_id,summary,interpretation_limit,evidence,evidence_hash,
+      observed_at,test_data)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+      ON CONFLICT (tenant_id,fact_key) DO NOTHING RETURNING id`,
+    [tenantId, factKey, signalRuleVersion, fact.type, fact.sourceType, fact.sourceId,
+      fact.pageChangeId, fact.previousSnapshotId, fact.currentSnapshotId, fact.summary, fact.limit,
+      evidence, hash(evidence), fact.observedAt, fact.testData]);
+    inserted += rows.length;
+    if (!rows.length) await client.query(`UPDATE marketrift.reviewable_signals
+      SET evidence=$3,evidence_hash=$4,updated_at=now()
+      WHERE tenant_id=$1 AND fact_key=$2 AND state<>'obsolete' AND evidence_hash<>$4`,
+    [tenantId, factKey, evidence, hash(evidence)]);
   }
-
-  @Get()
-  async list(@Req() request: Request): Promise<{ signals: SignalRow[]; alerts: SignalRow[];
-    real_count: number; test_count: number }> {
-    const principal = await this.accounts.principal(request);
-    return this.db.tenant(principal.tenantId, async client => {
-      const projection = `SELECT r.id,r.state,r.signal_type,r.source_type,
-        r.summary,r.interpretation_limit,r.evidence,r.observed_at,r.created_at,r.reviewed_at,
-        r.review_reason,r.obsolete_reason,r.rule_version,r.test_data,
-        ar.read_at FROM marketrift.reviewable_signals r
-        LEFT JOIN marketrift.signal_alert_reads ar ON ar.tenant_id=r.tenant_id
-          AND ar.signal_id=r.id AND ar.user_id=$2`;
-      const rows = await this.db.rows<SignalRow>(client, `${projection}
-        WHERE r.tenant_id=$1 AND ($3::boolean = false OR r.state='approved')
-        ORDER BY r.observed_at DESC,r.id LIMIT 100`,
-      [principal.tenantId, principal.userId, principal.role === 'viewer']);
-      const alerts = await this.db.rows<SignalRow>(client, `${projection}
-        WHERE r.tenant_id=$1 AND r.state='approved' AND r.reviewed_at >= now() - interval '30 days'
-        ORDER BY r.reviewed_at DESC,r.id LIMIT 20`, [principal.tenantId, principal.userId]);
-      const counts = await this.db.rows<{ real_count: number; test_count: number }>(client, `SELECT
-        count(*) FILTER (WHERE NOT test_data AND state <> 'obsolete')::integer AS real_count,
-        count(*) FILTER (WHERE test_data AND state <> 'obsolete')::integer AS test_count
-        FROM marketrift.reviewable_signals WHERE tenant_id=$1`, [principal.tenantId]);
-      return { signals: rows, alerts,
-      real_count: counts[0]?.real_count ?? 0, test_count: counts[0]?.test_count ?? 0 };
-    });
-  }
-
-  @Post(':id/review')
-  async review(@Req() request: Request, @Param('id') value: string, @Body() body: unknown): Promise<{ state: string }> {
-    const principal = await this.accounts.principal(request, ['owner', 'admin']);
-    const id = parse(uuid, value); const input = parse(decision, body);
-    return this.db.tenant(principal.tenantId, async client => {
-      const row = await this.db.rows<{ id: string; state: string }>(client, `UPDATE marketrift.reviewable_signals
-        SET state=$3,review_reason=$4,reviewed_by=$5,reviewed_at=now(),updated_at=now()
-        WHERE tenant_id=$1 AND id=$2 AND state='candidate' RETURNING id,state`,
-      [principal.tenantId, id, input.state, input.reason, principal.userId]);
-      if (!row[0]) throw new NotFoundException('Candidato inexistente, já revisado ou obsoleto nesta empresa');
-      return { state: row[0].state };
-    });
-  }
-
-  @Post(':id/read')
-  async read(@Req() request: Request, @Param('id') value: string, @Body() body: unknown): Promise<{ read: boolean }> {
-    const principal = await this.accounts.principal(request);
-    const id = parse(uuid, value); const input = parse(readInput, body);
-    return this.db.tenant(principal.tenantId, async client => {
-      const approved = await this.db.rows<{ id: string }>(client, `SELECT id FROM marketrift.reviewable_signals
-        WHERE tenant_id=$1 AND id=$2 AND state='approved'`, [principal.tenantId, id]);
-      if (!approved[0]) throw new NotFoundException('Alerta aprovado não encontrado nesta empresa');
-      if (input.read) await client.query(`INSERT INTO marketrift.signal_alert_reads (tenant_id,signal_id,user_id)
-        VALUES ($1,$2,$3) ON CONFLICT (tenant_id,signal_id,user_id) DO NOTHING`,
-      [principal.tenantId, id, principal.userId]);
-      else await client.query(`DELETE FROM marketrift.signal_alert_reads WHERE tenant_id=$1 AND signal_id=$2 AND user_id=$3`,
-      [principal.tenantId, id, principal.userId]);
-      return { read: input.read };
-    });
-  }
+  const obsolete = await db.rows<{ id: string }>(client, `UPDATE marketrift.reviewable_signals
+    SET state='obsolete', obsolete_reason='evidence_changed_removed_or_source_disabled',
+      evidence=jsonb_build_object('withdrawn',true,'reason','evidence_changed_removed_or_source_disabled'),
+      summary='Sinal sem suporte atual',
+      interpretation_limit='Origem alterada, removida ou desativada; revise um novo candidato antes de concluir.',
+      updated_at=now()
+    WHERE tenant_id=$1 AND state <> 'obsolete' AND rule_version=$2
+      AND NOT (fact_key = ANY($3::char(64)[])) RETURNING id`,
+  [tenantId, signalRuleVersion, keys]);
+  return { candidates: facts.length, new_candidates: inserted, obsolete: obsolete.length };
 }

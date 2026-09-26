@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReconcileSignalsJobV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tenant_id", "source_id", "revision", "idempotency_key"],
+  "properties": {
+    "version": { "const": 1 },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "source_id": { "type": "string", "format": "uuid" },
+    "revision": { "type": "string", "pattern": "^[1-9][0-9]*$" },
+    "idempotency_key": { "type": "string", "pattern": "^signal-reconcile-[0-9a-f-]+-[1-9][0-9]*-v1$" }
+  }
+}

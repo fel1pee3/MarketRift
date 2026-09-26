@@ -477,7 +477,7 @@ Owner, admin e analyst podem criar e julgar; viewer pode consultar, mas não rot
 
 A migração incremental `016_reviewable_signals.sql` cria candidatos revisáveis e leitura de alertas por usuário. Ela foi aplicada **uma vez** ao banco local existente com `npm run db:migrate:reviewable-signals`; o script detecta a tabela existente e só corrige uma eventual permissão de marcar alerta como não lido. Não rode `db:setup` no banco existente.
 
-Em **Sinais para revisão**, owner/admin clica **Atualizar candidatos a partir das evidências armazenadas**. Essa ação não coleta páginas, não consulta GitHub e não chama IA. Ela gera:
+Em **Sinais para revisão**, owner/admin pode clicar **Atualizar candidatos a partir das evidências armazenadas** como recuperação operacional. Essa ação não coleta páginas, não consulta GitHub e não chama IA. A reconciliação também é disparada automaticamente após gravações elegíveis, conforme a seção seguinte. Ela gera:
 
 - mudança do **preço listado** apenas com duas capturas v2 confirmadas, mesmo plano, moeda, período e condições explícitas, valores diferentes e citações presentes nas capturas;
 - **nova entrada** de changelog apenas quando a entrada foi confirmada na segunda captura com título, link específico e trecho preservado. Artigo editorial, alteração de entrada existente, captura parcial ou legado em revisão não vira lançamento;
@@ -490,8 +490,34 @@ Para testar com seus dados, após reiniciar `npm run dev:api` e `npm run dev:web
 1. Entre como owner/admin na empresa que já tem Discussions públicas `vercel/next.js` coletadas e abra **Sinais para revisão**. Clique **Atualizar candidatos**. Deve aparecer uma atividade de Discussions com contagem, link de origem e aviso de cobertura parcial se o último percurso mantiver cursor. Isso descreve comunidade pública, não clientes. Pode haver também Issues, se já foram coletadas com sucesso. Antes da atualização, o banco local tinha **0 sinais persistidos**, reais e de TESTE.
 2. Confira que a homepage editorial cadastrada como changelog, capturas `partial`/`unconfirmed` e a página de changelog legada `needs_review` **não** aparecem como novas entradas. Uma captura inicial isolada de preço também não cria mudança.
 3. Em um candidato, escreva um motivo e clique **Aprovar**. O item passa aos alertas internos como **Não lido**. Marque **Lido** e depois **Não lido**; a escolha afeta só sua conta. Para testar descarte, use outro candidato e informe um motivo. Com uma conta viewer, candidatos não aprovados e botões de revisão não devem aparecer.
-4. A coleta de uma nova versão ou a desativação de uma fonte exige clicar **Atualizar candidatos** novamente para reconciliar sinais antigos. Um sinal sem suporte passa a **obsoleto** e sai dos alertas. Não apague capturas ou julgamentos humanos para testar isso.
+4. Após uma coleta elegível ou desativação, o scheduler reconcilia automaticamente. O botão **Atualizar candidatos** continua disponível se o scheduler estiver parado ou falhar. Um sinal sem suporte passa a **obsoleto** e sai dos alertas. Não apague capturas ou julgamentos humanos para testar isso.
 
 Comandos verificados nesta entrega: `npm run db:migrate:reviewable-signals`, `npm run lint`, `npm run build`, `npm test`, `npm run test:db` e `node --env-file=.env scripts/e2e.mjs`. O E2E usa tenants e fontes simuladas **TESTE** e limpa seus dados; não mede a confiabilidade em concorrentes reais. A decisão técnica e os limites estão na [ADR 0017](docs/adr/0017-sinais-revisaveis-e-alertas-internos.md).
 
 **Verificações desta entrega:** `npm run lint`, `npm run build`, `npm test` (**29/29**), `npm run test:db` (**125/125**), `npm run test:e2e` (passou com corpus controlado; o primeiro ensaio exigiu atualizar a contagem esperada de origens duplicadas), Ruff nos arquivos Python alterados e uma execução local do novo avaliador com **3 trechos e 2 perguntas sintéticas**. O E2E percorreu criação, julgamento, pergunta sem resposta, cobertura incompleta, congelamento, comparação controlled/literal, cópia de versão, dois tenants, origem duplicada, edição e remoção; os rótulos do fixture são TESTE. Nenhuma chamada paga nem pergunta pública real foi avaliada. Custo de API de IA: **USD 0**.
+
+### Reconciliação automática dos sinais
+
+A migração **017** adiciona uma pendência transacional por empresa e fonte e os gatilhos para coletas GitHub Issues/Discussions concluídas, documentos públicos editados/removidos, mudanças de página e fontes elegíveis desativadas ou reassociadas. Ela foi aplicada uma vez ao banco local existente com:
+
+```powershell
+npm run db:migrate:signal-reconciliation
+```
+
+O comando detecta a tabela e não reaplica a migração. A migração não cria pendências para dados anteriores, não altera candidatos/alertas existentes e não ativa monitoramento de páginas pausadas. Não use `db:setup` no banco existente.
+
+Inicie o scheduler junto aos serviços que já usa:
+
+```powershell
+npm run dev:scheduler
+```
+
+No desenvolvimento, o comando da raiz delega ao workspace `@marketrift/api`, que executa o mesmo `src/page-scheduler-main.ts` com o `tsconfig.json` da API. Isso é necessário para que `tsx` transforme os decorators de parâmetros do NestJS no Windows. O processo continua reunindo o scheduler de páginas e o de sinais; `start:scheduler` continua usando o JavaScript compilado.
+
+**Resultado observado ao corrigir o comando:** a pendência real de GitHub Issues foi drenada sem nova coleta. A execução já concluída antes desta correção havia registrado 1 Issue nova e 1 atualizada; o fato armazenado passou de 2 para 3 Issues distintas. Portanto, o sinal de Issues antes aprovado ficou `obsolete` e surgiu um candidato novo, ainda sem aprovação. Seu ID, chave, hash e registro de leitura históricos permanecem. O sinal de Discussions continuou `approved` e lido. Essa mudança de estado reflete evidência material nova, não uma aprovação transferida pelo scheduler. A interface deve mostrar a última reconciliação e zero pendências; owner/admin precisa revisar o novo candidato de Issues.
+
+O scheduler publica apenas IDs, versão e revisão no BullMQ. Sua pendência fica no PostgreSQL se Redis falhar ou o processo reiniciar. O consumidor valida tenant, fonte e produto com RLS, serializa a reconciliação por empresa e usa as mesmas regras do botão manual. O painel **Sinais para revisão** mostra data da última conclusão, número de fontes pendentes e código da falha. Uma nova versão material cria candidato novo; um aprovado sem suporte fica obsoleto e desaparece dos alertas, sem mudar o estado de leitura histórico. Repetir uma coleta sem alteração não duplica candidato. A reconciliação não coleta fontes, não aprova candidatos e não envia mensagem externa. Veja [ADR 0018](docs/adr/0018-reconciliacao-automatica-dos-sinais.md).
+
+**Teste na interface sem esperar mudança em terceiros:** mantenha PostgreSQL, Redis, `dev:api`, `dev:worker`, `dev:web` e `dev:scheduler` abertos. Entre na empresa com Issues/Discussions já coletadas e anote os dois sinais aprovados e quais alertas estão lidos. Na fonte GitHub pública existente, solicite uma coleta manual de **1 página e até 5 itens**; o teste não depende de a fonte publicar conteúdo novo. Espere a execução terminar e abra **Sinais para revisão**. Em até cerca de 15 segundos após a gravação, o painel deve mostrar uma data de reconciliação recente e zero pendências para essa fonte. Se os documentos não mudaram, os mesmos sinais aprovados permanecem, sem novo alerta e sem mudar lido/não lido. Se a fonte mudou de fato, o aprovado antigo pode ficar obsoleto e um candidato novo exige revisão humana. Em caso de falha, o painel mostra pendência/motivo e o scheduler tenta novamente; owner/admin pode usar **Atualizar candidatos** para recuperação. O E2E controlado (`node --env-file=.env scripts/e2e.mjs`) verifica edição, obsolescência e candidato novo sem depender de mudança em site real.
+
+**Verificação desta entrega:** `npm run db:migrate:signal-reconciliation` aplicou 017 uma vez; `npm test` passou 39/39; `npm run test:db` passou 130/130; `npm run lint`, `npm run build` e `node --env-file=.env scripts/e2e.mjs` passaram. O E2E usou apenas tenants TESTE, duas instâncias do scheduler e respostas externas controladas. Os dois sinais públicos reais aprovados conservaram IDs, chaves, hashes e uma leitura por sinal. Custo externo de IA: USD 0. Não houve `db:setup`, commit ou push.

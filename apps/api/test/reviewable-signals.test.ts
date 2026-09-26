@@ -3,7 +3,7 @@ import test from 'node:test';
 import type { Request } from 'express';
 import { Accounts, Role } from '../src/accounts';
 import { Db } from '../src/db';
-import { ReviewableSignalsController, activityFact, pageFact } from '../src/reviewable-signals';
+import { ReviewableSignalsController, activityFact, pageFact, signalKeyForHistory } from '../src/reviewable-signals';
 
 const id = '11111111-1111-4111-8111-111111111111';
 const basePage = { id, source_id: id, product_id: id, source_type: 'pricing_page' as const,
@@ -59,6 +59,17 @@ test('public activity deduplicates the same source ID across two products and re
   assert.equal(fact?.evidence.coverage, 'partial_cursor');
   assert.equal((fact?.evidence.product_ids as string[]).length, 2);
   assert.equal(activityFact(sources, [{ ...document, synthetic: true }]), null);
+});
+
+test('unchanged facts keep approved keys; coverage changes and restored sources create another version', () => {
+  const oldKey = 'a'.repeat(64);
+  const historical = { id, fact_key: oldKey, state: 'approved',
+    evidence: { coverage: 'partial_cursor' }, updated_at: new Date('2026-09-01') };
+  assert.equal(signalKeyForHistory(oldKey, 'partial_cursor', [historical]), oldKey);
+  const changed = signalKeyForHistory(oldKey, 'complete_for_latest_scan', [historical]);
+  assert.notEqual(changed, oldKey);
+  assert.notEqual(signalKeyForHistory(oldKey, 'partial_cursor', [{ ...historical, state: 'obsolete' }]), oldKey);
+  assert.equal(signalKeyForHistory(oldKey, undefined, []), oldKey);
 });
 
 test('viewer and analyst cannot refresh or review; tenant context comes from principal', async () => {

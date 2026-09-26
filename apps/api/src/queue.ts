@@ -7,19 +7,21 @@ import { SyncGitHubDiscussionsJobV1 } from './github-discussions-job';
 import { SyncSteamReviewsJobV1 } from './steam-job';
 import { CheckWebPageJobV1 } from './web-page-job';
 import { SyncG2ReviewsJobV1 } from './g2-job';
+import { ReconcileSignalsJobV1 } from './signal-job';
+
+export function redisConnection(): { host: string; port: number; username: string;
+  password: string | undefined; db: number; tls: object | undefined; maxRetriesPerRequest: number } {
+  const url = new URL(process.env.REDIS_URL ?? 'redis://localhost:6380');
+  return { host: url.hostname, port: Number(url.port || 6379),
+    username: decodeURIComponent(url.username || 'default'),
+    password: url.password ? decodeURIComponent(url.password) : undefined,
+    db: Number(url.pathname.slice(1) || 0), tls: url.protocol === 'rediss:' ? {} : undefined,
+    maxRetriesPerRequest: 1 };
+}
 
 @Injectable()
 export class Jobs implements OnModuleDestroy {
-  private readonly redisUrl = new URL(process.env.REDIS_URL ?? 'redis://localhost:6380');
-  private readonly connection = {
-    host: this.redisUrl.hostname,
-    port: Number(this.redisUrl.port || 6379),
-    username: decodeURIComponent(this.redisUrl.username || 'default'),
-    password: this.redisUrl.password ? decodeURIComponent(this.redisUrl.password) : undefined,
-    db: Number(this.redisUrl.pathname.slice(1) || 0),
-    tls: this.redisUrl.protocol === 'rediss:' ? {} : undefined,
-    maxRetriesPerRequest: 1,
-  };
+  private readonly connection = redisConnection();
   private readonly queue = new Queue<IngestReviewJobV1>('review-ingest', {
     connection: this.connection,
   });
@@ -41,6 +43,14 @@ export class Jobs implements OnModuleDestroy {
   });
   private readonly evidenceQueue = new Queue<{ contract_version: 'index-evidence.v1'; tenant_id: string;
     source_id: string; idempotency_key: string }>('evidence-index', { connection: this.connection });
+  private readonly signalQueue = new Queue<ReconcileSignalsJobV1>('signal-reconcile',
+    { connection: this.connection });
+
+  async publishSignal(job: ReconcileSignalsJobV1): Promise<void> {
+    await this.signalQueue.add('reconcile-signals.v1', job, { jobId: job.idempotency_key,
+      attempts: 3, backoff: { type: 'exponential', delay: 2000 },
+      removeOnComplete: true, removeOnFail: true });
+  }
 
   async publishEvidenceIndex(tenantId: string, sourceId: string, key: string): Promise<void> {
     const job = { contract_version: 'index-evidence.v1' as const, tenant_id: tenantId,
@@ -109,5 +119,5 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.evidenceQueue.close()]); }
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.evidenceQueue.close(), this.signalQueue.close()]); }
 }

@@ -13,9 +13,15 @@ type Signal = { id: string; state: 'candidate' | 'approved' | 'discarded' | 'obs
   signal_type: string; source_type: string; summary: string; interpretation_limit: string;
   evidence: Evidence; observed_at: string; reviewed_at: string | null; review_reason: string | null;
   obsolete_reason: string | null; rule_version: string; test_data: boolean; read_at: string | null };
-type Result = { signals: Signal[]; alerts: Signal[]; real_count: number; test_count: number };
+type Result = { signals: Signal[]; alerts: Signal[]; real_count: number; test_count: number;
+  reconciliation: { last_at: string | null; pending: number; failed: number; reasons: string[] } };
 const base = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 function date(value: string): string { return new Date(value).toLocaleString('pt-BR'); }
+function failureReason(code: string): string {
+  if (code === 'fact_limit_exceeded') return 'limite de fatos da empresa excedido; revise a origem e tente a atualização manual';
+  if (code === 'source_not_visible') return 'fonte ou produto não está acessível neste tenant';
+  return 'falha interna de reconciliação; consulte o scheduler e tente a atualização manual';
+}
 function link(url: string | undefined, label: string): React.ReactNode {
   if (!url) return null;
   try { const parsed = new URL(url); if (!['https:', 'http:'].includes(parsed.protocol)) return null;
@@ -55,7 +61,8 @@ export default function SignalsPanel({ tenantId, csrfToken, role }: { tenantId: 
   }, []);
   useEffect(() => { let active = true;
     void get().catch(cause => { if (active) setError(cause instanceof Error ? cause.message : 'Falha ao carregar sinais'); });
-    return () => { active = false; };
+    const timer = setInterval(() => { void get().catch(() => undefined); }, 15_000);
+    return () => { active = false; clearInterval(timer); };
   }, [get, tenantId]);
   async function act(path: string, body: object = {}): Promise<void> {
     setBusy(true); setError('');
@@ -76,7 +83,12 @@ export default function SignalsPanel({ tenantId, csrfToken, role }: { tenantId: 
     <p>Fatos observados nas fontes cadastradas. Coleta, interpretação e aprovação humana são etapas diferentes. Nenhum sinal recomenda campanha, comprova impacto comercial ou representa participação de mercado.</p>
     {canReview && <button className="small" disabled={busy} onClick={() => void act('refresh')}>Atualizar candidatos a partir das evidências armazenadas</button>}
     {error && <p className="error" role="alert">{error}</p>}
-    {result && <><p>{result.real_count} sinais com suporte atual em fontes não marcadas TESTE · {result.test_count} sinais de TESTE, separados. A atualização é manual nesta etapa.</p>
+    {result && <><p>Reconciliação automática: {result.reconciliation.last_at
+      ? `última conclusão ${date(result.reconciliation.last_at)}` : 'ainda não concluída nesta empresa'}.
+      {' '}{result.reconciliation.pending} fonte(s) pendente(s); {result.reconciliation.failed} com falha.
+      {result.reconciliation.reasons.length > 0 && ` Motivo: ${result.reconciliation.reasons.map(failureReason).join('; ')}.`}</p>
+      <p>A reconciliação não coleta fontes, não ativa monitoramento e não aprova candidatos. O botão acima permite recuperação manual.</p></>}
+    {result && <><p>{result.real_count} sinais com suporte atual em fontes não marcadas TESTE · {result.test_count} sinais de TESTE, separados.</p>
       <h3>Alertas internos recentes</h3><p>Somente sinais aprovados nos últimos 30 dias; lido/não lido é individual. Nenhuma mensagem externa é enviada.</p>
       {result.alerts.length ? <ul>{result.alerts.map(item => <li key={item.id}>
         <strong>{item.read_at ? 'Lido' : 'Não lido'}</strong> · {item.summary} {item.test_data && <span className="badge">TESTE</span>}

@@ -1143,16 +1143,73 @@ try {
   assert.equal(laterSignals.some(item => item.evidence.previous?.url === editorialSource.body.url), false);
   assert.equal(laterSignals.some(item => item.evidence.previous?.url === legacySource.body.url), false);
   assert.equal(laterSignals.filter(item => item.id === priceSignal.id).length, 1);
+  // Two schedulers must reconcile a committed Discussion edit without another manual refresh.
+  assert.equal((await a.call(`reviewable-signals/${discussionSignal.id}/review`, { method: 'POST',
+    body: JSON.stringify({ state: 'approved', reason: 'controlled public activity' }) })).status, 201);
+  const signalSchedulerA = launchScheduler();
+  const signalSchedulerB = launchScheduler();
+  discussionBody = 'The integration also fails after a workspace is renamed.';
+  discussionUpdated = '2026-09-25T12:00:00Z';
+  const editedDiscussion = await syncDiscussions(2);
+  assert.equal(editedDiscussion.documents_updated, 1);
+  let autoSignals;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    autoSignals = (await a.call('reviewable-signals')).body;
+    if (autoSignals.signals.find(item => item.id === discussionSignal.id)?.state === 'obsolete'
+      && autoSignals.signals.some(item => item.signal_type === 'github_discussion_activity'
+        && item.state === 'candidate' && item.id !== discussionSignal.id)) break;
+    await delay(150);
+  }
+  assert.equal(autoSignals.signals.find(item => item.id === discussionSignal.id)?.state, 'obsolete');
+  assert.equal(autoSignals.alerts.some(item => item.id === discussionSignal.id), false);
+  const replacement = autoSignals.signals.find(item => item.signal_type === 'github_discussion_activity'
+    && item.state === 'candidate' && item.id !== discussionSignal.id);
+  assert(replacement, 'material edit requires a new human decision');
+  assert.equal(autoSignals.reconciliation.pending, 0);
+  assert.equal((await b.call('reviewable-signals')).body.signals.length, 0);
+  await syncDiscussions(2);
+  await delay(700);
+  const unchangedSignals = (await a.call('reviewable-signals')).body.signals;
+  assert.equal(unchangedSignals.filter(item => item.signal_type === 'github_discussion_activity'
+    && item.state === 'candidate').length, 1);
   const revokeDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
   try { await revokeDb.connect();
     await revokeDb.query('UPDATE marketrift.sources SET enabled=false WHERE tenant_id=$1 AND id=$2',
       [registeredA.body.tenant_id, pageSource.body.id]);
   } finally { await revokeDb.end(); }
+  let automaticallyRevoked;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    automaticallyRevoked = (await analyst.call('reviewable-signals')).body.signals
+      .find(item => item.id === priceSignal.id);
+    if (automaticallyRevoked?.state === 'obsolete') break;
+    await delay(150);
+  }
+  assert.equal(automaticallyRevoked?.state, 'obsolete', 'disabled source must reconcile automatically');
+  signalSchedulerA.kill(); signalSchedulerB.kill();
   const revokedRefresh = await a.call('reviewable-signals/refresh', { method: 'POST' });
   assert.equal(revokedRefresh.status, 201, JSON.stringify(revokedRefresh.body));
   const revokedSignal = (await analyst.call('reviewable-signals')).body.signals.find(item => item.id === priceSignal.id);
   assert.equal(revokedSignal.state, 'obsolete');
   assert.equal(revokedSignal.evidence.withdrawn, true);
+  assert.equal((await viewer.call('reviewable-signals')).body.alerts.some(item => item.id === priceSignal.id), false);
+  // Restoring the same confirmed evidence starts a new review epoch, not the old approval.
+  const restoreDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try { await restoreDb.connect();
+    await restoreDb.query('UPDATE marketrift.sources SET enabled=true WHERE tenant_id=$1 AND id=$2',
+      [registeredA.body.tenant_id, pageSource.body.id]);
+  } finally { await restoreDb.end(); }
+  const restoredScheduler = launchScheduler();
+  let restoredSignals;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    restoredSignals = (await a.call('reviewable-signals')).body.signals;
+    if (restoredSignals.some(item => item.signal_type === 'price_change'
+      && item.id !== priceSignal.id && item.state === 'candidate')) break;
+    await delay(150);
+  }
+  restoredScheduler.kill();
+  assert(restoredSignals.some(item => item.signal_type === 'price_change'
+    && item.id !== priceSignal.id && item.state === 'candidate'));
+  assert.equal(restoredSignals.find(item => item.id === priceSignal.id)?.state, 'obsolete');
   assert.equal((await viewer.call('reviewable-signals')).body.alerts.some(item => item.id === priceSignal.id), false);
 
   const foreignProduct = await b.call('products', { method: 'POST',
