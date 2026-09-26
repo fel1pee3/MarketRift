@@ -20,7 +20,8 @@ type PageRow = QueryResultRow & { id: string; source_id: string; product_id: str
   previous_text: string; current_text: string; previous_extracted: Record<string, unknown>;
   current_extracted: Record<string, unknown>; previous_at: Date; current_at: Date; detected_at: Date };
 type PublicRow = QueryResultRow & { id: string; product_id: string; source_type: 'github_issues' | 'github_discussions';
-  url: string; run_id: string | null; scan_complete: boolean | null; finished_at: Date | null };
+  url: string; access_environment?: string | null; run_id: string | null;
+  scan_complete: boolean | null; finished_at: Date | null };
 type DocumentRow = QueryResultRow & { id: string; source_id: string; external_key: string; source_url: string;
   source_title: string | null; source_created_at: Date | null; source_updated_at: Date | null;
   collected_at: Date; source_repository: string | null; synthetic: boolean };
@@ -161,7 +162,8 @@ export function activityFact(sources: PublicRow[], documents: DocumentRow[]): Fa
     summary: `${unique.length} ${noun} públicas armazenadas de ${repo}`,
     limit: `${noun} são atividade pública do repositório, não reviews de clientes. A coleta pode estar parcial por cursor; o total não representa todo o histórico.`,
     evidence: { ...evidence, observed_from: new Date(Math.min(...timestamps.map(value => value.getTime()))),
-      observed_to: latest }, observedAt: latest, testData: process.env.MARKETRIFT_TEST_MODE === '1' };
+    observed_to: latest }, observedAt: latest,
+    testData: sources.some(source => source.access_environment === 'sandbox') || process.env.MARKETRIFT_TEST_MODE === '1' };
 }
 
 @Controller('v1/reviewable-signals')
@@ -290,7 +292,7 @@ export async function signalFacts(db: Db, client: PoolClient): Promise<Fact[]> {
         evidence: { ...first.evidence, product_ids: products, source_ids: sourceIds,
           ambiguous_association: products.length > 1 } });
     }
-    const publicSources = await db.rows<PublicRow>(client, `SELECT s.id, s.product_id, s.source_type, s.url,
+    const publicSources = await db.rows<PublicRow>(client, `SELECT s.id, s.product_id, s.source_type, s.url, s.access_environment,
       latest.id AS run_id, latest.scan_complete, latest.finished_at
       FROM marketrift.sources s LEFT JOIN LATERAL (
         SELECT r.id, r.scan_complete, r.finished_at FROM marketrift.source_runs r

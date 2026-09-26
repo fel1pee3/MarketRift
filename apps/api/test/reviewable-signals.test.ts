@@ -58,6 +58,8 @@ test('public activity deduplicates the same source ID across two products and re
   assert.equal(fact?.evidence.count, 1);
   assert.equal(fact?.evidence.coverage, 'partial_cursor');
   assert.equal((fact?.evidence.product_ids as string[]).length, 2);
+  assert.equal(activityFact([{ ...sources[0]!, access_environment: 'sandbox' }, sources[1]!],
+    [document])?.testData, true, 'a controlled source stays TESTE even in another scheduler process');
   assert.equal(activityFact(sources, [{ ...document, synthetic: true }]), null);
 });
 

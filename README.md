@@ -37,6 +37,26 @@ O escopo completo está em [00-escopo-completo.md](docs/00-escopo-completo.md); 
 
 Veja [02-arquitetura.md](docs/02-arquitetura.md), [05-sinais-e-decisoes.md](docs/05-sinais-e-decisoes.md) e [07-interfaces-e-contratos.md](docs/07-interfaces-e-contratos.md).
 
+## Navegação do painel atual
+
+Com API e web iniciadas (`npm run dev:api` e `npm run dev:web` em terminais separados), entre em `http://localhost:3000`. O menu leva diretamente às áreas abaixo; você também pode abrir qualquer URL e atualizar a página. O navegador recupera a sessão por cookie `HttpOnly`. Se a sessão expirou, a URL aberta mostra o formulário de entrada e volta à mesma área após o login.
+
+| URL | O que contém |
+| --- | --- |
+| `http://localhost:3000/` | Visão geral da empresa ativa: produtos, associações de fontes, cobertura, últimas execuções, candidatos e alertas internos recentes. |
+| `http://localhost:3000/fontes` | Cadastro de produtos, GitHub Issues/Discussions, Steam, CSV B2B e legado, G2 condicionado ao acesso, páginas e importações. Os atalhos internos levam ao conector desejado. |
+| `http://localhost:3000/evidencias` | Busca com filtros, indicadores descritivos, Discussions, documentos e análises com origem. |
+| `http://localhost:3000/perguntas` | Estado da indexação e perguntas extrativas com citações; sintéticos continuam excluídos por padrão. |
+| `http://localhost:3000/revisao` | Candidatos, aprovação/descartes por owner/admin, reconciliação e alertas lidos/não lidos. |
+| `http://localhost:3000/avaliacao-busca` | Conjuntos e julgamentos humanos da recuperação, separados do resumo executivo. |
+| `http://localhost:3000/conta` | Empresa ativa, troca de tenant, membros, convites e logout (também no cabeçalho). |
+
+A visão geral **não** coleta dados, chama IA ou aprova sinais ao abrir. “Fontes associadas” conta vínculos cadastrados, não documentos distintos; uma mesma origem em dois produtos não duplica o total de evidências. Issues, Discussions, reviews e páginas conservam rótulos e limites próprios. `TESTE`, coleta parcial, direitos pendentes, interpretação não confirmada e erros aparecem explicitamente. A API mantém a validação de membership, RBAC, CSRF e RLS nas operações; a navegação não concede permissão adicional.
+
+Para conferir com dados existentes: abra `/`, siga “Produtos e fontes”, use os atalhos para uma origem já cadastrada, depois abra `/evidencias` e aplique um filtro. Em `/revisao`, confira os candidatos e alertas existentes sem clicar em aprovação. Abra `/avaliacao-busca` para ver os conjuntos humanos sem mudar rótulos. Em `/conta`, troque de empresa se sua conta pertencer a duas; volte a `/` e confirme que produtos, fontes e sinais agora são os da nova empresa. Atualize `/evidencias` diretamente no navegador para conferir restauração da sessão. Um viewer pode consultar dados autorizados, mas não cadastrar fontes, rotular nem aprovar candidatos.
+
+Esta alteração de navegação não cria migração nem modifica o banco. As verificações da entrega são `npm run lint`, `npm run build`, `npm test`, `npm run test:db` e `npm run test:e2e`; o E2E serve as URLs diretas e exercita RBAC, CSRF e isolamento de tenants com dados controlados. Ele não automatiza cliques de navegador; o roteiro acima cobre a verificação visual e por teclado.
+
 ## Estrutura
 
 ```text
@@ -114,9 +134,9 @@ npm run dev:intelligence-http
 
 O worker pode ficar sem novas mensagens no terminal enquanto espera jobs. O servidor FastAPI expõe somente `/health` nesta fase e não é necessário para o fluxo de importação. O Next.js grava o servidor de desenvolvimento em `apps/web/.next-dev` e o build de produção em `apps/web/.next`, para que os dois comandos não sobrescrevam os mesmos arquivos. Se o navegador avisar sobre hidratação e mostrar atributos como `bis_skin_checked`, `bis_register` ou `cz-shortcut-listen`, teste a página com as extensões desativadas: esses atributos são inseridos no HTML antes da hidratação do React.
 
-Abra `http://localhost:3000`. Crie uma empresa, cadastre produto próprio e concorrente e associe ao concorrente uma fonte com URL `https://example.invalid/reviews`. Na seção **Importar CSV**, selecione essa fonte; no campo **Arquivo CSV**, use o seletor de arquivos para escolher `fixtures/reviews.example.csv` dentro da pasta do projeto e clique em **Enviar avaliações**. Abrir o CSV no editor apenas mostra seu conteúdo; não o importa. As duas linhas do exemplo são sintéticas, com URLs `.invalid` que não levam a páginas reais e marcação `synthetic=true`. A lista de importações mostra o estado; os documentos exibem texto, data e URL de origem. O FastAPI atual expõe apenas `/health` em `127.0.0.1:8000`.
+Abra `http://localhost:3000`. Crie uma empresa, entre em `/fontes`, cadastre produto próprio e concorrente e associe ao concorrente uma fonte com URL `https://example.invalid/reviews`. Em **Importar CSV** nessa mesma página, selecione a fonte; no campo **Arquivo CSV**, use o seletor de arquivos para escolher `fixtures/reviews.example.csv` dentro da pasta do projeto e clique em **Enviar avaliações**. Abrir o CSV no editor apenas mostra seu conteúdo; não o importa. As duas linhas do exemplo são sintéticas, com URLs `.invalid` que não levam a páginas reais e marcação `synthetic=true`. A lista de importações mostra o estado; `/evidencias#documentos` exibe texto, data e URL de origem. O FastAPI atual expõe também as rotas internas documentadas nos marcos posteriores.
 
-Em **Membros e convites**, owner pode criar convites para admin, analyst ou viewer; admin pode convidar analyst ou viewer. Copie o código exibido uma única vez e entregue à pessoa convidada por canal seguro. Quem já tem conta entra e usa **Aceitar convite recebido**; quem é novo cola o código no formulário **Criar conta** usando o mesmo email do convite. Depois, **Empresa ativa** permite trocar de tenant. A sessão é recuperada após recarregar a página e termina ao clicar em **Sair**. O frontend não recebe o identificador secreto do cookie; mantém apenas um token CSRF em memória.
+Em `/conta`, **Membros e convites** permite ao owner criar convites para admin, analyst ou viewer; admin pode convidar analyst ou viewer. Copie o código exibido uma única vez e entregue à pessoa convidada por canal seguro. Quem já tem conta entra e usa **Aceitar convite recebido**; quem é novo cola o código no formulário **Criar conta** usando o mesmo email do convite. **Empresa ativa** nessa página permite trocar de tenant. A sessão é recuperada após recarregar a página e termina ao clicar em **Sair**. O frontend não recebe o identificador secreto do cookie; mantém apenas um token CSRF em memória.
 
 ### Análise de avaliações
 
@@ -277,7 +297,7 @@ O teste direto anterior confirmou cinco itens reais em memória; o teste posteri
 
 ### Visão de evidências e primeiros indicadores
 
-Na seção **Visão de evidências** da página inicial, a API pesquisa somente a **empresa ativa**. Os filtros aceitos são produto, tipo de fonte, datas de/até (dias UTC da publicação/criação; quando falta, da coleta), termo literal no título/texto, limite de 1–50 e deslocamento de 0–1000. A interface mostra horários no fuso do navegador, 20 itens por página e permite navegar até as primeiras 1.020 origens; refine os filtros para investigar o restante. Consultas ao banco usam a sessão, membership e transação com RLS; enviar um `product_id` de outra empresa não dá acesso a ela. A busca não chama IA nem envia conteúdo à OpenAI.
+Em `/evidencias`, a API pesquisa somente a **empresa ativa**. Os filtros aceitos são produto, tipo de fonte, datas de/até (dias UTC da publicação/criação; quando falta, da coleta), termo literal no título/texto, limite de 1–50 e deslocamento de 0–1000. A interface mostra horários no fuso do navegador, 20 itens por página e permite navegar até as primeiras 1.020 origens; refine os filtros para investigar o restante. Consultas ao banco usam a sessão, membership e transação com RLS; enviar um `product_id` de outra empresa não dá acesso a ela. A busca não chama IA nem envia conteúdo à OpenAI.
 
 Cada total conta **origens distintas armazenadas** dentro do tipo: review CSV pela URL da avaliação mais chave externa; Steam por App ID e `recommendationid`; Issue/Discussion por repositório e ID externo; captura de página por URL final e hash do conteúdo. Se uma página voltar a um conteúdo antigo, esse conteúdo conta uma vez no agregado, embora as versões continuem no histórico detalhado. Repetir uma coleta não aumenta esse total. Se a mesma origem estiver ligada a mais de um produto, ela aparece uma vez no total geral e a interface avisa quantos produtos estão associados. Um filtro por produto pode mostrá-la em ambos os produtos: não some esses subtotais como se fossem amostras independentes. Cada tipo exibe sua própria contagem e intervalo observado. `scan_complete=false` no último sucesso de uma fonte é indicado como **cobertura parcial**, não como histórico completo.
 

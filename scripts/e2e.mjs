@@ -262,6 +262,17 @@ try {
     await delay(100);
   }
   assert.equal(webReady, true, `Web did not serve the onboarding page: ${errors}`);
+  for (const [path, title] of [
+    ['/fontes', 'Produtos e fontes'], ['/evidencias', 'Evidências'], ['/perguntas', 'Perguntas'],
+    ['/revisao', 'Revisão de sinais'], ['/avaliacao-busca', 'Avaliação da busca'],
+    ['/conta', 'Conta e equipe'],
+  ]) {
+    const response = await fetch(`${webOrigin}${path}`);
+    const html = await response.text();
+    assert.equal(response.status, 200, `Direct navigation to ${path} failed`);
+    assert.match(html, /Verificando sessão/, `Direct navigation to ${path} must restore the cookie session`);
+    assert(html.includes(`<title>${title} | MarketRift</title>`), `Direct navigation to ${path} has the wrong page title`);
+  }
 
   const suffix = randomUUID();
   const password = `test-password-${suffix}`;
@@ -324,9 +335,21 @@ try {
   assert.equal((await analyst.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await admin.call('sources', { method: 'POST', body: JSON.stringify({ product_id: competitor.body.id, url: 'https://example.invalid/other' }) })).status, 201);
 
+  async function markControlledPublicSource(sourceId) {
+    const client = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+    try {
+      await client.connect();
+      const result = await client.query(`UPDATE marketrift.sources SET access_environment='sandbox'
+        WHERE tenant_id=$1 AND id=$2 AND source_type IN ('github_issues','github_discussions')`,
+      [registeredA.body.tenant_id, sourceId]);
+      assert.equal(result.rowCount, 1);
+    } finally { await client.end(); }
+  }
+
   const discussionSource = await a.call('sources/github-discussions', { method: 'POST',
     body: JSON.stringify({ product_id: competitor.body.id, repository: 'Example/Repo' }) });
   assert.equal(discussionSource.status, 201, JSON.stringify(discussionSource.body));
+  await markControlledPublicSource(discussionSource.body.id);
   assert.equal(discussionSource.body.url, 'https://github.com/example/repo');
   assert.equal((await b.call('sources/github-discussions', { method: 'POST',
     body: JSON.stringify({ product_id: competitor.body.id, repository: 'Example/Repo' }) })).status, 404);
@@ -487,6 +510,7 @@ try {
   const duplicateDiscussionSource = await a.call('sources/github-discussions', { method: 'POST',
     body: JSON.stringify({ product_id: product.body.id, repository: 'Example/Repo' }) });
   assert.equal(duplicateDiscussionSource.status, 201);
+  await markControlledPublicSource(duplicateDiscussionSource.body.id);
   const duplicateSync = await analyst.call(`sources/${duplicateDiscussionSource.body.id}/sync`, {
     method: 'POST', body: JSON.stringify({ max_pages: 2, max_items: 2 }) });
   assert.equal(duplicateSync.status, 200);
