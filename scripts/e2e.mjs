@@ -25,6 +25,7 @@ const pageRequests = [];
 let discussionBody = 'The integration fails when the account name has spaces.';
 let discussionUpdated = '2026-09-24T12:00:00Z';
 const discussionRequests = [];
+let discoveryMode = 'normal';
 let g2Body = 'The invoice export failed.';
 let g2Updated = '2026-09-02T12:00:00Z';
 let g2Public = true;
@@ -71,6 +72,37 @@ const steamMock = createServer((request, response) => {
           hasNextPage: number === 1 } } } } }));
     });
     return;
+  }
+  if (url.pathname.startsWith('/discovery/')) {
+    if (url.pathname === '/discovery/robots.txt') {
+      response.writeHead(200, { 'Content-Type': 'text/plain' });
+      response.end(discoveryMode === 'robots_large' ? `User-agent: *\n${'x'.repeat(256_001)}` :
+        'User-agent: *\nAllow: /\n'); return;
+    }
+    if (url.pathname === '/discovery/') {
+      response.writeHead(200, { 'Content-Type': 'text/html' });
+      response.end('<a href="/plans">Pricing</a><a href="/pricing-alt">Alternative pricing</a>'
+        + '<a href="/changelog">Release notes</a>'
+        + '<a href="https://instagram.com/example">Instagram</a>'
+        + '<a href="https://thirdparty.com/pricing">Similar company pricing</a>'
+        + '<a href="https://github.com/example/repo">Community repository</a>'
+        + '<link rel="alternate" href="/feed.xml" type="application/rss+xml">'); return;
+    }
+    if (url.pathname === '/discovery/sitemap.xml') {
+      response.writeHead(200, { 'Content-Type': 'application/xml' });
+      response.end(discoveryMode === 'sitemap_large' ? 'x'.repeat(1_000_001) :
+        '<urlset><url><loc>https://example.com/plans</loc></url>'
+        + '<url><loc>https://example.com/docs</loc></url></urlset>'); return;
+    }
+    if (url.pathname === '/discovery/feed.xml') {
+      response.writeHead(200, { 'Content-Type': 'application/rss+xml' });
+      response.end('<rss><channel><item><link>https://example.com/blog</link></item></channel></rss>'); return;
+    }
+    if (url.pathname === '/discovery/plans') {
+      response.writeHead(200, { 'Content-Type': 'text/html' });
+      response.end('<a href="/support">Support forum</a>'); return;
+    }
+    response.writeHead(404); response.end(); return;
   }
   if (url.pathname.startsWith('/web-page/')) {
     pageRequests.push(url.pathname);
@@ -132,6 +164,7 @@ const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
   env: { ...childEnv, ANALYSIS_PROVIDER: 'test', MARKETRIFT_TEST_MODE: '1',
     STEAM_REVIEW_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     WEB_PAGE_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    DISCOVERY_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TOKEN: 'e2e-read-only-placeholder',
     G2_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
@@ -334,6 +367,187 @@ try {
   assert.equal((await viewer.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await analyst.call('products', { method: 'POST', body: JSON.stringify({ name: 'Forbidden', kind: 'competitor' }) })).status, 403);
   assert.equal((await admin.call('sources', { method: 'POST', body: JSON.stringify({ product_id: competitor.body.id, url: 'https://example.invalid/other' }) })).status, 201);
+
+  // A controlled site exercises API -> BullMQ -> worker -> tenant tables -> API.
+  const discoveryInput = { product_id: competitor.body.id, official_domain: 'example.com',
+    aliases: ['Example'], country_code: 'US', languages: ['en'], official_urls: [] };
+  assert.equal((await viewer.call('source-discovery/profiles', { method: 'POST',
+    body: JSON.stringify(discoveryInput) })).status, 403);
+  assert.equal((await analyst.call('source-discovery/profiles', { method: 'POST',
+    body: JSON.stringify(discoveryInput) })).status, 403);
+  assert.equal((await b.call('source-discovery/profiles', { method: 'POST',
+    body: JSON.stringify(discoveryInput) })).status, 404);
+  assert.equal((await a.call('source-discovery/profiles', { method: 'POST', withoutCsrf: true,
+    body: JSON.stringify(discoveryInput) })).status, 403);
+  const profile = await admin.call('source-discovery/profiles', { method: 'POST',
+    body: JSON.stringify(discoveryInput) });
+  assert.equal(profile.status, 200, JSON.stringify(profile.body));
+  assert.equal(profile.body.official_domain, 'example.com');
+  assert.equal((await viewer.call(`source-discovery/profiles/${competitor.body.id}/run`,
+    { method: 'POST' })).status, 403);
+  const discoveryStart = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`,
+    { method: 'POST' });
+  assert.equal(discoveryStart.status, 200, JSON.stringify(discoveryStart.body));
+  let discovered;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    discovered = (await a.call('source-discovery')).body;
+    const run = discovered.runs.find(item => item.id === discoveryStart.body.id);
+    if (run?.status === 'failed') throw new Error(`Controlled discovery failed: ${JSON.stringify(run)}`);
+    if (run?.status === 'succeeded') break;
+    await delay(150);
+  }
+  assert.equal(discovered.runs.find(item => item.id === discoveryStart.body.id).status, 'succeeded');
+  assert.equal((await b.call('source-discovery')).body.candidates.length, 0);
+  const discoveryRls = new pg.Client({ connectionString: process.env.RUNTIME_DATABASE_URL });
+  try {
+    await discoveryRls.connect();
+    await discoveryRls.query('BEGIN');
+    await discoveryRls.query("SELECT set_config('app.tenant_id',$1,true)", [registeredB.body.tenant_id]);
+    const isolated = await discoveryRls.query('SELECT id FROM marketrift.discovery_candidates WHERE tenant_id=$1',
+      [registeredA.body.tenant_id]);
+    assert.equal(isolated.rowCount, 0, 'RLS must hide another company candidates');
+    await discoveryRls.query('ROLLBACK');
+  } finally { await discoveryRls.end(); }
+  const priceCandidate = discovered.candidates.find(item => item.canonical_url === 'https://example.com/plans');
+  assert(priceCandidate, 'pricing link must be discovered');
+  assert.equal(priceCandidate.confidence, 'official_host');
+  const secondPriceCandidate = discovered.candidates.find(item => item.canonical_url === 'https://example.com/pricing-alt');
+  assert(secondPriceCandidate);
+  assert(discovered.candidates.some(item => item.canonical_url === 'https://instagram.com/example'));
+  assert.equal(discovered.candidates.find(item => item.canonical_url === 'https://thirdparty.com/pricing').confidence, 'ambiguous');
+  const existingDiscoveryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  let alreadyRegisteredId;
+  try {
+    await existingDiscoveryDb.connect();
+    const registered = await existingDiscoveryDb.query("INSERT INTO marketrift.sources "
+      + "(tenant_id,product_id,source_type,url,check_interval_minutes,monitoring_enabled,access_environment) "
+      + "VALUES ($1,$2,'pricing_page','https://example.com/plans',1440,false,'sandbox') RETURNING id",
+      [registeredA.body.tenant_id, competitor.body.id]);
+    alreadyRegisteredId = registered.rows[0].id;
+  } finally { await existingDiscoveryDb.end(); }
+  assert.equal((await viewer.call(`source-discovery/candidates/${priceCandidate.id}/decision`, { method: 'POST',
+    body: JSON.stringify({ decision: 'confirmed' }) })).status, 403);
+  assert.equal((await b.call(`source-discovery/candidates/${priceCandidate.id}/decision`, { method: 'POST',
+    body: JSON.stringify({ decision: 'confirmed' }) })).status, 404);
+  const confirmation = await admin.call(`source-discovery/candidates/${priceCandidate.id}/decision`,
+    { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) });
+  assert.equal(confirmation.status, 200, JSON.stringify(confirmation.body));
+  assert.equal(confirmation.body.linked_source_id, alreadyRegisteredId,
+    'confirmation must reuse an existing connector');
+  const discoveredPageSource = (await a.call('page-sources')).body.sources.find(item => item.id === confirmation.body.linked_source_id);
+  assert(discoveredPageSource);
+  assert.equal(discoveredPageSource.monitoring_enabled, false);
+  assert.equal(discoveredPageSource.next_check_at, null);
+  const secondConfirmation = await admin.call(`source-discovery/candidates/${secondPriceCandidate.id}/decision`,
+    { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) });
+  assert.equal(secondConfirmation.status, 200, JSON.stringify(secondConfirmation.body));
+  assert(secondConfirmation.body.linked_source_id);
+  assert.notEqual(secondConfirmation.body.linked_source_id, alreadyRegisteredId);
+  const secondPageSource = (await a.call('page-sources')).body.sources.find(item => item.id === secondConfirmation.body.linked_source_id);
+  assert.equal(secondPageSource.monitoring_enabled, false, 'a newly discovered page stays paused');
+  const discoverySourceDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await discoverySourceDb.connect();
+    await discoverySourceDb.query("UPDATE marketrift.sources SET access_environment='sandbox' WHERE tenant_id=$1 AND id=$2",
+      [registeredA.body.tenant_id, secondPageSource.id]);
+  } finally { await discoverySourceDb.end(); }
+  assert.equal((await admin.call(`source-discovery/candidates/${priceCandidate.id}/decision`, { method: 'POST',
+    body: JSON.stringify({ decision: 'confirmed' }) })).body.linked_source_id, discoveredPageSource.id);
+  assert.equal((await a.call('page-sources')).body.sources.filter(item => item.url === 'https://example.com/plans').length, 1);
+  const intervalBlocked = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`,
+    { method: 'POST' });
+  assert.equal(intervalBlocked.status, 409, 'minimum interval applies even to analysts');
+  assert.equal(intervalBlocked.body.code, 'minimum_interval');
+  assert(intervalBlocked.body.retry_after_at);
+  const discoveryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await discoveryDb.connect();
+    await discoveryDb.query("UPDATE marketrift.discovery_runs SET finished_at=now()-interval '6 minutes' "
+      + 'WHERE tenant_id=$1 AND id=$2', [registeredA.body.tenant_id, discoveryStart.body.id]);
+  } finally { await discoveryDb.end(); }
+  discoveryMode = 'sitemap_large';
+  const discoveryRepeat = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`,
+    { method: 'POST' });
+  assert.equal(discoveryRepeat.status, 200, JSON.stringify(discoveryRepeat.body));
+  for (let attempt = 0; attempt < 100; attempt++) {
+    discovered = (await a.call('source-discovery')).body;
+    const run = discovered.runs.find(item => item.id === discoveryRepeat.body.id);
+    if (run?.status === 'failed') throw new Error(`Repeated discovery failed: ${JSON.stringify(run)}`);
+    if (run?.status === 'succeeded') break;
+    await delay(150);
+  }
+  assert.equal(discovered.runs.find(item => item.id === discoveryRepeat.body.id).candidates_new, 0);
+  const partialRun = discovered.runs.find(item => item.id === discoveryRepeat.body.id);
+  assert.equal(partialRun.partial, true);
+  assert(partialRun.resource_failures.some(item => item.resource === 'sitemap'
+    && item.code === 'response_too_large' && item.limit_kind === 'actual_bytes'));
+  discoveryMode = 'normal';
+  assert.equal(discovered.candidates.find(item => item.id === priceCandidate.id).status, 'confirmed');
+  const rateDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await rateDb.connect();
+    await rateDb.query("UPDATE marketrift.discovery_runs SET retry_after_at=now()+interval '1 hour' "
+      + 'WHERE tenant_id=$1 AND id=$2', [registeredA.body.tenant_id, discoveryRepeat.body.id]);
+  } finally { await rateDb.end(); }
+  const rateBlocked = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`, { method: 'POST' });
+  assert.equal(rateBlocked.status, 409);
+  assert.equal(rateBlocked.body.code, 'origin_rate_limit');
+  assert(rateBlocked.body.retry_after_at);
+  // A too-large robots.txt must stop safely, keep the existing candidates, and record one attempted request.
+  const discoveryResetDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await discoveryResetDb.connect();
+  try {
+    await discoveryResetDb.query("UPDATE marketrift.discovery_runs SET retry_after_at=NULL, finished_at=now()-interval '6 minutes' "
+      + 'WHERE tenant_id=$1 AND id=$2', [registeredA.body.tenant_id, discoveryRepeat.body.id]);
+  } finally { await discoveryResetDb.end(); }
+  discoveryMode = 'robots_large';
+  const robotsRun = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`, { method: 'POST' });
+  assert.equal(robotsRun.status, 200);
+  for (let attempt = 0; attempt < 100; attempt++) {
+    discovered = (await a.call('source-discovery')).body;
+    const run = discovered.runs.find(item => item.id === robotsRun.body.id);
+    if (run?.status === 'failed') break;
+    await delay(150);
+  }
+  const robotsFailure = discovered.runs.find(item => item.id === robotsRun.body.id);
+  assert.equal(robotsFailure.status, 'failed');
+  assert.equal(robotsFailure.error_code, 'robots_too_large');
+  assert.equal(robotsFailure.pages_examined, 1);
+  assert.equal(robotsFailure.resource_failures[0].resource, 'robots.txt');
+  discoveryMode = 'normal';
+  const activeDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await activeDb.connect();
+  let activeDiscoveryId;
+  try {
+    const inserted = await activeDb.query("INSERT INTO marketrift.discovery_runs "
+      + "(tenant_id,product_id,identity_version,status) VALUES ($1,$2,$3,'running') RETURNING id",
+    [registeredA.body.tenant_id, competitor.body.id, profile.body.identity_version]);
+    activeDiscoveryId = inserted.rows[0].id;
+    const activeBlocked = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`,
+      { method: 'POST' });
+    assert.equal(activeBlocked.status, 409);
+    assert.equal(activeBlocked.body.code, 'run_active');
+    assert.equal(activeBlocked.body.run_id, activeDiscoveryId);
+  } finally {
+    if (activeDiscoveryId) await activeDb.query("UPDATE marketrift.discovery_runs SET status='failed',"
+      + "error_code='e2e_cleanup',finished_at=now()-interval '6 minutes' WHERE id=$1", [activeDiscoveryId]);
+    await activeDb.end();
+  }
+  const changedProfile = await a.call('source-discovery/profiles', { method: 'POST',
+    body: JSON.stringify({ ...discoveryInput, official_domain: 'example.org' }) });
+  assert.equal(changedProfile.status, 200, JSON.stringify(changedProfile.body));
+  assert.equal(changedProfile.body.identity_version, profile.body.identity_version + 1);
+  assert.equal((await a.call(`source-discovery/candidates/${priceCandidate.id}/decision`, { method: 'POST',
+    body: JSON.stringify({ decision: 'rejected' }) })).status, 409);
+  assert((await a.call('page-sources')).body.sources.some(item => item.id === discoveredPageSource.id));
+  assert.equal((await admin.call(`source-discovery/profiles/${competitor.body.id}/pause`,
+    { method: 'POST' })).status, 200);
+  const pausedBlocked = await analyst.call(`source-discovery/profiles/${competitor.body.id}/run`,
+    { method: 'POST' });
+  assert.equal(pausedBlocked.status, 409);
+  assert.equal(pausedBlocked.body.code, 'discovery_paused');
+  assert.equal((await admin.call(`source-discovery/profiles/${competitor.body.id}/resume`,
+    { method: 'POST' })).status, 200);
 
   async function markControlledPublicSource(sourceId) {
     const client = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
@@ -901,7 +1115,7 @@ try {
   assert(priceSignal, 'confirmed comparable price must create a candidate');
   assert.equal(priceSignal.state, 'candidate');
   assert.equal(priceSignal.test_data, true, 'simulated page must be TESTE');
-  assert.equal(firstSignals.body.real_count, 0);
+  assert.equal(firstSignals.body.real_count, 0, 'controlled fixtures must not count as real signals');
   assert.equal((await viewer.call('reviewable-signals')).body.signals.length, 0);
   assert.equal((await b.call('reviewable-signals')).body.signals.length, 0);
   const repeatedSignals = await a.call('reviewable-signals/refresh', { method: 'POST' });
@@ -1224,7 +1438,7 @@ try {
   } finally { await restoreDb.end(); }
   const restoredScheduler = launchScheduler();
   let restoredSignals;
-  for (let attempt = 0; attempt < 80; attempt++) {
+  for (let attempt = 0; attempt < 150; attempt++) {
     restoredSignals = (await a.call('reviewable-signals')).body.signals;
     if (restoredSignals.some(item => item.signal_type === 'price_change'
       && item.id !== priceSignal.id && item.state === 'candidate')) break;
@@ -1232,7 +1446,10 @@ try {
   }
   restoredScheduler.kill();
   assert(restoredSignals.some(item => item.signal_type === 'price_change'
-    && item.id !== priceSignal.id && item.state === 'candidate'));
+    && item.id !== priceSignal.id && item.state === 'candidate'),
+  JSON.stringify({ signals: restoredSignals.filter(item => item.signal_type === 'price_change')
+    .map(item => ({ id: item.id, state: item.state, test: item.test_data })),
+  reconciliation: (await a.call('reviewable-signals')).body.reconciliation }));
   assert.equal(restoredSignals.find(item => item.id === priceSignal.id)?.state, 'obsolete');
   assert.equal((await viewer.call('reviewable-signals')).body.alerts.some(item => item.id === priceSignal.id), false);
 
@@ -1332,7 +1549,7 @@ try {
   assert.equal(afterRemoval.body.reports[0].stale, true);
   assert.equal((await a.call(`retrieval-review/sets/${reviewSet.body.id}/evaluate`, {
     method: 'POST', body: JSON.stringify({}) })).status, 400);
-  console.log('E2E passed: sessions, RBAC, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, controlled source discovery, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
@@ -1347,7 +1564,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

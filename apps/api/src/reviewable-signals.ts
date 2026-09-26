@@ -326,14 +326,17 @@ export async function reconcileSignals(db: Db, client: PoolClient, tenantId: str
   const keys: string[] = [];
   let inserted = 0;
   for (const fact of facts) {
+    // A fixture and a real observation must never share an approval or a metric row,
+    // even if an external scheduler saw the source before its sandbox marker arrived.
+    const baseKey = fact.testData ? hash([fact.key, 'sandbox-v1']) : fact.key;
     // An unchanged active fact keeps its approval. A coverage transition or a
     // return after obsolescence creates another row and leaves history intact.
     const history = await db.rows<HistoricalKey>(client,
       `SELECT id,fact_key,state,evidence,updated_at FROM marketrift.reviewable_signals
         WHERE tenant_id=$1 AND (fact_key=$2 OR evidence->>'base_fact_key'=$2)
-        ORDER BY created_at DESC,id DESC`, [tenantId, fact.key]);
-    const factKey = signalKeyForHistory(fact.key, fact.evidence.coverage, history);
-    const evidence = factKey === fact.key ? fact.evidence : { ...fact.evidence, base_fact_key: fact.key };
+        ORDER BY created_at DESC,id DESC`, [tenantId, baseKey]);
+    const factKey = signalKeyForHistory(baseKey, fact.evidence.coverage, history);
+    const evidence = factKey === baseKey ? fact.evidence : { ...fact.evidence, base_fact_key: baseKey };
     keys.push(factKey);
     const rows = await db.rows<{ id: string }>(client, `INSERT INTO marketrift.reviewable_signals
       (tenant_id,fact_key,rule_version,signal_type,source_type,source_id,page_change_id,

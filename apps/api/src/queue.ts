@@ -8,6 +8,7 @@ import { SyncSteamReviewsJobV1 } from './steam-job';
 import { CheckWebPageJobV1 } from './web-page-job';
 import { SyncG2ReviewsJobV1 } from './g2-job';
 import { ReconcileSignalsJobV1 } from './signal-job';
+import { DiscoverSourcesJobV1 } from './source-discovery-job';
 
 export function redisConnection(): { host: string; port: number; username: string;
   password: string | undefined; db: number; tls: object | undefined; maxRetriesPerRequest: number } {
@@ -45,6 +46,14 @@ export class Jobs implements OnModuleDestroy {
     source_id: string; idempotency_key: string }>('evidence-index', { connection: this.connection });
   private readonly signalQueue = new Queue<ReconcileSignalsJobV1>('signal-reconcile',
     { connection: this.connection });
+  private readonly discoveryQueue = new Queue<DiscoverSourcesJobV1>('source-discovery',
+    { connection: this.connection });
+
+  async publishDiscovery(job: DiscoverSourcesJobV1): Promise<void> {
+    await this.discoveryQueue.add('discover-sources.v1', job, { jobId: job.idempotency_key,
+      attempts: 3, backoff: { type: 'exponential', delay: 2000 },
+      removeOnComplete: true, removeOnFail: true });
+  }
 
   async publishSignal(job: ReconcileSignalsJobV1): Promise<void> {
     await this.signalQueue.add('reconcile-signals.v1', job, { jobId: job.idempotency_key,
@@ -119,5 +128,5 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.evidenceQueue.close(), this.signalQueue.close()]); }
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.evidenceQueue.close(), this.signalQueue.close(), this.discoveryQueue.close()]); }
 }

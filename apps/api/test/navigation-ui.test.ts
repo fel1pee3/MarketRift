@@ -41,6 +41,13 @@ test('overview separates source associations, coverage warnings and human decisi
       pages_fetched: 1, pull_requests_skipped: 0, error_code: null, retry_after_at: null,
       started_at: '2026-09-25T11:59:00Z', finished_at: '2026-09-25T12:00:00Z' }],
     pages: { sources: [], runs: [], snapshots: [], changes: [] },
+    discovery: { profiles: [], runs: [], search_provider: 'not_configured', candidates: [{
+      id: 'candidate-a', product_id: 'product-a', canonical_url: 'https://example.com/pricing',
+      category: 'product', suggested_type: 'pricing_page', discovered_from_url: 'https://example.com/',
+      discovery_method: 'homepage', association_evidence: 'Pricing', confidence: 'official_host',
+      status: 'pending', linked_source_id: null, identity_version: 1,
+      first_seen_at: '2026-09-25T12:00:00Z', last_examined_at: '2026-09-25T12:00:00Z',
+    }] },
     signals: { signals: [{ id: 'signal-a', state: 'candidate', summary: '3 Issues públicas',
       source_type: 'github_issues', test_data: false, read_at: null }], alerts: [],
       reconciliation: { last_at: '2026-09-25T12:00:00Z', pending: 0, failed: 0, reasons: [] } },
@@ -48,6 +55,7 @@ test('overview separates source associations, coverage warnings and human decisi
   const html = renderToStaticMarkup(createElement(Overview, props));
   assert.match(html, /Empresa A/);
   assert.match(html, /2<\/strong><span>Fontes associadas/);
+  assert.match(html, /1 URL\(s\) candidata\(s\)/);
   assert.match(html, /Associações não são documentos distintos/);
   assert.match(html, /coleta parcial por cursor/);
   assert.match(html, /envio à IA não autorizado ou expirado/);
@@ -56,6 +64,7 @@ test('overview separates source associations, coverage warnings and human decisi
 
   const otherTenant = renderToStaticMarkup(createElement(Overview, {
     ...props, tenantName: 'Empresa B', products: [], sources: [], sourceRuns: [],
+    discovery: { profiles: [], runs: [], candidates: [], search_provider: 'not_configured' },
     signals: { signals: [], alerts: [], reconciliation: { last_at: null, pending: 0, failed: 0, reasons: [] } },
   }));
   assert.doesNotMatch(otherTenant, /Empresa A|Produto A|3 Issues públicas/);

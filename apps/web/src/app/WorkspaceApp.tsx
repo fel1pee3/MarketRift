@@ -33,6 +33,20 @@ type PageSnapshot = { id: string; source_id: string; version_no: number; final_u
 type PageDetail = { kind: string; name?: string; previous?: string | PagePlan | PageEntry | null; current?: string | PagePlan | PageEntry | null; percent_change?: string | null };
 type PageChange = { id: string; source_id: string; previous_snapshot_id: string; current_snapshot_id: string; change_details: PageDetail[]; detected_at: string };
 type PageData = { sources: PageSource[]; runs: PageRun[]; snapshots: PageSnapshot[]; changes: PageChange[] };
+type DiscoveryProfile = { product_id: string; product_name: string; official_domain: string; aliases: string[];
+  country_code: string | null; languages: string[]; official_urls: string[]; identity_version: number;
+  discovery_paused: boolean };
+type DiscoveryRun = { id: string; product_id: string; identity_version: number; status: string;
+  error_code: string | null; pages_examined: number; candidates_seen: number; candidates_new: number;
+  created_at: string; finished_at: string | null; retry_after_at: string | null; partial: boolean;
+  resource_failures: { resource: string | null; url?: string | null; code: string; limit_kind: string }[] };
+type DiscoveryCandidate = { id: string; product_id: string; canonical_url: string;
+  category: 'official_site' | 'product' | 'reviews' | 'community' | 'apps' | 'social' | 'news';
+  suggested_type: string; discovered_from_url: string; discovery_method: string; association_evidence: string;
+  confidence: string; status: string; linked_source_id: string | null; identity_version: number;
+  first_seen_at: string; last_examined_at: string };
+type DiscoveryData = { profiles: DiscoveryProfile[]; runs: DiscoveryRun[];
+  candidates: DiscoveryCandidate[]; search_provider: 'not_configured' };
 type View = 'overview' | 'sources' | 'evidence' | 'questions' | 'signals' | 'retrieval-review' | 'account';
 type SignalSummary = { id: string; state: string; summary: string; source_type: string; test_data: boolean; read_at: string | null };
 type SignalResult = { signals: SignalSummary[]; alerts: SignalSummary[];
@@ -53,6 +67,7 @@ export function WorkspaceNavigation({ view }: { view: View }) {
   </nav>;
 }
 const emptyPageData: PageData = { sources: [], runs: [], snapshots: [], changes: [] };
+const emptyDiscoveryData: DiscoveryData = { profiles: [], runs: [], candidates: [], search_provider: 'not_configured' };
 function pageEvidence(value: PageDetail['previous']): string {
   if (!value) return 'ausente nesta versão';
   if (typeof value === 'string') return value;
@@ -108,7 +123,9 @@ async function api<T>(path: string, session: Session | null, init: RequestInit =
   const body = response.status === 204 ? null : await response.json();
   if (!response.ok) {
     const message = Array.isArray(body?.message) ? body.message.join(', ') : body?.message ?? 'Falha na API';
-    const friendly = response.status === 409 && path.startsWith('page-sources/') ?
+    const friendly = response.status === 409 && path.startsWith('source-discovery/') ?
+      `${message}${body?.retry_after_at ? ` Tente novamente após ${new Date(body.retry_after_at).toLocaleString('pt-BR')}.` : ''}` :
+      response.status === 409 && path.startsWith('page-sources/') ?
       message.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g,
         (value: string) => new Date(value).toLocaleString('pt-BR')) : message;
     throw new ApiError(friendly, response.status);
@@ -136,23 +153,25 @@ export default function WorkspaceApp({ view }: { view: View }) {
   const [imports, setImports] = useState<Import[]>([]);
   const [documents, setDocuments] = useState<Document[]>([]);
   const [pageData, setPageData] = useState<PageData>(emptyPageData);
+  const [discoveryData, setDiscoveryData] = useState<DiscoveryData>(emptyDiscoveryData);
   const [members, setMembers] = useState<Member[]>([]);
   const [signalResult, setSignalResult] = useState<SignalResult | null>(null);
   const [dataLoaded, setDataLoaded] = useState(false);
 
   const refresh = useCallback(async (current: Session) => {
-    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages, nextSignals] = await Promise.all([
+    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages, nextSignals, nextDiscovery] = await Promise.all([
       api<Product[]>('products', current), api<Source[]>('sources', current),
       api<SourceRun[]>('source-runs', current),
       api<Import[]>('imports', current), api<Document[]>('documents', current),
       api<Member[]>('members', current),
       api<PageData>('page-sources', current),
       view === 'overview' ? api<SignalResult>('reviewable-signals', current) : Promise.resolve(null),
+      view === 'overview' || view === 'sources' ? api<DiscoveryData>('source-discovery', current) : Promise.resolve(emptyDiscoveryData),
     ]);
     if (sessionKey.current !== sessionIdentity(current)) return;
     setProducts(nextProducts); setSources(nextSources); setSourceRuns(nextRuns); setImports(nextImports);
     setDocuments(nextDocuments); setMembers(nextMembers); setPageData(nextPages);
-    setSignalResult(nextSignals); setDataLoaded(true);
+    setSignalResult(nextSignals); setDiscoveryData(nextDiscovery); setDataLoaded(true);
   }, [view]);
 
   useEffect(() => {
@@ -192,7 +211,8 @@ export default function WorkspaceApp({ view }: { view: View }) {
   }
   function clearTenantData(): void {
     setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setDocuments([]); setMembers([]);
-    setPageData(emptyPageData); setSignalResult(null); setDataLoaded(false); setIssuedInvite('');
+    setPageData(emptyPageData); setSignalResult(null); setDiscoveryData(emptyDiscoveryData);
+    setDataLoaded(false); setIssuedInvite('');
   }
   async function switchTo(current: Session, tenantId: string): Promise<void> {
     const next = await api<Session>('auth/switch-tenant', current, {
@@ -254,7 +274,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
           {error && <button className="small" onClick={() => void run(() => refresh(session))}>Tentar novamente</button>}</div>}
         {view === 'overview' && dataLoaded && <Overview tenantName={activeTenant?.name ?? 'Empresa ativa'}
           role={session.role} products={products} sources={sources} sourceRuns={sourceRuns}
-          pages={pageData} signals={signalResult} />}
+          pages={pageData} signals={signalResult} discovery={discoveryData} />}
         {view === 'evidence' && <section className="card wide source-jump" aria-label="Ir para evidências">
           <h2>Encontre uma evidência</h2><div className="jump-links"><a href="#explorar">Busca e indicadores</a>
             <a href="#discussions-coletadas">Discussions públicas</a><a href="#documentos">Documentos e análises</a></div>
@@ -267,7 +287,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
           csrfToken={session.csrf_token} role={session.role} />}
         {view === 'sources' && <><section className="card wide source-jump" aria-label="Ir para uma fonte">
           <h2>Encontre uma fonte</h2><div className="jump-links">
-            <a href="#produtos">Produtos</a><a href="#csv-legado">CSV legado</a><a href="#b2b">Reviews B2B</a>
+            <a href="#produtos">Produtos</a><a href="#descoberta">Descoberta</a><a href="#csv-legado">CSV legado</a><a href="#b2b">Reviews B2B</a>
             <a href="#g2">G2</a><a href="#github-issues">GitHub Issues</a><a href="#github-discussions">GitHub Discussions</a>
             <a href="#steam">Steam</a><a href="#paginas">Preços e changelogs</a><a href="#importacoes">Importações</a>
           </div></section>
@@ -284,6 +304,9 @@ export default function WorkspaceApp({ view }: { view: View }) {
             <button disabled={busy || !canManage}>Adicionar produto</button></form>
           <ul>{products.map(product => <li key={product.id}><strong>{product.name}</strong> <small>{product.kind === 'own' ? 'Próprio' : 'Concorrente'}</small></li>)}</ul>
         </section>
+        <DiscoveryPanel data={discoveryData} products={products} role={session.role} busy={busy}
+          act={action => run(action)} request={(path, init) => api(path, session, init)}
+          refresh={() => refresh(session)} />
         <section id="csv-legado" className="card"><h2>Fontes</h2>
           <p>A importação manual exige URL por avaliação. Confirme que você pode usar os dados enviados.</p>
           <p>Para testar, use <code>https://example.invalid/reviews</code>. Esse endereço fictício não abre uma página.</p>
@@ -697,9 +720,114 @@ const sourceLabels: Record<string, { title: string; href: string }> = {
 };
 function displayDate(value: string | null): string { return value ? new Date(value).toLocaleString('pt-BR') : 'ainda não registrada'; }
 
-export function Overview({ tenantName, role, products, sources, sourceRuns, pages, signals }: {
+const discoveryCategories: { id: DiscoveryCandidate['category']; label: string }[] = [
+  { id: 'official_site', label: 'Site oficial' }, { id: 'product', label: 'Produto, preços e releases' },
+  { id: 'reviews', label: 'Avaliações' }, { id: 'community', label: 'Comunidades' },
+  { id: 'apps', label: 'Aplicativos' }, { id: 'social', label: 'Redes sociais' },
+  { id: 'news', label: 'Notícias e blog' },
+];
+const discoveryErrors: Record<string, string> = {
+  robots_disallowed: 'A origem não permite essa URL em robots.txt.',
+  robots_unavailable: 'Não foi possível conferir robots.txt.',
+  robots_crawl_delay: 'O intervalo exigido pela origem excede o limite desta verificação.',
+  rate_limited: 'A origem limitou as requisições.', access_denied: 'A origem recusou o acesso.',
+  unsafe_destination: 'Destino ou redirecionamento bloqueado por segurança.',
+  dns_failure: 'Não foi possível confirmar um endereço público para o domínio.',
+  network_failure: 'Falha de rede.', identity_changed: 'O domínio mudou durante a execução.',
+  discovery_paused: 'Descoberta pausada.', worker_timeout: 'O worker não concluiu a execução.',
+  invalid_test_host: 'Worker de teste não pode acessar um domínio real.',
+  response_too_large: 'A resposta excedeu o limite de leitura.',
+  robots_too_large: 'robots.txt excedeu o limite; a coleta parou para respeitar as regras da origem.',
+  resource_timeout: 'O recurso excedeu o tempo máximo de leitura.',
+  response_truncated: 'A resposta foi interrompida antes do fim; o conteúdo parcial foi descartado.',
+  unsupported_content_type: 'O formato do recurso não pôde ser analisado.',
+  unsupported_encoding: 'A codificação da resposta não é suportada.',
+  invalid_xml: 'O XML do recurso não pôde ser interpretado.',
+  unsafe_xml: 'O XML contém declarações não aceitas por segurança.',
+  not_found: 'Recurso não encontrado.', http_failure: 'A origem retornou uma falha HTTP.',
+};
+const discoveryResourceNames: Record<string, string> = {
+  'robots.txt': 'robots.txt', homepage: 'Página inicial', sitemap: 'Sitemap', feed: 'Feed',
+  related_page: 'Página relacionada',
+};
+function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
+  data: DiscoveryData; products: Product[]; role: Role; busy: boolean;
+  act: (action: () => Promise<void>) => Promise<void>;
+  request: (path: string, init: RequestInit) => Promise<unknown>; refresh: () => Promise<void>;
+}) {
+  const [runErrors, setRunErrors] = useState<Record<string, string>>({});
+  const competitors = products.filter(product => product.kind === 'competitor');
+  const canManage = role === 'owner' || role === 'admin';
+  return <section id="descoberta" className="card wide"><h2>Descoberta de fontes por concorrente</h2>
+    <p>O MarketRift examina apenas recursos públicos do domínio informado. Links encontrados são candidatos; uma pessoa confirma a associação. Isso não concede direitos para coletar reviews ou enviar textos à IA.</p>
+    <p>Busca externa: <strong>{data.search_provider === 'not_configured' ? 'não configurada' : data.search_provider}</strong>. Instagram: conector indisponível; Reclame Aqui: acesso e direitos a verificar; G2: credencial e direitos pendentes.</p>
+    {!competitors.length && <p className="empty">Cadastre primeiro um produto do tipo Concorrente.</p>}
+    {competitors.map(product => {
+      const profile = data.profiles.find(item => item.product_id === product.id);
+      const latest = data.runs.find(item => item.product_id === product.id);
+      const candidates = data.candidates.filter(item => item.product_id === product.id);
+      return <div key={product.id} className="discovery-product"><h3>{product.name}</h3>
+        {canManage && <form key={`${product.id}-${profile?.identity_version ?? 0}`} onSubmit={event => void act(async () => {
+          const form = new FormData(event.currentTarget);
+          await request('source-discovery/profiles', { method: 'POST', body: JSON.stringify({
+            product_id: product.id, official_domain: form.get('official_domain'),
+            aliases: String(form.get('aliases') ?? '').split(',').map(item => item.trim()).filter(Boolean),
+            country_code: String(form.get('country_code') ?? '').trim() || null,
+            languages: String(form.get('languages') ?? '').split(',').map(item => item.trim()).filter(Boolean),
+            official_urls: String(form.get('official_urls') ?? '').split(/\r?\n/).map(item => item.trim()).filter(Boolean),
+          }) }); await refresh();
+        })}>
+          <label>Domínio oficial confirmado<input name="official_domain" placeholder="exemplo.com" defaultValue={profile?.official_domain ?? ''} required /></label>
+          <label>Nomes e aliases (separados por vírgula)<input name="aliases" defaultValue={profile?.aliases.join(', ') ?? ''} /></label>
+          <label>País (ISO, opcional)<input name="country_code" maxLength={2} defaultValue={profile?.country_code ?? ''} /></label>
+          <label>Idiomas (pt, en; separados por vírgula)<input name="languages" defaultValue={profile?.languages.join(', ') ?? ''} /></label>
+          <label>URLs oficiais conhecidas (uma por linha)<textarea name="official_urls" defaultValue={profile?.official_urls.join('\n') ?? ''} /></label>
+          <button disabled={busy}>Salvar identidade</button>
+        </form>}
+        {profile ? <><p>Domínio: <strong>{profile.official_domain}</strong> · versão {profile.identity_version} · {profile.discovery_paused ? 'pausada' : 'disponível para execução manual'}.</p>
+          {latest && <p>Última descoberta: <strong>{latest.status}</strong>{latest.partial && <> · cobertura parcial</>} · {latest.pages_examined} requisição(ões) · {latest.candidates_seen} candidato(s) examinado(s) · {latest.candidates_new} novo(s) · {latest.finished_at ? new Date(latest.finished_at).toLocaleString('pt-BR') : 'em andamento'}.
+            {latest.error_code && <> Motivo: {discoveryErrors[latest.error_code] ?? latest.error_code}.</>}
+            {latest.retry_after_at && <> Aguarde até {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+          {latest?.resource_failures?.length ? <ul aria-label="Recursos não examinados completamente">{latest.resource_failures.map((failure, index) =>
+            <li key={`${failure.resource}-${index}`}>{discoveryResourceNames[failure.resource ?? ''] ?? failure.resource ?? 'Recurso não identificado'}{failure.url ? ` (${failure.url})` : ''}: {discoveryErrors[failure.code] ?? failure.code}{failure.limit_kind === 'content_length' ? ' Limite indicado pelo Content-Length.' : failure.limit_kind === 'actual_bytes' ? ' Limite atingido pelos bytes recebidos.' : ''}</li>)}</ul> :
+            latest?.error_code === 'response_too_large' && <p>O recurso exato não foi registrado nesta execução antiga. Repita após o intervalo mínimo para obter o diagnóstico.</p>}
+          {role !== 'viewer' && <button className="small" disabled={busy || profile.discovery_paused || latest?.status === 'running'} onClick={() => void act(async () => {
+            setRunErrors(previous => ({ ...previous, [product.id]: '' }));
+            try { await request(`source-discovery/profiles/${product.id}/run`, { method: 'POST' }); await refresh(); }
+            catch (error) { setRunErrors(previous => ({ ...previous, [product.id]: error instanceof Error ? error.message : String(error) })); throw error; }
+          })}>Descobrir agora (limite pequeno)</button>}
+          {runErrors[product.id] && <p className="error" role="alert">{runErrors[product.id]}</p>}
+          {canManage && <button className="small ghost" disabled={busy} onClick={() => void act(async () => {
+            await request(`source-discovery/profiles/${product.id}/${profile.discovery_paused ? 'resume' : 'pause'}`, { method: 'POST' }); await refresh();
+          })}>{profile.discovery_paused ? 'Retomar descobertas manuais' : 'Pausar descobertas'}</button>}
+          {candidates.length === 0 && <p className="empty">Nenhuma URL candidata encontrada para este concorrente.</p>}
+          {discoveryCategories.map(category => {
+            const group = candidates.filter(item => item.category === category.id);
+            if (!group.length) return null;
+            return <div key={category.id}><h4>{category.label} ({group.length})</h4><ul>{group.map(item => {
+              const stale = item.identity_version !== profile.identity_version;
+              const supported = !!item.linked_source_id;
+              return <li key={item.id}><a href={item.canonical_url} target="_blank" rel="noreferrer">{item.canonical_url}</a>
+                <p>Tipo sugerido: {item.suggested_type} · estado: <strong>{stale ? 'associação antiga: revisar' : item.status}</strong> · vínculo: {item.confidence === 'official_host' ? 'mesmo domínio oficial' : 'link externo, associação ambígua'}.
+                  {' '}Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a> · examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')}.</p>
+                <p>Evidência da associação: “{item.association_evidence}”. {supported ? 'Fonte cadastrada; coleta só após ação própria.' : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' ? 'Conector indisponível; não monitorada.' : 'Ainda não monitorada.'}</p>
+                {canManage && !stale && item.status === 'pending' && <><button className="small" disabled={busy} onClick={() => void act(async () => {
+                  await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) }); await refresh();
+                })}>Confirmar associação</button><button className="small ghost" disabled={busy} onClick={() => void act(async () => {
+                  await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'rejected' }) }); await refresh();
+                })}>Rejeitar</button></>}
+              </li>;
+            })}</ul></div>;
+          })}
+        </> : <p className="empty">Identidade ainda não cadastrada. Informe o domínio oficial antes de descobrir URLs.</p>}
+      </div>;
+    })}
+  </section>;
+}
+
+export function Overview({ tenantName, role, products, sources, sourceRuns, pages, signals, discovery }: {
   tenantName: string; role: Role; products: Product[]; sources: Source[]; sourceRuns: SourceRun[];
-  pages: PageData; signals: SignalResult | null;
+  pages: PageData; signals: SignalResult | null; discovery: DiscoveryData;
 }) {
   const candidates = signals?.signals.filter(item => item.state === 'candidate') ?? [];
   const alerts = signals?.alerts ?? [];
@@ -725,6 +853,15 @@ export function Overview({ tenantName, role, products, sources, sourceRuns, page
     </section>
     <section className="card wide"><h2>Cobertura e limites das fontes</h2>
       <p>Issues e Discussions são atividade pública; reviews B2B, CSV e Steam são populações separadas. Coleta parcial, direitos pendentes e interpretações não confirmadas continuam visíveis.</p>
+      <p><Link href="/fontes#descoberta">Fontes descobertas</Link>: {discovery.candidates.length} URL(s) candidata(s),
+        {' '}{discovery.candidates.filter(item => item.status === 'pending').length} pendente(s) de revisão;
+        fontes cadastradas: {sources.length + pages.sources.length}; última coleta bem-sucedida:
+        {' '}{[...sourceRuns.filter(run => run.status === 'succeeded'), ...pages.runs.filter(run => run.status === 'succeeded')]
+          .sort((a, b) => Date.parse(b.finished_at ?? '') - Date.parse(a.finished_at ?? ''))[0]?.finished_at
+          ? displayDate([...sourceRuns.filter(run => run.status === 'succeeded'), ...pages.runs.filter(run => run.status === 'succeeded')]
+            .sort((a, b) => Date.parse(b.finished_at ?? '') - Date.parse(a.finished_at ?? ''))[0]!.finished_at) : 'nenhuma'}.
+        {' '}Cobertura parcial por cursor: {sourceRuns.filter(run => run.scan_complete === false).length} execução(ões).
+        Descoberta não equivale a fonte monitorada.</p>
       {sources.length + pages.sources.length === 0 ? <p className="empty">Nenhuma fonte cadastrada. <Link href="/fontes">Cadastrar produto e fonte</Link>.</p> :
         <ul className="coverage-list">{sources.map(source => {
           const latest = sourceRuns.find(run => run.source_id === source.id);

@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://marketrift.local/contracts/discover-sources-job.v1.schema.json",
+  "title": "DiscoverSourcesJobV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version", "tenant_id", "product_id", "run_id", "identity_version", "idempotency_key"],
+  "properties": {
+    "version": { "const": 1 },
+    "tenant_id": { "type": "string", "format": "uuid" },
+    "product_id": { "type": "string", "format": "uuid" },
+    "run_id": { "type": "string", "format": "uuid" },
+    "identity_version": { "type": "integer", "minimum": 1 },
+    "idempotency_key": { "type": "string", "pattern": "^source-discovery-[0-9a-f-]{36}-v1$" }
+  }
+}

@@ -14,6 +14,7 @@ from .github_discussions import sync_github_discussions
 from .github_issues import sync_github_issues
 from .ingest import ingest, mark_failed
 from .steam_reviews import sync_steam_reviews
+from .source_discovery import discover
 from .web_pages import check_web_page, e2e_fetch_public_page
 
 logger = logging.getLogger(__name__)
@@ -82,6 +83,10 @@ async def process_index(job, _token):
     return await index_source(job.data)
 
 
+async def process_discovery(job, _token):
+    return await discover(job.data)
+
+
 async def main() -> None:
     if os.getenv("EMBEDDING_PROVIDER") == "local":
         embed("MarketRift local model warmup")
@@ -100,11 +105,13 @@ async def main() -> None:
     g2_worker = Worker("g2-reviews", process_g2, {"connection": os.environ["REDIS_URL"]})
     web_page_worker = Worker("web-pages", process_web_page, {"connection": os.environ["REDIS_URL"]})
     index_worker = Worker("evidence-index", process_index, {"connection": os.environ["REDIS_URL"]})
+    discovery_worker = Worker("source-discovery", process_discovery, {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
         await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(), discussions_worker.close(),
-                             steam_worker.close(), g2_worker.close(), web_page_worker.close(), index_worker.close())
+                             steam_worker.close(), g2_worker.close(), web_page_worker.close(), index_worker.close(),
+                             discovery_worker.close())
 
 
 if __name__ == "__main__":

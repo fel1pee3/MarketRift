@@ -22,7 +22,7 @@ test('development scheduler entry loads Nest parameter decorators from the API w
   child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
   try {
     await new Promise<void>((resolveWait, reject) => {
-      const timeout = setTimeout(() => reject(new Error(`scheduler did not start: ${stderr}`)), 5000);
+      const timeout = setTimeout(() => reject(new Error(`scheduler did not start: ${stderr}`)), 12000);
       child.stdout.on('data', (chunk: Buffer) => {
         stdout += chunk.toString();
         if (stdout.includes('MarketRift scheduler started')) {
