@@ -41,8 +41,9 @@ def literal_rank(question: str, documents: list[dict]) -> list[tuple[str, float]
     return sorted(scores, key=lambda row: (-row[1], row[0]))
 
 
-def vector_rank(question: str, documents: list[dict], vectors: list[list[float]]) -> list[tuple[str, float]]:
-    query = embed(question)
+def vector_rank(question: str, documents: list[dict], vectors: list[list[float]],
+                provider: str | None = None) -> list[tuple[str, float]]:
+    query = embed(question, provider) if provider else embed(question)
     scores = [(item["id"], sum(a * b for a, b in zip(query, vector, strict=True)))
               for item, vector in zip(documents, vectors, strict=True)]
     return sorted(scores, key=lambda row: (-row[1], row[0]))
@@ -122,6 +123,104 @@ def evaluate(dataset: dict, provider: str, k: int) -> dict:
                                   "ranked_ids": {key: [item for item, _ in value[:k]]
                                                  for key, value in rankings.items()}}
     return result
+
+
+def evaluate_frozen(dataset: dict, providers: tuple[str, ...] = ("local", "controlled")) -> dict:
+    """Blind judgments of a frozen public GitHub corpus. Never treats unjudged as negative."""
+    documents = dataset.get("documents", [])
+    questions = dataset.get("questions", [])
+    ids = [item.get("id") for item in documents]
+    if (dataset.get("origin") not in ("real", "synthetic") or dataset.get("index_version") != INDEX_VERSION or
+            not 1 <= len(documents) <= 30 or not 1 <= len(questions) <= 20 or len(ids) != len(set(ids))):
+        raise ValueError("invalid_frozen_corpus")
+    for item in documents:
+        if (item.get("source_type") not in ("github_issue", "github_discussion") or
+                not isinstance(item.get("text"), str) or not 1 <= len(item["text"]) <= 12000):
+            raise ValueError("invalid_public_item")
+    for question in questions:
+        judged = question.get("judged_ids", [])
+        relevant = question.get("relevant_ids", [])
+        if (not isinstance(question.get("text"), str) or not 3 <= len(question["text"]) <= 500 or
+                question.get("language") not in ("pt", "en") or len(judged) != len(set(judged)) or
+                not set(relevant).issubset(judged) or not set(judged).issubset(ids) or
+                (question.get("no_answer_claim") and relevant) or
+                (set(judged) == set(ids) and not relevant and not question.get("no_answer_claim"))):
+            raise ValueError("invalid_frozen_judgments")
+
+    result = {"dataset_version": dataset["version"],
+              "origin": "public_github_real" if dataset["origin"] == "real" else "synthetic_test",
+              "index_version": INDEX_VERSION, "corpus_hash": dataset["corpus_hash"],
+              "judgment_hash": dataset["judgment_hash"], "corpus_size": len(documents),
+              "question_count": len(questions), "human_judged_questions": sum(bool(q["judged_ids"]) for q in questions),
+              "fully_judged_questions": sum(len(q["judged_ids"]) == len(ids) for q in questions),
+              "judged_pairs": sum(len(q["judged_ids"]) for q in questions),
+              "total_pairs": len(ids) * len(questions),
+              "languages": {language: sum(q["language"] == language for q in questions)
+                            for language in ("pt", "en")},
+              "source_types": {source: sum(d["source_type"] == source for d in documents)
+                               for source in ("github_issue", "github_discussion")},
+              "external_cost_usd": 0, "runs": {}}
+    for provider in providers:
+        started = time.perf_counter()
+        first = embed(documents[0]["text"], provider)
+        cold_ms = round((time.perf_counter() - started) * 1000)
+        started = time.perf_counter()
+        embed(documents[0]["text"], provider)
+        warm_ms = round((time.perf_counter() - started) * 1000)
+        started = time.perf_counter()
+        vectors = [first] + [embed(item["text"], provider) for item in documents[1:]]
+        rankings = {q["id"]: vector_rank(q["text"], documents, vectors, provider) for q in questions}
+        model, version = identity(provider)
+        result["runs"][provider] = {"model": model, "model_version": version,
+                                      "cold_ms": cold_ms, "warm_ms": warm_ms,
+                                      "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                                      "metrics": judged_metrics(questions, rankings, len(ids), 0.15),
+                                      "ranked_ids": {q: [item for item, _ in rows[:5]]
+                                                     for q, rows in rankings.items()}}
+    started = time.perf_counter()
+    rankings = {q["id"]: literal_rank(q["text"], documents) for q in questions}
+    result["runs"]["literal"] = {"model": "literal-token-overlap", "model_version": "1",
+                                   "elapsed_ms": round((time.perf_counter() - started) * 1000),
+                                   "metrics": judged_metrics(questions, rankings, len(ids), 0.000001),
+                                   "ranked_ids": {q: [item for item, _ in rows[:5]]
+                                                  for q, rows in rankings.items()}}
+    return result
+
+
+def judged_metrics(questions: list[dict], rankings: dict[str, list[tuple[str, float]]],
+                   corpus_size: int, minimum_score: float) -> dict:
+    """Complete questions produce main metrics; partial ones only conditional judged-only metrics."""
+    complete = [q for q in questions if len(q["judged_ids"]) == corpus_size]
+    incomplete = [q for q in questions if len(q["judged_ids"]) < corpus_size]
+    output = {}
+    for k in (3, 5):
+        full = metrics(complete, rankings, k, minimum_score) if complete else None
+        partial_recall = partial_reciprocal = 0.0
+        partial_answerable = 0
+        unjudged_top = []
+        judged_irrelevant_top = []
+        for q in incomplete:
+            top = [item for item, score in rankings[q["id"]][:k] if score >= minimum_score]
+            known = set(q["judged_ids"])
+            positives = set(q["relevant_ids"])
+            unjudged_top.extend({"question_id": q["id"], "item_id": item}
+                                for item in top if item not in known)
+            judged_irrelevant_top.extend({"question_id": q["id"], "item_id": item}
+                                        for item in top if item in known - positives)
+            if positives:
+                partial_answerable += 1
+                hits = positives.intersection(top)
+                partial_recall += len(hits) / len(positives)
+                if hits:
+                    partial_reciprocal += 1 / (1 + min(top.index(item) for item in hits))
+        output[f"at_{k}"] = {"complete": full,
+                             "conditional_judged_only": {
+                                 "answerable_questions": partial_answerable,
+                                 "recall": partial_recall / partial_answerable if partial_answerable else None,
+                                 "mrr": partial_reciprocal / partial_answerable if partial_answerable else None,
+                                 "unjudged_in_top": unjudged_top,
+                                 "judged_irrelevant_in_top": judged_irrelevant_top}}
+    return output
 
 
 def main() -> None:

@@ -1,5 +1,6 @@
 from fastapi.testclient import TestClient
 
+from marketrift_intelligence import http
 from marketrift_intelligence.http import app
 
 
@@ -34,3 +35,26 @@ def test_local_status_reports_missing_weights_without_controlled_fallback(monkey
                                    headers={"X-Internal-Token": "test-only-internal-token"})
     assert response.status_code == 503
     assert response.json()["detail"].startswith("local_embedding_model_missing")
+
+
+def test_retrieval_evaluation_is_internal_and_requires_local_model(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "controlled")
+    monkeypatch.setenv("EMBEDDING_INTERNAL_TOKEN", "test-only-internal-token")
+    client = TestClient(app)
+    assert client.post("/internal/retrieval/evaluate", json={}).status_code == 401
+    response = client.post("/internal/retrieval/evaluate", json={},
+                           headers={"X-Internal-Token": "test-only-internal-token"})
+    assert response.status_code == 503
+    assert response.json()["detail"] == "local_model_required"
+
+
+def test_controlled_retrieval_evaluation_is_explicitly_test_only(monkeypatch):
+    monkeypatch.setenv("EMBEDDING_PROVIDER", "controlled")
+    monkeypatch.setenv("EMBEDDING_INTERNAL_TOKEN", "test-only-internal-token")
+    monkeypatch.setenv("MARKETRIFT_TEST_MODE", "1")
+    monkeypatch.setattr(http, "evaluate_frozen", lambda dataset, providers: {
+        "origin": "synthetic_test", "providers": list(providers)})
+    response = TestClient(app).post("/internal/retrieval/evaluate", json={"origin": "synthetic"},
+                                    headers={"X-Internal-Token": "test-only-internal-token"})
+    assert response.status_code == 200
+    assert response.json() == {"origin": "synthetic_test", "providers": ["controlled"]}

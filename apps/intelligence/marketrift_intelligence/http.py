@@ -6,6 +6,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .embeddings import DIMENSIONS, embed, identity, verify_local_model
+from .retrieval_eval import evaluate_frozen
 
 
 @asynccontextmanager
@@ -58,3 +59,19 @@ def embedding(request: EmbeddingRequest, x_internal_token: str = Header(default=
         raise HTTPException(status_code=503, detail=str(error)) from None
     return {"model": model, "version": version, "dimensions": DIMENSIONS, "vector": vector,
             "test_only": model.startswith("controlled-")}
+
+
+@app.post("/internal/retrieval/evaluate")
+def retrieval_evaluation(dataset: dict, x_internal_token: str = Header(default="")) -> dict:
+    authorize(x_internal_token)
+    test_only = (dataset.get("origin") == "synthetic" and os.getenv("MARKETRIFT_TEST_MODE") == "1"
+                 and os.getenv("EMBEDDING_PROVIDER") == "controlled"
+                 and os.getenv("NODE_ENV") != "production")
+    if not test_only and (dataset.get("origin") != "real" or os.getenv("EMBEDDING_PROVIDER") != "local"):
+        raise HTTPException(status_code=503, detail="local_model_required")
+    try:
+        return evaluate_frozen(dataset, providers=("controlled",) if test_only else ("local", "controlled"))
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from None
+    except RuntimeError:
+        raise HTTPException(status_code=503, detail="local_model_unavailable") from None

@@ -35,7 +35,8 @@
     "db:migrate:github-discussions": "node --env-file=.env scripts/migrate-github-discussions.mjs",
     "db:migrate:b2b-reviews": "node --env-file=.env scripts/migrate-b2b-reviews.mjs",
     "db:migrate:b2b-analysis": "node --env-file=.env scripts/migrate-b2b-analysis.mjs",
-    "db:migrate:evidence-chunks": "node --env-file=.env scripts/migrate-evidence-chunks.mjs"
+    "db:migrate:evidence-chunks": "node --env-file=.env scripts/migrate-evidence-chunks.mjs",
+    "db:migrate:retrieval-review": "node --env-file=.env scripts/migrate-retrieval-review.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }

@@ -18,8 +18,8 @@ REQUIRED_FILES = (
 _model_lock = Lock()
 
 
-def identity() -> tuple[str, str]:
-    provider = os.getenv("EMBEDDING_PROVIDER", "controlled")
+def identity(provider: str | None = None) -> tuple[str, str]:
+    provider = provider or os.getenv("EMBEDDING_PROVIDER", "controlled")
     if provider == "controlled":
         return "controlled-hash-TESTE", "1"
     if provider == "local":
@@ -73,16 +73,17 @@ def _local_model():
                                trust_remote_code=False, model_kwargs={"use_safetensors": True})
 
 
-def embed(text: str) -> list[float]:
+def embed(text: str, provider: str | None = None) -> list[float]:
     if not text.strip() or len(text) > 12000:
         raise ValueError("invalid_embedding_input")
-    if os.getenv("EMBEDDING_PROVIDER", "controlled") == "local":
+    selected = provider or os.getenv("EMBEDDING_PROVIDER", "controlled")
+    if selected == "local":
         with _model_lock:
             vector = _local_model().encode(text, normalize_embeddings=True).tolist()
         if len(vector) != DIMENSIONS:
             raise RuntimeError("embedding_dimension_mismatch")
         return [float(value) for value in vector]
-    identity()
+    identity(selected)
     # Deterministic bag of words for TESTE only. It does not establish semantic quality.
     vector = [0.0] * DIMENSIONS
     for token in re.findall(r"\w+", text.casefold(), flags=re.UNICODE):

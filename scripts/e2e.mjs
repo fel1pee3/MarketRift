@@ -123,6 +123,7 @@ await new Promise(resolve => steamMock.listen(0, '127.0.0.1', resolve));
 const steamPort = steamMock.address().port;
 const childEnv = { ...process.env, API_PORT: String(apiPort), WEB_ORIGIN: webOrigin,
   REDIS_URL: e2eRedisUrl.toString(), EMBEDDING_PROVIDER: 'controlled',
+  RETRIEVAL_REVIEW_TEST_MODE: '1', MARKETRIFT_TEST_MODE: '1',
   EMBEDDING_INTERNAL_TOKEN: 'e2e-internal-placeholder',
   EMBEDDING_INTERNAL_URL: `http://127.0.0.1:${embeddingPort}` };
 const apiProcess = spawn(process.execPath, ['apps/api/dist/main.js'], { env: childEnv, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -348,6 +349,71 @@ try {
   assert.equal(partialEvidence.status, 200, JSON.stringify(partialEvidence.body));
   assert.equal(partialEvidence.body.counts[0].count, 1);
   assert(partialEvidence.body.partial_sources.some(item => item.source_id === discussionSource.body.id));
+  assert.equal((await analyst.call('evidence/reindex', { method: 'POST',
+    body: JSON.stringify({ source_id: discussionSource.body.id }) })).status, 201);
+  let discussionIndexed = false;
+  for (let attempt = 0; attempt < 80; attempt++) {
+    const status = await analyst.call(`evidence/index-status?source_id=${discussionSource.body.id}`);
+    if (status.body?.sources?.[0]?.ready_chunks > 0) { discussionIndexed = true; break; }
+    await delay(150);
+  }
+  assert.equal(discussionIndexed, true, 'controlled GitHub fixture must be indexed');
+  const reviewSet = await analyst.call('retrieval-review/sets', { method: 'POST',
+    body: JSON.stringify({ title: 'Synthetic GitHub relevance E2E', product_id: competitor.body.id,
+      limit: 1, test_only: true }) });
+  assert.equal(reviewSet.status, 201, JSON.stringify(reviewSet.body));
+  assert.equal(reviewSet.body.items, 1);
+  assert.equal(reviewSet.body.partial_sources, 1);
+  assert.equal((await viewer.call('retrieval-review/sets', { method: 'POST',
+    body: JSON.stringify({ title: 'Forbidden', test_only: true }) })).status, 403);
+  assert.equal((await b.call(`retrieval-review/sets/${reviewSet.body.id}`)).status, 400);
+  const reviewDetail = await viewer.call(`retrieval-review/sets/${reviewSet.body.id}`);
+  assert.equal(reviewDetail.status, 200);
+  assert.equal(reviewDetail.body.set.origin, 'synthetic_test');
+  assert.equal(reviewDetail.body.items.length, 1);
+  assert.equal(reviewDetail.body.items[0].stale, false);
+  const reviewQuestion = await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/questions`, {
+    method: 'POST', body: JSON.stringify({ text: 'What integration failed?', language: 'en' }) });
+  assert.equal(reviewQuestion.status, 201);
+  const questionPath = `retrieval-review/sets/${reviewSet.body.id}/questions/${reviewQuestion.body.id}`;
+  assert.equal((await viewer.call(`${questionPath}/judgments`, { method: 'POST',
+    body: JSON.stringify({ item_id: reviewDetail.body.items[0].id, verdict: 'relevant' }) })).status, 403);
+  assert.equal((await b.call(`${questionPath}/judgments`, { method: 'POST',
+    body: JSON.stringify({ item_id: reviewDetail.body.items[0].id, verdict: 'relevant' }) })).status, 400);
+  assert.equal((await analyst.call(`${questionPath}/judgments`, { method: 'POST',
+    body: JSON.stringify({ item_id: reviewDetail.body.items[0].id, verdict: 'relevant' }) })).status, 201);
+  const noAnswerQuestion = await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/questions`, {
+    method: 'POST', body: JSON.stringify({ text: 'Does this discuss a price increase?', language: 'en' }) });
+  assert.equal(noAnswerQuestion.status, 201);
+  const noAnswerPath = `retrieval-review/sets/${reviewSet.body.id}/questions/${noAnswerQuestion.body.id}`;
+  assert.equal((await analyst.call(`${noAnswerPath}/judgments`, { method: 'POST',
+    body: JSON.stringify({ item_id: reviewDetail.body.items[0].id, verdict: 'irrelevant' }) })).status, 201);
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/freeze`, {
+    method: 'POST', body: JSON.stringify({}) })).status, 400); // explicit abstention is required
+  assert.equal((await analyst.call(`${noAnswerPath}/no-answer`, { method: 'POST',
+    body: JSON.stringify({ no_answer: true }) })).status, 201);
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/questions`, {
+    method: 'POST', body: JSON.stringify({ text: 'Is there a separate export issue?', language: 'en' }) })).status, 201);
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/freeze`, {
+    method: 'POST', body: JSON.stringify({}) })).status, 400); // unjudged pair requires acknowledgment
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/freeze`, {
+    method: 'POST', body: JSON.stringify({ acknowledge_unjudged: true }) })).status, 201);
+  const reviewReport = await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/evaluate`, { method: 'POST',
+    body: JSON.stringify({}) });
+  assert.equal(reviewReport.status, 201, JSON.stringify(reviewReport.body));
+  assert.equal(reviewReport.body.result.origin, 'synthetic_test');
+  assert.equal(reviewReport.body.result.external_cost_usd, 0);
+  assert.equal(reviewReport.body.result.fully_judged_questions, 2);
+  assert.equal(reviewReport.body.result.judged_pairs, 2);
+  assert.equal(reviewReport.body.result.total_pairs, 3);
+  assert.deepEqual(Object.keys(reviewReport.body.result.runs).sort(), ['controlled', 'literal']);
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/questions`, {
+    method: 'POST', body: JSON.stringify({ text: 'Too late', language: 'en' }) })).status, 400);
+  const reviewFork = await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/fork`, { method: 'POST',
+    body: JSON.stringify({}) });
+  assert.equal(reviewFork.status, 201);
+  assert.equal(reviewFork.body.version, 2);
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewFork.body.id}`)).body.coverage.unjudged, 1);
   const discussionSecond = await syncDiscussions();
   assert.equal(discussionSecond.documents_new, 1);
   assert.equal(discussionSecond.scan_complete, true);
@@ -364,10 +430,35 @@ try {
   assert.equal(discussionThird.documents_new, 0);
   assert.equal(discussionThird.documents_updated, 1);
   assert.equal((await a.call('documents')).body.find(item => item.external_key === 'D_1').source_body, discussionBody);
+  const historicalReview = await viewer.call(`retrieval-review/sets/${reviewSet.body.id}`);
+  assert.equal(historicalReview.body.stale_items, 1);
+  assert.equal(historicalReview.body.reports[0].stale, true);
   assert.equal((await a.call('documents')).body.filter(item => item.document_type === 'github_discussion').length, 2);
   assert.equal(discussionRequests.length, 4);
   assert.equal(discussionRequests.every(item => item.authorized), true);
   assert.deepEqual(discussionRequests.map(item => item.variables.after), [null, 'cursor-one', null, 'cursor-one']);
+  const duplicateDiscussionSource = await a.call('sources/github-discussions', { method: 'POST',
+    body: JSON.stringify({ product_id: product.body.id, repository: 'Example/Repo' }) });
+  assert.equal(duplicateDiscussionSource.status, 201);
+  const duplicateSync = await analyst.call(`sources/${duplicateDiscussionSource.body.id}/sync`, {
+    method: 'POST', body: JSON.stringify({ max_pages: 2, max_items: 2 }) });
+  assert.equal(duplicateSync.status, 200);
+  await waitForSourceRun(a, duplicateSync.body.id);
+  for (const sourceId of [discussionSource.body.id, duplicateDiscussionSource.body.id]) {
+    assert.equal((await analyst.call('evidence/reindex', { method: 'POST',
+      body: JSON.stringify({ source_id: sourceId }) })).status, 201);
+    let ready = false;
+    for (let attempt = 0; attempt < 80; attempt++) {
+      const response = await analyst.call(`evidence/index-status?source_id=${sourceId}`);
+      if (response.body?.sources?.[0]?.ready_chunks >= 2) { ready = true; break; }
+      await delay(150);
+    }
+    assert.equal(ready, true, 'both associated sources must be indexed');
+  }
+  const deduplicatedSet = await analyst.call('retrieval-review/sets', { method: 'POST',
+    body: JSON.stringify({ title: 'Synthetic duplicate-origin E2E', limit: 30, test_only: true }) });
+  assert.equal(deduplicatedSet.status, 201, JSON.stringify(deduplicatedSet.body));
+  assert.equal(deduplicatedSet.body.items, 2, 'same Discussion in two products counts once');
 
   const g2Registration = { product_id: competitor.body.id, g2_product_id: 'product-test-1',
     product_url: 'https://www.g2.com/products/example', environment: 'sandbox' };
@@ -933,7 +1024,9 @@ try {
   assert.equal(allEvidence.body.counts.find(item => item.source_type === 'csv_review').count, 2);
   assert.equal(allEvidence.body.counts.find(item => item.source_type === 'steam_review').count, 1);
   assert.equal(allEvidence.body.counts.find(item => item.source_type === 'github_discussion').count, 2);
-  assert.equal(allEvidence.body.ambiguous_total, 1);
+  assert.equal(allEvidence.body.ambiguous_total, 3); // shared Steam review and two shared Discussions
+  assert.equal(allEvidence.body.items.filter(item => item.source_type === 'github_discussion'
+    && item.association_count === 2).length, 2);
   const sharedReview = allEvidence.body.items.find(item => item.source_type === 'steam_review');
   assert.equal(sharedReview.association_count, 2);
   assert.equal(sharedReview.duplicate_rows, 2);
@@ -1020,6 +1113,8 @@ try {
   const oldSession = new Browser(); oldSession.cookie = oldCookie;
   assert.equal((await oldSession.call('auth/session')).status, 401);
   assert.equal((await analyst.call(`imports/${first.body.id}`)).status, 404);
+  assert.equal((await analyst.call('retrieval-review/sets')).body.length, 0);
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}`)).status, 400);
   assert.equal((await upload(analyst, source.body.id)).status, 403);
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).body.citations.length, 1);
@@ -1027,6 +1122,7 @@ try {
   const switched = await analyst.call('auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: registeredA.body.tenant_id }) });
   assert.equal(switched.status, 200, JSON.stringify(switched.body));
   assert.equal(switched.body.role, 'analyst');
+  assert.ok((await analyst.call('retrieval-review/sets')).body.some(item => item.id === reviewSet.body.id));
   assert.equal((await analyst.call('documents')).body.filter(document => document.external_key === externalKey).length, 1);
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).body.citations.length, 0);
@@ -1042,7 +1138,17 @@ try {
   assert.equal((await admin.call('auth/session')).status, 401);
   assert.equal((await admin.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).status, 401);
-  console.log('E2E passed: sessions, RBAC, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, signals, schedulers, retries and tenant isolation');
+  const removedDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await removedDb.connect();
+    await removedDb.query('DELETE FROM marketrift.documents WHERE id = $1', [originalDiscussion.id]);
+  } finally { await removedDb.end(); }
+  const afterRemoval = await a.call(`retrieval-review/sets/${reviewSet.body.id}`);
+  assert.equal(afterRemoval.body.stale_items, 1);
+  assert.equal(afterRemoval.body.reports[0].stale, true);
+  assert.equal((await a.call(`retrieval-review/sets/${reviewSet.body.id}/evaluate`, {
+    method: 'POST', body: JSON.stringify({}) })).status, 400);
+  console.log('E2E passed: sessions, RBAC, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
@@ -1057,7 +1163,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

@@ -3,6 +3,7 @@
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import EvidencePanel from './EvidencePanel';
 import QuestionsPanel from './QuestionsPanel';
+import RetrievalReviewPanel from './RetrievalReviewPanel';
 
 type Role = 'owner' | 'admin' | 'analyst' | 'viewer';
 type Tenant = { tenant_id: string; name: string; role: Role };
@@ -213,6 +214,8 @@ export default function Home() {
         </section>
         <EvidencePanel key={session.tenant_id} products={products} />
         <QuestionsPanel key={`questions-${session.tenant_id}`} products={products} sources={sources}
+          csrfToken={session.csrf_token} role={session.role} />
+        <RetrievalReviewPanel key={`retrieval-review-${session.tenant_id}`} products={products}
           csrfToken={session.csrf_token} role={session.role} />
         <section className="card"><h2>Produtos</h2><p>Cadastre o produto próprio e concorrentes.</p>
           <form onSubmit={event => void run(async () => {
