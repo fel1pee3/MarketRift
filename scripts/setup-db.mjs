@@ -7,7 +7,7 @@ for (const name of required) if (!process.env[name]) throw new Error(`Missing ${
 const client = new Client({ connectionString: process.env.DATABASE_ADMIN_URL });
 await client.connect();
 try {
-  for (const name of ['001_initial.sql', '002_full_product.sql', '003_first_slice.sql', '004_account_security.sql', '005_review_analysis.sql', '006_github_issues.sql', '007_steam_reviews.sql', '008_web_pages.sql', '009_page_monitoring.sql', '010_github_discussions.sql', '011_b2b_review_rights.sql', '012_b2b_analysis_rights.sql', '013_evidence_chunks.sql', '014_retrieval_review.sql', '015_retrieval_origin.sql']) {
+  for (const name of ['001_initial.sql', '002_full_product.sql', '003_first_slice.sql', '004_account_security.sql', '005_review_analysis.sql', '006_github_issues.sql', '007_steam_reviews.sql', '008_web_pages.sql', '009_page_monitoring.sql', '010_github_discussions.sql', '011_b2b_review_rights.sql', '012_b2b_analysis_rights.sql', '013_evidence_chunks.sql', '014_retrieval_review.sql', '015_retrieval_origin.sql', '016_reviewable_signals.sql']) {
     const sql = readFileSync(new URL(`../db/migrations/${name}`, import.meta.url), 'utf8');
     await client.query(sql);
     console.log(`Applied ${name}`);

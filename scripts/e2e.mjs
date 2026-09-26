@@ -349,6 +349,9 @@ try {
   assert.equal(partialEvidence.status, 200, JSON.stringify(partialEvidence.body));
   assert.equal(partialEvidence.body.counts[0].count, 1);
   assert(partialEvidence.body.partial_sources.some(item => item.source_id === discussionSource.body.id));
+  assert.equal((await a.call('reviewable-signals/refresh', { method: 'POST' })).status, 201);
+  assert((await analyst.call('reviewable-signals')).body.signals.some(item =>
+    item.signal_type === 'github_discussion_activity' && item.evidence.coverage === 'partial_cursor'));
   assert.equal((await analyst.call('evidence/reindex', { method: 'POST',
     body: JSON.stringify({ source_id: discussionSource.body.id }) })).status, 201);
   let discussionIndexed = false;
@@ -863,6 +866,37 @@ try {
   assert.equal(priceChange.change_details[0].percent_change, '20.00');
   assert.equal(pageRequests.filter(path => path === '/web-page/pricing').length, 3);
   assert.equal((await b.call('page-sources')).body.changes.length, 0);
+  assert.equal((await viewer.call('reviewable-signals/refresh', { method: 'POST' })).status, 403);
+  assert.equal((await analyst.call('reviewable-signals/refresh', { method: 'POST' })).status, 403);
+  assert.equal((await a.call('reviewable-signals/refresh', { method: 'POST', withoutCsrf: true })).status, 403);
+  const firstSignalsRefresh = await a.call('reviewable-signals/refresh', { method: 'POST' });
+  assert.equal(firstSignalsRefresh.status, 201, JSON.stringify(firstSignalsRefresh.body));
+  const firstSignals = await analyst.call('reviewable-signals');
+  assert.equal(firstSignals.status, 200);
+  const priceSignal = firstSignals.body.signals.find(item => item.signal_type === 'price_change');
+  assert(priceSignal, 'confirmed comparable price must create a candidate');
+  assert.equal(priceSignal.state, 'candidate');
+  assert.equal(priceSignal.test_data, true, 'simulated page must be TESTE');
+  assert.equal(firstSignals.body.real_count, 0);
+  assert.equal((await viewer.call('reviewable-signals')).body.signals.length, 0);
+  assert.equal((await b.call('reviewable-signals')).body.signals.length, 0);
+  const repeatedSignals = await a.call('reviewable-signals/refresh', { method: 'POST' });
+  assert.equal(repeatedSignals.body.new_candidates, 0, 'same captures must not duplicate candidate');
+  assert.equal((await b.call(`reviewable-signals/${priceSignal.id}/review`, { method: 'POST',
+    body: JSON.stringify({ state: 'approved', reason: 'wrong tenant' }) })).status, 404);
+  assert.equal((await analyst.call(`reviewable-signals/${priceSignal.id}/review`, { method: 'POST',
+    body: JSON.stringify({ state: 'approved', reason: 'not allowed' }) })).status, 403);
+  assert.equal((await a.call(`reviewable-signals/${priceSignal.id}/review`, { method: 'POST',
+    body: JSON.stringify({ state: 'approved', reason: 'Capturas simuladas conferidas para E2E' }) })).status, 201);
+  const approvedSignals = await viewer.call('reviewable-signals');
+  assert(approvedSignals.body.signals.some(item => item.id === priceSignal.id));
+  assert(approvedSignals.body.alerts.some(item => item.id === priceSignal.id && item.read_at === null));
+  assert.equal((await viewer.call(`reviewable-signals/${priceSignal.id}/read`, { method: 'POST',
+    body: JSON.stringify({ read: true }) })).status, 201);
+  assert((await viewer.call('reviewable-signals')).body.alerts.find(item => item.id === priceSignal.id).read_at);
+  assert.equal((await analyst.call('reviewable-signals')).body.alerts.find(item => item.id === priceSignal.id).read_at, null);
+  assert.equal((await viewer.call(`reviewable-signals/${priceSignal.id}/read`, { method: 'POST',
+    body: JSON.stringify({ read: false }) })).status, 201);
 
   const legacySource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
     product_id: competitor.body.id, source_type: 'release_notes',
@@ -1097,6 +1131,29 @@ try {
   assert.equal(signalResponse.body.page_events.some(item => item.source_type === 'release_notes'
     && item.source_url === editorialSource.body.url), false);
   assert.equal((await analyst.call('evidence/signals?source_type=pricing_page')).body.page_events.length, 1);
+  const laterRefresh = await a.call('reviewable-signals/refresh', { method: 'POST' });
+  assert.equal(laterRefresh.status, 201, JSON.stringify(laterRefresh.body));
+  const laterSignals = (await analyst.call('reviewable-signals')).body.signals;
+  assert(laterSignals.some(item => item.signal_type === 'release_entry' && item.test_data));
+  const discussionSignal = laterSignals.find(item => item.signal_type === 'github_discussion_activity'
+    && item.evidence.coverage === 'complete_for_latest_scan');
+  assert(discussionSignal);
+  assert.equal(discussionSignal.evidence.count, 2, 'same public Discussion in two products counts once');
+  assert.equal(discussionSignal.evidence.product_ids.length, 2);
+  assert.equal(laterSignals.some(item => item.evidence.previous?.url === editorialSource.body.url), false);
+  assert.equal(laterSignals.some(item => item.evidence.previous?.url === legacySource.body.url), false);
+  assert.equal(laterSignals.filter(item => item.id === priceSignal.id).length, 1);
+  const revokeDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try { await revokeDb.connect();
+    await revokeDb.query('UPDATE marketrift.sources SET enabled=false WHERE tenant_id=$1 AND id=$2',
+      [registeredA.body.tenant_id, pageSource.body.id]);
+  } finally { await revokeDb.end(); }
+  const revokedRefresh = await a.call('reviewable-signals/refresh', { method: 'POST' });
+  assert.equal(revokedRefresh.status, 201, JSON.stringify(revokedRefresh.body));
+  const revokedSignal = (await analyst.call('reviewable-signals')).body.signals.find(item => item.id === priceSignal.id);
+  assert.equal(revokedSignal.state, 'obsolete');
+  assert.equal(revokedSignal.evidence.withdrawn, true);
+  assert.equal((await viewer.call('reviewable-signals')).body.alerts.some(item => item.id === priceSignal.id), false);
 
   const foreignProduct = await b.call('products', { method: 'POST',
     body: JSON.stringify({ name: 'Foreign Test Product', kind: 'competitor' }) });
@@ -1159,6 +1216,7 @@ try {
   assert.equal((await analyst.call(`imports/${first.body.id}`)).status, 404);
   assert.equal((await analyst.call('retrieval-review/sets')).body.length, 0);
   assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}`)).status, 400);
+  assert.equal((await analyst.call('reviewable-signals')).body.signals.length, 0);
   assert.equal((await upload(analyst, source.body.id)).status, 403);
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).body.citations.length, 1);
@@ -1166,6 +1224,7 @@ try {
   const switched = await analyst.call('auth/switch-tenant', { method: 'POST', body: JSON.stringify({ tenant_id: registeredA.body.tenant_id }) });
   assert.equal(switched.status, 200, JSON.stringify(switched.body));
   assert.equal(switched.body.role, 'analyst');
+  assert((await analyst.call('reviewable-signals')).body.signals.some(item => item.signal_type === 'release_entry'));
   assert.ok((await analyst.call('retrieval-review/sets')).body.some(item => item.id === reviewSet.body.id));
   assert.equal((await analyst.call('documents')).body.filter(document => document.external_key === externalKey).length, 1);
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
@@ -1207,7 +1266,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

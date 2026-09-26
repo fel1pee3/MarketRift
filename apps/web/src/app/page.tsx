@@ -2,6 +2,7 @@
 
 import { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import EvidencePanel from './EvidencePanel';
+import SignalsPanel from './SignalsPanel';
 import QuestionsPanel from './QuestionsPanel';
 import RetrievalReviewPanel from './RetrievalReviewPanel';
 
@@ -213,6 +214,7 @@ export default function Home() {
           </select></label><button disabled={busy}>Trocar empresa</button></form>}
         </section>
         <EvidencePanel key={session.tenant_id} products={products} />
+        <SignalsPanel key={`signals-${session.tenant_id}`} tenantId={session.tenant_id} csrfToken={session.csrf_token} role={session.role} />
         <QuestionsPanel key={`questions-${session.tenant_id}`} products={products} sources={sources}
           csrfToken={session.csrf_token} role={session.role} />
         <RetrievalReviewPanel key={`retrieval-review-${session.tenant_id}`} products={products}

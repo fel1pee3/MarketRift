@@ -7,7 +7,8 @@ import { WebPagesController } from './web-pages';
 import { EvidenceController } from './evidence';
 import { SemanticController } from './semantic';
 import { RetrievalReviewController } from './retrieval-review';
+import { ReviewableSignalsController } from './reviewable-signals';
 
 @Module({ controllers: [ApiController, AccountsController, WebPagesController, EvidenceController, SemanticController,
-  RetrievalReviewController], providers: [Db, Jobs, Accounts] })
+  RetrievalReviewController, ReviewableSignalsController], providers: [Db, Jobs, Accounts] })
 export class AppModule {}
