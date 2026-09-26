@@ -2,6 +2,7 @@ from fastapi.testclient import TestClient
 
 from marketrift_intelligence import http
 from marketrift_intelligence.http import app
+from marketrift_intelligence.retrieval_eval import FROZEN_CONTRACT_VERSION, FROZEN_EVALUATOR_VERSION
 
 
 def test_health():
@@ -24,6 +25,8 @@ def test_internal_embedding_requires_private_token(monkeypatch):
                         headers={"X-Internal-Token": "test-only-internal-token"})
     assert status.status_code == 200
     assert status.json()["model"] == "controlled-hash-TESTE"
+    assert status.json()["retrieval_evaluator_version"] == FROZEN_EVALUATOR_VERSION
+    assert status.json()["retrieval_contract_version"] == FROZEN_CONTRACT_VERSION
     assert client.get("/internal/embeddings/status").status_code == 401
 
 

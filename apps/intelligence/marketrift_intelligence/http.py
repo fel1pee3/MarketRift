@@ -6,7 +6,7 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 
 from .embeddings import DIMENSIONS, embed, identity, verify_local_model
-from .retrieval_eval import evaluate_frozen
+from .retrieval_eval import FROZEN_CONTRACT_VERSION, FROZEN_EVALUATOR_VERSION, evaluate_frozen
 
 
 @asynccontextmanager
@@ -46,6 +46,8 @@ def embedding_status(x_internal_token: str = Header(default="")) -> dict:
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=503, detail=str(error)) from None
     return {"model": model, "version": version, "dimensions": DIMENSIONS,
+            "retrieval_evaluator_version": FROZEN_EVALUATOR_VERSION,
+            "retrieval_contract_version": FROZEN_CONTRACT_VERSION,
             "test_only": model.startswith("controlled-")}
 
 

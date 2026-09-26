@@ -1,4 +1,4 @@
-import { BadRequestException, Body, Controller, Get, Inject, Param, Post, Query, Req, ServiceUnavailableException } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, Inject, Param, Post, Query, Req, ServiceUnavailableException } from '@nestjs/common';
 import { createHash } from 'node:crypto';
 import type { Request } from 'express';
 import type { PoolClient, QueryResultRow } from 'pg';
@@ -18,6 +18,8 @@ const freezeSchema = z.object({ acknowledge_unjudged: z.boolean().default(false)
 const localModel = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2';
 const localRevision = 'e8f8c211226b894fcb81acc59f3b34ba3efd5f42';
 const indexVersion = 'evidence_chunks/013/exact-cosine/chunks-v1';
+export const frozenEvaluatorVersion = 'frozen-ranking-v2';
+export const frozenContractVersion = 'frozen-eval-contract-v2';
 
 type SetRow = QueryResultRow & { id: string; tenant_id: string; title: string; origin: 'public_real' | 'synthetic_test'; status: 'draft' | 'frozen';
   version: number; product_id: string | null; corpus_hash: string | null; created_at: Date; frozen_at: Date | null };
@@ -29,8 +31,89 @@ type QuestionRow = QueryResultRow & { id: string; text_content: string; language
   no_answer_claim: boolean; created_at: Date };
 type JudgmentRow = QueryResultRow & { question_id: string; item_id: string; verdict: 'relevant' | 'irrelevant';
   reviewer_id: string; revision: number; judged_at: Date };
-type ReportRow = QueryResultRow & { id: string; corpus_hash: string; judgment_hash: string;
+type ReportRow = QueryResultRow & { id: string; set_id: string; corpus_hash: string; judgment_hash: string;
   result: Record<string, unknown>; created_at: Date };
+
+type FrozenDatasetIdentity = { set_id: string; version: string; origin: 'real' | 'synthetic'; index_version: string;
+  corpus_hash: string; judgment_hash: string; documents: { id: string }[];
+  questions: { id: string; judged_ids: string[]; relevant_ids: string[] }[] };
+
+function object(value: unknown): Record<string, unknown> | null {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown> : null;
+}
+
+function sameOrderedIds(value: unknown, expected: string[]): boolean {
+  return Array.isArray(value) && value.length === expected.length &&
+    value.every((id, index) => typeof id === 'string' && id === expected[index]);
+}
+
+export function reportMismatchField(value: unknown, dataset: FrozenDatasetIdentity): string | null {
+  const result = object(value);
+  if (!result) return 'result';
+  const fields: [string, unknown, unknown][] = [
+    ['contract_version', result.contract_version, frozenContractVersion],
+    ['evaluator_version', result.evaluator_version, frozenEvaluatorVersion],
+    ['set_id', result.set_id, dataset.set_id],
+    ['dataset_version', result.dataset_version, dataset.version],
+    ['origin', result.origin, dataset.origin === 'real' ? 'public_github_real' : 'synthetic_test'],
+    ['index_version', result.index_version, dataset.index_version],
+    ['corpus_hash', result.corpus_hash, dataset.corpus_hash],
+    ['judgment_hash', result.judgment_hash, dataset.judgment_hash],
+    ['corpus_size', result.corpus_size, dataset.documents.length],
+    ['question_count', result.question_count, dataset.questions.length],
+  ];
+  for (const [field, actual, expected] of fields) if (actual !== expected) return field;
+  if (!sameOrderedIds(result.document_ids, dataset.documents.map(item => item.id))) return 'document_ids';
+  if (!sameOrderedIds(result.question_ids, dataset.questions.map(item => item.id))) return 'question_ids';
+  const labels = object(result.labels_by_question);
+  if (!labels || Object.keys(labels).sort().join(',') !== dataset.questions.map(item => item.id).sort().join(','))
+    return 'labels_by_question';
+  for (const question of dataset.questions) {
+    const entry = object(labels[question.id]);
+    if (!entry || !sameOrderedIds(entry.judged_ids, question.judged_ids))
+      return `labels_by_question.${question.id}.judged_ids`;
+    if (!sameOrderedIds(entry.relevant_ids, question.relevant_ids))
+      return `labels_by_question.${question.id}.relevant_ids`;
+  }
+  const runs = object(result.runs);
+  const modes = dataset.origin === 'real' ? ['local', 'controlled', 'literal'] : ['controlled', 'literal'];
+  if (!runs || Object.keys(runs).sort().join(',') !== modes.sort().join(',')) return 'runs';
+  const eligible = new Set(dataset.documents.map(item => item.id));
+  const questions = dataset.questions.map(item => item.id);
+  for (const mode of modes) {
+    const run = object(runs[mode]);
+    const rankedIds = object(run?.ranked_ids);
+    const coverage = object(run?.ranking_coverage);
+    if (!rankedIds || Object.keys(rankedIds).sort().join(',') !== [...questions].sort().join(','))
+      return `runs.${mode}.ranked_ids`;
+    if (!coverage || Object.keys(coverage).sort().join(',') !== [...questions].sort().join(','))
+      return `runs.${mode}.ranking_coverage`;
+    for (const id of questions) {
+      const top = rankedIds[id];
+      const entry = object(coverage[id]);
+      const exclusions = entry?.excluded;
+      if (!entry || !Array.isArray(exclusions) || entry.eligible_count !== eligible.size ||
+        typeof entry.ranked_count !== 'number' ||
+        !Number.isInteger(entry.ranked_count) || entry.ranked_count < 0 || entry.ranked_count > eligible.size ||
+        exclusions.length !== eligible.size - entry.ranked_count)
+        return `runs.${mode}.ranking_coverage.${id}`;
+      if (!Array.isArray(top) || top.length !== Math.min(5, entry.ranked_count) ||
+        new Set(top).size !== top.length || top.some(item => typeof item !== 'string' || !eligible.has(item)))
+        return `runs.${mode}.ranked_ids.${id}`;
+      const omitted = exclusions.map(item => object(item));
+      if (omitted.some(item => !item || typeof item.item_id !== 'string' || !eligible.has(item.item_id) ||
+        top.includes(item.item_id) || typeof item.reason !== 'string' || !item.reason.trim()) ||
+        new Set(omitted.map(item => item?.item_id)).size !== omitted.length)
+        return `runs.${mode}.ranking_coverage.${id}.excluded`;
+    }
+  }
+  return null;
+}
+
+export function reportMatchesDataset(value: unknown, dataset: FrozenDatasetIdentity): boolean {
+  return reportMismatchField(value, dataset) === null;
+}
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
@@ -170,12 +253,15 @@ export class RetrievalReviewController {
       const set = await this.one(client, id);
       const { items, questions, judgments } = await this.rows(client, id);
       const stale = new Set(await this.staleItems(client, set));
-      const reports = await this.db.rows<ReportRow>(client, `SELECT id, corpus_hash, judgment_hash, result, created_at
+      const reports = await this.db.rows<ReportRow>(client, `SELECT id, set_id, corpus_hash, judgment_hash, result, created_at
         FROM marketrift.retrieval_reports WHERE set_id = $1 ORDER BY created_at DESC LIMIT 10`, [id]);
       return { set, items: items.map(item => ({ ...item, stale: stale.has(item.id) })), questions, judgments,
         coverage: judgmentCoverage(items, questions, judgments), stale_items: stale.size,
         reports: reports.map(report => ({ ...report, stale: stale.size > 0 || report.corpus_hash !== corpusHash(items) ||
-          report.judgment_hash !== judgmentHash(questions, judgments) })) };
+          report.judgment_hash !== judgmentHash(questions, judgments),
+        obsolete: report.set_id !== set.id || report.result.evaluator_version !== frozenEvaluatorVersion ||
+          report.result.dataset_version !== `public-github.v${set.version}` ||
+          report.result.corpus_hash !== report.corpus_hash || report.result.judgment_hash !== report.judgment_hash })) };
     });
   }
 
@@ -316,9 +402,11 @@ export class RetrievalReviewController {
           process.env.NODE_ENV !== 'production'))
         throw new BadRequestException('Conjunto sintético requer modo de teste');
       const { items, questions, judgments } = await this.rows(client, id);
-      if (set.corpus_hash !== corpusHash(items)) throw new BadRequestException('Corpus congelado inconsistente');
-      return { version: `public-github.v${set.version}`,
-        origin: set.origin === 'synthetic_test' ? 'synthetic' : 'real', index_version: indexVersion,
+      if (set.corpus_hash !== corpusHash(items))
+        throw new ConflictException('CONJUNTO_CONGELADO_DIVERGENTE: corpus_hash; crie outra versão após revisar a origem');
+      return { set_id: set.id, version: `public-github.v${set.version}`,
+        origin: set.origin === 'synthetic_test' ? 'synthetic' as const : 'real' as const,
+        index_version: indexVersion,
         corpus_hash: set.corpus_hash!, judgment_hash: judgmentHash(questions, judgments),
         documents: items.map(item => ({ id: item.id, text: item.text_content, source_type: item.source_type })),
         questions: questions.map(q => ({ id: q.id, text: q.text_content, language: q.language,
@@ -330,6 +418,22 @@ export class RetrievalReviewController {
     const token = process.env.EMBEDDING_INTERNAL_TOKEN;
     if (!/^http:\/\/(127\.0\.0\.1|localhost):\d{2,5}$/.test(base) || !token)
       throw new ServiceUnavailableException('Serviço local de embeddings indisponível');
+    let serviceStatus: Record<string, unknown>;
+    try {
+      const response = await fetch(`${base}/internal/embeddings/status`, {
+        headers: { 'X-Internal-Token': token }, signal: AbortSignal.timeout(10000),
+      });
+      if (!response.ok) throw new Error('internal_status_failed');
+      serviceStatus = await response.json() as Record<string, unknown>;
+    } catch { throw new ServiceUnavailableException('Serviço local de embeddings indisponível; confira FastAPI e o token interno'); }
+    if (serviceStatus.retrieval_contract_version !== frozenContractVersion)
+      throw new ConflictException('AVALIADOR_LOCAL_DESATUALIZADO: campo retrieval_contract_version; reinicie FastAPI e API');
+    if (serviceStatus.retrieval_evaluator_version !== frozenEvaluatorVersion)
+      throw new ConflictException('AVALIADOR_LOCAL_DESATUALIZADO: campo retrieval_evaluator_version; reinicie FastAPI e API');
+    const expectedModel = dataset.origin === 'real' ? localModel : 'controlled-hash-TESTE';
+    const expectedRevision = dataset.origin === 'real' ? localRevision : '1';
+    if (serviceStatus.model !== expectedModel || serviceStatus.version !== expectedRevision)
+      throw new ConflictException('MODELO_LOCAL_DIVERGENTE: confira EMBEDDING_PROVIDER e a revisão fixa do modelo');
     let result: Record<string, unknown>;
     try {
       const response = await fetch(`${base}/internal/retrieval/evaluate`, {
@@ -339,12 +443,22 @@ export class RetrievalReviewController {
       if (!response.ok) throw new Error('internal_evaluation_failed');
       result = await response.json() as Record<string, unknown>;
     } catch { throw new ServiceUnavailableException('A avaliação local falhou; confira o serviço FastAPI e o modelo'); }
+    const mismatch = reportMismatchField(result, dataset);
+    if (mismatch)
+      throw new ConflictException(`CONTRATO_DE_AVALIACAO_DIVERGENTE: campo ${mismatch}; reinicie API e FastAPI. Se persistir, revise a versão congelada`);
     return this.db.tenant(principal.tenantId, async client => {
       const set = await this.one(client, id, true);
       const { items, questions, judgments } = await this.rows(client, id);
-      if (set.status !== 'frozen' || set.corpus_hash !== dataset.corpus_hash ||
-        judgmentHash(questions, judgments) !== dataset.judgment_hash || items.length !== dataset.documents.length)
-        throw new BadRequestException('Conjunto mudou durante a avaliação');
+      if (set.status !== 'frozen') throw new ConflictException('CONJUNTO_CONGELADO_DIVERGENTE: status');
+      if (set.corpus_hash !== dataset.corpus_hash || corpusHash(items) !== dataset.corpus_hash)
+        throw new ConflictException('CONJUNTO_CONGELADO_DIVERGENTE: corpus_hash');
+      if (judgmentHash(questions, judgments) !== dataset.judgment_hash)
+        throw new ConflictException('CONJUNTO_CONGELADO_DIVERGENTE: judgment_hash');
+      if (items.length !== dataset.documents.length || items.some((item, index) => item.id !== dataset.documents[index]?.id))
+        throw new ConflictException('CONJUNTO_CONGELADO_DIVERGENTE: document_ids');
+      if (questions.length !== dataset.questions.length ||
+        questions.some((question, index) => question.id !== dataset.questions[index]?.id))
+        throw new ConflictException('CONJUNTO_CONGELADO_DIVERGENTE: question_ids');
       const [report] = await this.db.rows<{ id: string }>(client, `INSERT INTO marketrift.retrieval_reports
         (tenant_id,set_id,corpus_hash,judgment_hash,result,created_by) VALUES ($1,$2,$3,$4,$5,$6) RETURNING id`,
       [principal.tenantId, id, dataset.corpus_hash, dataset.judgment_hash, result, principal.userId]);

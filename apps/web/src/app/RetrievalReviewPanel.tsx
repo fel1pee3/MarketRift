@@ -1,6 +1,6 @@
 'use client';
 
-import { FormEvent, useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 type Product = { id: string; name: string };
 type SetInfo = { id: string; title: string; origin: 'public_real' | 'synthetic_test'; status: 'draft' | 'frozen'; version: number; created_at: string };
@@ -10,16 +10,24 @@ type Question = { id: string; text_content: string; language: 'pt' | 'en'; no_an
 type Judgment = { question_id: string; item_id: string; verdict: 'relevant' | 'irrelevant';
   reviewer_id: string; judged_at: string; revision: number };
 type Metrics = { recall_at_k: number | null; mrr_at_k: number | null; answerable: number;
-  without_answer: number; no_answer_correct: number; errors: { question_id: string; kind: string;
+  without_answer: number; errors: { question_id: string; kind: string;
     retrieved_ids?: string[]; expected_ids?: string[] }[] };
+type RankingCoverage = { eligible_count: number; ranked_count: number;
+  excluded: { item_id: string; reason: string }[] };
+type Abstention = { minimum_score: number; without_answer: number; correct_no_answer: number;
+  per_question: Record<string, { ranked_count: number; returned_ids: string[];
+    excluded: { item_id: string; reason: string; score: number }[] }> };
 type Run = { model: string; model_version: string; elapsed_ms: number; cold_ms?: number; warm_ms?: number;
+  ranking_coverage?: Record<string, RankingCoverage>; ranked_ids?: Record<string, string[]>;
+  abstention_at_5?: Abstention;
   metrics: { at_3: { complete: Metrics | null; conditional_judged_only: { answerable_questions: number;
     recall: number | null; unjudged_in_top: unknown[] } }; at_5: { complete: Metrics | null;
     conditional_judged_only: { answerable_questions: number; recall: number | null; unjudged_in_top: unknown[] } } } };
-type Report = { id: string; stale: boolean; created_at: string; result: { corpus_size: number;
+type Report = { id: string; set_id: string; stale: boolean; obsolete: boolean; created_at: string; result: { corpus_size: number;
   question_count: number; fully_judged_questions: number; judged_pairs: number; total_pairs: number;
   source_types: Record<string, number>; languages: Record<string, number>; runs: Record<string, Run>;
-  index_version: string; external_cost_usd: number } };
+  index_version: string; external_cost_usd: number; dataset_version: string; evaluator_version?: string;
+  rankings_directly_comparable?: boolean } };
 type Detail = { set: SetInfo; items: Item[]; questions: Question[]; judgments: Judgment[];
   coverage: { judged: number; total: number; unjudged: number; fully_judged: boolean }; stale_items: number;
   reports: Report[] };
@@ -38,6 +46,7 @@ export default function RetrievalReviewPanel({ products, csrfToken, role }:
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState('');
+  const refreshSequence = useRef(0);
   const canReview = role === 'owner' || role === 'admin' || role === 'analyst';
 
   async function request<T>(path: string, body?: object): Promise<T> {
@@ -54,13 +63,18 @@ export default function RetrievalReviewPanel({ products, csrfToken, role }:
     return value as T;
   }
   async function refresh(id = selected): Promise<void> {
+    const sequence = ++refreshSequence.current;
+    if (id !== selected) { setSelected(id); setDetail(null); setQuestionId(''); }
     const list = await request<SetInfo[]>('sets');
+    if (sequence !== refreshSequence.current) return;
     setSets(list);
     if (id) {
       const next = await request<Detail>(`sets/${id}`);
+      if (sequence !== refreshSequence.current) return;
+      if (next.set.id !== id) throw new Error('A API retornou outro conjunto; atualize a página');
       setDetail(next); setSelected(id);
       setQuestionId(current => next.questions.some(q => q.id === current) ? current : next.questions[0]?.id ?? '');
-    } else { setDetail(null); }
+    } else { setDetail(null); setQuestionId(''); }
   }
   useEffect(() => { void refresh().catch(cause => setError(String(cause))); // first load for active company
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -170,39 +184,68 @@ export default function RetrievalReviewPanel({ products, csrfToken, role }:
           await refresh(copy.id); setMessage('Nova versão em rascunho; pode continuar a rotulagem.');
         })}>Criar versão para continuar</button>
       </p>}
-      {detail.reports.map(report => <article key={report.id}>
-        <h3>Relatório · {new Date(report.created_at).toLocaleString('pt-BR')}</h3>
-        {report.stale && <p><strong>Histórico: origem ou versão mudou; este relatório não descreve o estado atual.</strong></p>}
-        <p>{report.result.corpus_size} trechos; {report.result.question_count} perguntas;
-          {report.result.fully_judged_questions} inteiramente julgadas;
-          {report.result.judged_pairs}/{report.result.total_pairs} pares julgados;
-          tipos {JSON.stringify(report.result.source_types)}; idiomas {JSON.stringify(report.result.languages)};
-          custo externo USD {report.result.external_cost_usd}.</p>
-        <p>Versão do índice: {report.result.index_version}. Modelo controlado é somente referência de TESTE;
-          este corpus de Issues/Discussions não mede reviews B2B.</p>
-        {Object.entries(report.result.runs).map(([mode, run]) => <div key={mode}>
-          <h4>{mode === 'controlled' ? 'controlled-hash-TESTE' : mode} · {run.model} ({run.model_version})</h4>
-          <p>Tempo de ranking {run.elapsed_ms} ms{run.cold_ms !== undefined &&
-            ` · carga/primeiro vetor ${run.cold_ms} ms · vetor quente ${run.warm_ms} ms`}.
-            Perguntas inteiramente julgadas: Recall@3
-            {' '}{percent(run.metrics.at_3.complete?.recall_at_k ?? null)}, Recall@5
-            {' '}{percent(run.metrics.at_5.complete?.recall_at_k ?? null)}, MRR@5
-            {' '}{percent(run.metrics.at_5.complete?.mrr_at_k ?? null)}.
-            Sem resposta correta {run.metrics.at_5.complete?.no_answer_correct ?? 0}/
-            {run.metrics.at_5.complete?.without_answer ?? 0}.</p>
-          <p>Julgamento parcial (condicional, itens não julgados desconhecidos): Recall@3
-            {' '}{percent(run.metrics.at_3.conditional_judged_only.recall)}, top-3 não julgados
-            {' '}{run.metrics.at_3.conditional_judged_only.unjudged_in_top.length}.</p>
-          {(run.metrics.at_5.complete?.errors ?? []).slice(0, 5).map((entry, n) =>
-            <div key={n}><p>Erro {entry.kind} · pergunta {entry.question_id}</p>
-              {(entry.retrieved_ids ?? entry.expected_ids ?? []).map(itemId => {
-                const item = detail.items.find(candidate => candidate.id === itemId);
-                return <p key={itemId}>Item {itemId}{item && <> · {label(item.source_type)}:
-                  {' '}{item.text_content.slice(0, 180)}… {' '}
-                  <a href={item.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a></>}</p>;
-              })}</div>)}
-        </div>)}
-      </article>)}
+      {detail.reports.map(report => {
+        const obsolete = report.obsolete || report.set_id !== detail.set.id ||
+          report.result.dataset_version !== `public-github.v${detail.set.version}` ||
+          report.result.evaluator_version !== 'frozen-ranking-v2';
+        return <article key={report.id}>
+          <h3>Relatório · conjunto v{detail.set.version} · {new Date(report.created_at).toLocaleString('pt-BR')}</h3>
+          <p>Versão registrada: {report.result.dataset_version}; avaliador:
+            {' '}{report.result.evaluator_version ?? 'anterior, sem versão'}; ID {report.id}.</p>
+          {report.stale && <p><strong>Histórico: origem ou corpus mudou; este relatório descreve a captura congelada.</strong></p>}
+          {obsolete && <p role="status"><strong>Relatório obsoleto: o avaliador antigo aplicava um corte de score
+            às métricas e não mostrava as exclusões. Os números antigos não são comparáveis aos novos.
+            Reexecute a avaliação desta versão; os julgamentos humanos serão preservados.</strong></p>}
+          <p>{report.result.corpus_size} trechos; {report.result.question_count} perguntas;
+            {report.result.fully_judged_questions} inteiramente julgadas;
+            {report.result.judged_pairs}/{report.result.total_pairs} pares julgados;
+            tipos {JSON.stringify(report.result.source_types)}; idiomas {JSON.stringify(report.result.languages)};
+            custo externo USD {report.result.external_cost_usd}.</p>
+          <p>Versão do índice: {report.result.index_version}. Modelo controlado é somente referência de TESTE;
+            este corpus de Issues/Discussions não mede reviews B2B.</p>
+          {!obsolete && <>
+            <p>Recall@k e MRR@k usam o ranking dos candidatos elegíveis, sem corte de score.
+              {' '}{report.result.rankings_directly_comparable ? 'Todos os métodos ranquearam o corpus completo.' :
+                'Ranking parcial: confira as exclusões; os métodos não são diretamente comparáveis.'}
+              {' '}O diagnóstico de abstenção abaixo usa limiares diferentes e não é comparável entre modelos.</p>
+            {Object.entries(report.result.runs).map(([mode, run]) => <div key={mode}>
+              <h4>{mode === 'controlled' ? 'controlled-hash-TESTE' : mode} · {run.model} ({run.model_version})</h4>
+              <p>Tempo de ranking {run.elapsed_ms} ms{run.cold_ms !== undefined &&
+                ` · carga/primeiro vetor ${run.cold_ms} ms · vetor quente ${run.warm_ms} ms`}.
+                Perguntas inteiramente julgadas: Recall@3
+                {' '}{percent(run.metrics.at_3.complete?.recall_at_k ?? null)}, Recall@5
+                {' '}{percent(run.metrics.at_5.complete?.recall_at_k ?? null)}, MRR@5
+                {' '}{percent(run.metrics.at_5.complete?.mrr_at_k ?? null)}.</p>
+              <p>Julgamento parcial (condicional, itens não julgados desconhecidos): Recall@3
+                {' '}{percent(run.metrics.at_3.conditional_judged_only.recall)}, top-3 não julgados
+                {' '}{run.metrics.at_3.conditional_judged_only.unjudged_in_top.length}.</p>
+              {Object.entries(run.ranking_coverage ?? {}).map(([id, coverage]) => <div key={id}>
+                <p>Pergunta {id}: {coverage.ranked_count}/{coverage.eligible_count} candidatos ranqueados;
+                  top-5 na ordem: {(run.ranked_ids?.[id] ?? []).join(' → ') || 'nenhum'}.</p>
+                {coverage.excluded.map(entry => <p key={entry.item_id}>Excluído do ranking:
+                  {' '}{entry.item_id} · motivo {entry.reason}.</p>)}
+              </div>)}
+              {run.abstention_at_5 && <details>
+                <summary>Diagnóstico separado de abstenção (corte {run.abstention_at_5.minimum_score}) ·
+                  sem resposta correta {run.abstention_at_5.correct_no_answer}/{run.abstention_at_5.without_answer}</summary>
+                {Object.entries(run.abstention_at_5.per_question).map(([id, data]) => <div key={id}>
+                  <p>Pergunta {id}: {data.returned_ids.length}/{data.ranked_count} passaram pelo corte.</p>
+                  {data.excluded.map(entry => <p key={entry.item_id}>Abaixo do corte:
+                    {' '}{entry.item_id} · score {entry.score.toFixed(4)} · {entry.reason}.</p>)}
+                </div>)}
+              </details>}
+              {(run.metrics.at_5.complete?.errors ?? []).slice(0, 5).map((entry, n) =>
+                <div key={n}><p>Erro {entry.kind} · pergunta {entry.question_id}</p>
+                  {(entry.kind === 'missed_relevance' ? entry.expected_ids ?? [] : entry.retrieved_ids ?? []).map(itemId => {
+                    const item = detail.items.find(candidate => candidate.id === itemId);
+                    return <p key={itemId}>Item {itemId}{item && <> · {label(item.source_type)}:
+                      {' '}{item.text_content.slice(0, 180)}… {' '}
+                      <a href={item.source_url} target="_blank" rel="noreferrer">Abrir origem ↗</a></>}</p>;
+                  })}</div>)}
+            </div>)}
+          </>}
+        </article>;
+      })}
     </>}
   </section>;
 }

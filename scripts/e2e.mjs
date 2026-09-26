@@ -403,17 +403,61 @@ try {
   assert.equal(reviewReport.status, 201, JSON.stringify(reviewReport.body));
   assert.equal(reviewReport.body.result.origin, 'synthetic_test');
   assert.equal(reviewReport.body.result.external_cost_usd, 0);
+  assert.equal(reviewReport.body.result.evaluator_version, 'frozen-ranking-v2');
+  assert.equal(reviewReport.body.result.contract_version, 'frozen-eval-contract-v2');
+  assert.equal(reviewReport.body.result.set_id, reviewSet.body.id);
+  assert.equal(reviewReport.body.result.dataset_version, 'public-github.v1');
+  assert.equal(reviewReport.body.result.rankings_directly_comparable, true);
   assert.equal(reviewReport.body.result.fully_judged_questions, 2);
   assert.equal(reviewReport.body.result.judged_pairs, 2);
   assert.equal(reviewReport.body.result.total_pairs, 3);
   assert.deepEqual(Object.keys(reviewReport.body.result.runs).sort(), ['controlled', 'literal']);
+  assert.equal(reviewReport.body.result.runs.controlled.metrics.at_5.complete.recall_at_k, 1);
+  assert.equal(reviewReport.body.result.runs.controlled.metrics.at_5.complete.mrr_at_k, 1);
+  assert.deepEqual(reviewReport.body.result.runs.controlled.ranking_coverage[reviewQuestion.body.id],
+    { eligible_count: 1, ranked_count: 1, excluded: [] });
+  const savedReviewReport = await viewer.call(`retrieval-review/sets/${reviewSet.body.id}`);
+  assert.equal(savedReviewReport.body.reports[0].obsolete, false);
+  assert.equal(savedReviewReport.body.reports[0].set_id, reviewSet.body.id);
   assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/questions`, {
     method: 'POST', body: JSON.stringify({ text: 'Too late', language: 'en' }) })).status, 400);
   const reviewFork = await analyst.call(`retrieval-review/sets/${reviewSet.body.id}/fork`, { method: 'POST',
     body: JSON.stringify({}) });
   assert.equal(reviewFork.status, 201);
   assert.equal(reviewFork.body.version, 2);
-  assert.equal((await analyst.call(`retrieval-review/sets/${reviewFork.body.id}`)).body.coverage.unjudged, 1);
+  const forkDetail = await analyst.call(`retrieval-review/sets/${reviewFork.body.id}`);
+  assert.equal(forkDetail.body.coverage.unjudged, 1);
+  assert.deepEqual(forkDetail.body.reports, []); // selecting v2 cannot serve a report from v1
+  assert.equal((await analyst.call(`retrieval-review/sets/${reviewFork.body.id}/freeze`, {
+    method: 'POST', body: JSON.stringify({ acknowledge_unjudged: true }) })).status, 201);
+  const firstV2Report = await analyst.call(`retrieval-review/sets/${reviewFork.body.id}/evaluate`, {
+    method: 'POST', body: JSON.stringify({}) });
+  assert.equal(firstV2Report.status, 201, JSON.stringify(firstV2Report.body));
+  const historicalDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await historicalDb.connect();
+  try {
+    await historicalDb.query(`UPDATE marketrift.retrieval_reports
+      SET result = result - 'evaluator_version' - 'contract_version'
+      WHERE id = $1`, [firstV2Report.body.id]); // simulate an old-format report in the isolated E2E tenant
+  } finally { await historicalDb.end(); }
+  const beforeReevaluation = await viewer.call(`retrieval-review/sets/${reviewFork.body.id}`);
+  assert.equal(beforeReevaluation.body.reports.length, 1);
+  assert.equal(beforeReevaluation.body.reports[0].obsolete, true);
+  assert.equal(beforeReevaluation.body.reports[0].stale, false);
+  const newV2Report = await analyst.call(`retrieval-review/sets/${reviewFork.body.id}/evaluate`, {
+    method: 'POST', body: JSON.stringify({}) });
+  assert.equal(newV2Report.status, 201, JSON.stringify(newV2Report.body));
+  assert.equal(newV2Report.body.result.set_id, reviewFork.body.id);
+  assert.equal(newV2Report.body.result.dataset_version, 'public-github.v2');
+  assert.equal(newV2Report.body.result.contract_version, 'frozen-eval-contract-v2');
+  assert.equal(newV2Report.body.result.document_ids.length, forkDetail.body.items.length);
+  assert.deepEqual(newV2Report.body.result.question_ids,
+    forkDetail.body.questions.map(question => question.id));
+  const afterReevaluation = await viewer.call(`retrieval-review/sets/${reviewFork.body.id}`);
+  assert.equal(afterReevaluation.body.reports.length, 2);
+  assert.equal(afterReevaluation.body.reports.find(report => report.id === firstV2Report.body.id).obsolete, true);
+  assert.equal(afterReevaluation.body.reports.find(report => report.id === newV2Report.body.id).obsolete, false);
+  assert.equal(afterReevaluation.body.coverage.judged, forkDetail.body.coverage.judged);
   const discussionSecond = await syncDiscussions();
   assert.equal(discussionSecond.documents_new, 1);
   assert.equal(discussionSecond.scan_complete, true);
