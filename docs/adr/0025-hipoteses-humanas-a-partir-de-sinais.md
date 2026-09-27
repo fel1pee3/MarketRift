@@ -1,0 +1,13 @@
+# ADR 0025: hipóteses humanas ligadas a sinais revisáveis
+
+**Status:** implementado em 2026-09-27.
+
+Uma hipótese de produto ou marketing nasce de um `reviewable_signal` **aprovado**, com fonte ativa e reconciliação concluída. Ela guarda o ID do sinal, a chave do fato, o hash da evidência, a versão da regra e fatos copiados pelo servidor: IDs, datas, trechos literais e URLs. O texto proposto separa interpretação, ação possível, alegações não verificadas, passos de verificação e riscos. O usuário não envia fatos arbitrários. Issues e Discussions são atividade pública, possivelmente parcial; capturas de preços e changelogs precisam ter as duas evidências confirmadas já exigidas pelo sinal. Isso não constitui recomendação automática nem comprova impacto comercial.
+
+O fluxo é `draft → proposed → approved/rejected`. Analyst pode criar, editar e propor o próprio rascunho; owner/admin podem criar, editar, propor e decidir; viewer vê somente hipóteses aprovadas com suporte atual. Cada transição de estado cria evento com ator, data e motivo quando há decisão. A edição do texto atualiza `updated_at`, não muda os fatos copiados nem o sinal, e só ocorre antes da proposta. Há no máximo uma hipótese por versão do fato de um sinal. Um fato materialmente novo recebe nova chave e exige outra hipótese e revisão. A aprovação não publica nem executa a ação.
+
+Uma alegação sobre vantagem do produto próprio exige `product_capabilities` para produto `own`, URL HTTPS de evidência e revisão humana registrada com autor e data. A API exige essa capacidade novamente ao propor/aprovar. A revisão humana da URL não é verificação automática de contrato, funcionalidade ou superioridade. Sem tal capacidade, a interface e o registro dizem **verificar internamente**.
+
+A migração incremental 024 cria hipóteses, eventos e gatilho transacional sobre obsolescência do sinal, com RLS forçada por tenant e chaves estrangeiras de tenant. Se a reconciliação torna um sinal obsoleto, a hipótese passa imediatamente a `needs_review`, sai da lista atual de viewer, perde os trechos copiados e mantém a trilha de decisões. A mudança nunca transfere aprovação antiga para fato novo. O servidor usa sessão, CSRF e membership existentes; o navegador não escolhe tenant. Os bloqueios seguem a ordem sinal → hipótese, inclusive durante revisão, para conviver com a reconciliação.
+
+O E2E usa tenants e fontes controlados marcados TESTE e verifica papéis, CSRF, RLS, fato duplicado, capacidade própria, evidências literais, transições e perda de suporte. Não cria hipóteses para os sinais reais do usuário, nem chama OpenAI. O banco existente recebeu 024 uma única vez; os sinais reais aprovados e seus estados de leitura não foram alterados.

@@ -9,7 +9,9 @@ import { SemanticController } from './semantic';
 import { RetrievalReviewController } from './retrieval-review';
 import { ReviewableSignalsController } from './reviewable-signals';
 import { SourceDiscoveryController } from './source-discovery';
+import { ActionHypothesesController } from './action-hypotheses';
 
 @Module({ controllers: [ApiController, AccountsController, WebPagesController, EvidenceController, SemanticController,
-  RetrievalReviewController, ReviewableSignalsController, SourceDiscoveryController], providers: [Db, Jobs, Accounts] })
+  RetrievalReviewController, ReviewableSignalsController, ActionHypothesesController,
+  SourceDiscoveryController], providers: [Db, Jobs, Accounts] })
 export class AppModule {}

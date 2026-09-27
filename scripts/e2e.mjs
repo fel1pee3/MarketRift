@@ -1431,6 +1431,69 @@ try {
   const approvedSignals = await viewer.call('reviewable-signals');
   assert(approvedSignals.body.signals.some(item => item.id === priceSignal.id));
   assert(approvedSignals.body.alerts.some(item => item.id === priceSignal.id && item.read_at === null));
+  const hypothesisInput = { signal_id: priceSignal.id, hypothesis_kind: 'product',
+    interpretation: 'Talvez exista uma oportunidade para revisar nossa apresentação do plano.',
+    proposed_action: 'Conferir internamente condições e valor antes de discutir uma ação.',
+    unverified_claims: 'Ainda não sabemos se nosso produto oferece uma condição superior.',
+    verification_steps: 'Comparar contratos e confirmar as condições vigentes com a equipe.',
+    risks: 'A captura pode não refletir uma oferta contratual.' };
+  assert.equal((await viewer.call('action-hypotheses', { method: 'POST',
+    body: JSON.stringify(hypothesisInput) })).status, 403);
+  assert.equal((await b.call('action-hypotheses', { method: 'POST',
+    body: JSON.stringify(hypothesisInput) })).status, 409);
+  assert.equal((await analyst.call('action-hypotheses', { method: 'POST', withoutCsrf: true,
+    body: JSON.stringify(hypothesisInput) })).status, 403);
+  assert.equal((await analyst.call('action-hypotheses', { method: 'POST',
+    body: JSON.stringify({ ...hypothesisInput, own_advantage_claim: 'Nosso produto é melhor.' }) })).status, 400);
+  const draftHypothesis = await analyst.call('action-hypotheses', { method: 'POST',
+    body: JSON.stringify(hypothesisInput) });
+  assert.equal(draftHypothesis.status, 201, JSON.stringify(draftHypothesis.body));
+  assert.equal(draftHypothesis.body.status, 'draft');
+  const revisedHypothesis = { ...hypothesisInput,
+    interpretation: 'A oportunidade possivel precisa de validacao interna adicional.' };
+  assert.equal((await viewer.call(`action-hypotheses/${draftHypothesis.body.id}`, { method: 'PATCH',
+    body: JSON.stringify(revisedHypothesis) })).status, 403);
+  assert.equal((await b.call(`action-hypotheses/${draftHypothesis.body.id}`, { method: 'PATCH',
+    body: JSON.stringify(revisedHypothesis) })).status, 404);
+  assert.equal((await analyst.call(`action-hypotheses/${draftHypothesis.body.id}`, { method: 'PATCH',
+    body: JSON.stringify(revisedHypothesis) })).status, 200);
+  assert.equal((await analyst.call('action-hypotheses')).body.find(item =>
+    item.id === draftHypothesis.body.id).interpretation, revisedHypothesis.interpretation);
+  assert.equal((await analyst.call('action-hypotheses', { method: 'POST',
+    body: JSON.stringify(hypothesisInput) })).status, 409, 'same signal version has one hypothesis');
+  assert.equal((await viewer.call('action-hypotheses')).body.length, 0);
+  assert.equal((await b.call('action-hypotheses')).body.length, 0);
+  assert.equal((await analyst.call(`action-hypotheses/${draftHypothesis.body.id}/submit`, { method: 'POST' })).body.status,
+    'proposed');
+  assert.equal((await analyst.call(`action-hypotheses/${draftHypothesis.body.id}`, { method: 'PATCH',
+    body: JSON.stringify(revisedHypothesis) })).status, 409);
+  assert.equal((await analyst.call(`action-hypotheses/${draftHypothesis.body.id}/review`, { method: 'POST',
+    body: JSON.stringify({ status: 'approved', reason: 'no permission' }) })).status, 403);
+  assert.equal((await a.call(`action-hypotheses/${draftHypothesis.body.id}/review`, { method: 'POST',
+    body: JSON.stringify({ status: 'approved', reason: 'Hipótese conferida apenas para discussão interna.' }) })).body.status,
+    'approved');
+  const approvedHypothesis = (await viewer.call('action-hypotheses')).body.find(item =>
+    item.id === draftHypothesis.body.id);
+  assert(approvedHypothesis);
+  assert.equal(approvedHypothesis.signal_id, priceSignal.id);
+  assert.equal(approvedHypothesis.source_type, 'pricing_page');
+  assert.equal(approvedHypothesis.facts.length, 2);
+  assert.equal(approvedHypothesis.own_advantage_claim, null);
+  assert.deepEqual(approvedHypothesis.history.map(item => item.action), ['created', 'submitted', 'approved']);
+  const capabilityInput = { product_id: product.body.id, topic: 'condições comerciais',
+    claim: 'Existe uma página pública sobre nossos planos.', evidence_url: 'https://example.com/our-plans' };
+  const capability = await a.call('action-hypotheses/capabilities', { method: 'POST',
+    body: JSON.stringify(capabilityInput) });
+  assert.equal(capability.status, 201, JSON.stringify(capability.body));
+  assert.equal(capability.body.verification_status, 'unverified');
+  assert.equal((await a.call('action-hypotheses/capabilities', { method: 'POST',
+    body: JSON.stringify(capabilityInput) })).status, 409);
+  assert.equal((await viewer.call(`action-hypotheses/capabilities/${capability.body.id}/verify`,
+    { method: 'POST' })).status, 403);
+  assert.equal((await b.call(`action-hypotheses/capabilities/${capability.body.id}/verify`,
+    { method: 'POST' })).status, 409);
+  assert.equal((await a.call(`action-hypotheses/capabilities/${capability.body.id}/verify`,
+    { method: 'POST' })).body.verification_status, 'verified');
   assert.equal((await viewer.call(`reviewable-signals/${priceSignal.id}/read`, { method: 'POST',
     body: JSON.stringify({ read: true }) })).status, 201);
   assert((await viewer.call('reviewable-signals')).body.alerts.find(item => item.id === priceSignal.id).read_at);
@@ -1693,6 +1756,21 @@ try {
   // Two schedulers must reconcile a committed Discussion edit without another manual refresh.
   assert.equal((await a.call(`reviewable-signals/${discussionSignal.id}/review`, { method: 'POST',
     body: JSON.stringify({ state: 'approved', reason: 'controlled public activity' }) })).status, 201);
+  const discussionHypothesis = await analyst.call('action-hypotheses', { method: 'POST',
+    body: JSON.stringify({ ...hypothesisInput, signal_id: discussionSignal.id,
+      hypothesis_kind: 'marketing', own_capability_id: capability.body.id,
+      own_advantage_claim: 'Nossa página documenta as condições que precisam ser comparadas.' }) });
+  assert.equal(discussionHypothesis.status, 201, JSON.stringify(discussionHypothesis.body));
+  const discussionDraft = (await analyst.call('action-hypotheses')).body.find(item =>
+    item.id === discussionHypothesis.body.id);
+  assert.equal(discussionDraft.source_type, 'github_discussions');
+  assert(discussionDraft.facts.every(fact => fact.evidence_id && fact.quote && fact.url));
+  assert.match(discussionDraft.coverage_note, /atividade pública/i);
+  assert.equal((await analyst.call(`action-hypotheses/${discussionHypothesis.body.id}/submit`,
+    { method: 'POST' })).body.status, 'proposed');
+  assert.equal((await a.call(`action-hypotheses/${discussionHypothesis.body.id}/review`, { method: 'POST',
+    body: JSON.stringify({ status: 'approved', reason: 'Revisado para discussão interna.' }) })).body.status,
+    'approved');
   const signalSchedulerA = launchScheduler();
   const signalSchedulerB = launchScheduler();
   discussionBody = 'The integration also fails after a workspace is renamed.';
@@ -1709,6 +1787,13 @@ try {
   }
   assert.equal(autoSignals.signals.find(item => item.id === discussionSignal.id)?.state, 'obsolete');
   assert.equal(autoSignals.alerts.some(item => item.id === discussionSignal.id), false);
+  const obsoleteDiscussionHypothesis = (await analyst.call('action-hypotheses')).body.find(item =>
+    item.id === discussionHypothesis.body.id);
+  assert.equal(obsoleteDiscussionHypothesis.status, 'needs_review');
+  assert.deepEqual(obsoleteDiscussionHypothesis.facts, []);
+  assert.equal(obsoleteDiscussionHypothesis.history.at(-1).action, 'signal_obsolete');
+  assert.equal((await viewer.call('action-hypotheses')).body.some(item =>
+    item.id === discussionHypothesis.body.id), false);
   const replacement = autoSignals.signals.find(item => item.signal_type === 'github_discussion_activity'
     && item.state === 'candidate' && item.id !== discussionSignal.id);
   assert(replacement, 'material edit requires a new human decision');
@@ -1732,6 +1817,11 @@ try {
     await delay(150);
   }
   assert.equal(automaticallyRevoked?.state, 'obsolete', 'disabled source must reconcile automatically');
+  const obsoletePriceHypothesis = (await analyst.call('action-hypotheses')).body.find(item =>
+    item.id === draftHypothesis.body.id);
+  assert.equal(obsoletePriceHypothesis.status, 'needs_review');
+  assert.deepEqual(obsoletePriceHypothesis.facts, []);
+  assert.equal((await viewer.call('action-hypotheses')).body.length, 0);
   signalSchedulerA.kill(); signalSchedulerB.kill();
   const revokedRefresh = await a.call('reviewable-signals/refresh', { method: 'POST' });
   assert.equal(revokedRefresh.status, 201, JSON.stringify(revokedRefresh.body));
@@ -1873,7 +1963,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

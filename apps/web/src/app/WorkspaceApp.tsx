@@ -305,7 +305,9 @@ export default function WorkspaceApp({ view }: { view: View }) {
             <a href="#discussions-coletadas">Discussions públicas</a><a href="#documentos">Documentos e análises</a></div>
         </section>}
         {view === 'evidence' && <EvidencePanel key={session.tenant_id} products={products} />}
-        {view === 'signals' && <SignalsPanel key={`signals-${session.tenant_id}`} tenantId={session.tenant_id} csrfToken={session.csrf_token} role={session.role} />}
+        {view === 'signals' && <SignalsPanel key={`signals-${session.tenant_id}`} tenantId={session.tenant_id}
+          userId={session.user_id} csrfToken={session.csrf_token} role={session.role}
+          ownProducts={products.filter(product => product.kind === 'own').map(product => ({ id: product.id, name: product.name }))} />}
         {view === 'questions' && <QuestionsPanel key={`questions-${session.tenant_id}`} products={products} sources={sources}
           csrfToken={session.csrf_token} role={session.role} />}
         {view === 'retrieval-review' && <RetrievalReviewPanel key={`retrieval-review-${session.tenant_id}`} products={products}
