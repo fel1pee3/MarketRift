@@ -112,6 +112,22 @@ const steamMock = createServer((request, response) => {
       response.end(`<main><section class="plan"><h2>Pro</h2><p>USD ${pagePrice} per month</p><p>API access</p></section><footer>Updated today</footer></main>`);
       return;
     }
+    if (url.pathname === '/web-page/pricing-large') {
+      const prefix = '<main><h1>Pricing</h1><section class="plan"><h2>Pro</h2>'
+        + '<p>USD 10 per month</p><p>API access</p></section></main>';
+      const body = prefix + ' '.repeat(1_100_000);
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8',
+        'Content-Length': Buffer.byteLength(body) });
+      response.end(body); return;
+    }
+    if (url.pathname === '/web-page/changelog-vercel') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<main><h1>Changelog</h1><ul><li><div>25 September</div><article>'
+        + '<h2><a href="/changelog/vcr-login-github-action">'
+        + 'Push images to Container Registry from GitHub Actions</a></h2>'
+        + '<p>The login action logs workflows in with GitHub OIDC, removing long-lived credentials.</p>'
+        + '</article></li></ul></main>'); return;
+    }
     if (url.pathname === '/web-page/changelog') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end(`<main><h1>Changelog</h1><article><h2>Version ${releaseVersion}</h2>`
@@ -273,14 +289,22 @@ async function waitForPageRun(browser, id) {
   throw new Error(`Page check did not complete: ${errors}`);
 }
 async function waitForScheduledPageRun(browser, sourceId, count) {
+  let last = null;
   for (let attempt = 0; attempt < 100; attempt++) {
     const result = await browser.call('page-sources');
     const runs = result.body.runs.filter(item => item.source_id === sourceId && item.trigger_kind === 'scheduled');
-    if (runs.some(item => item.status === 'failed')) throw new Error(`Scheduled check failed: ${JSON.stringify(runs)}`);
+    last = { runs: runs.map(item => ({ status: item.status, error_code: item.error_code })),
+      source: result.body.sources.filter(item => item.id === sourceId).map(item => ({
+        monitoring_enabled: item.monitoring_enabled, next_check_at: item.next_check_at })) };
+    if (runs.some(item => item.status === 'failed')) throw new Error(`Scheduled check failed: ${JSON.stringify({
+      runs: runs.map(item => ({ status: item.status, error_code: item.error_code })),
+      source: result.body.sources.find(item => item.id === sourceId)?.url,
+      pageRequests: pageRequests.slice(-10),
+    })}`);
     if (runs.filter(item => item.status === 'succeeded').length >= count) return result.body;
     await delay(200);
   }
-  throw new Error(`Scheduled page check did not complete: ${errors}`);
+  throw new Error(`Scheduled page check did not complete: ${JSON.stringify(last)} ${errors}`);
 }
 
 try {
@@ -1104,6 +1128,76 @@ try {
   assert.equal(priceChange.change_details[0].percent_change, '20.00');
   assert.equal(pageRequests.filter(path => path === '/web-page/pricing').length, 3);
   assert.equal((await b.call('page-sources')).body.changes.length, 0);
+  const largeSource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'pricing_page',
+    url: 'https://example.com/pricing-large', check_interval_minutes: 1440,
+  }) });
+  assert.equal(largeSource.status, 201);
+  const largeRun = await analyst.call(`page-sources/${largeSource.body.id}/check`, { method: 'POST' });
+  assert.equal(largeRun.status, 200);
+  const largeResult = await waitForPageRun(analyst, largeRun.body.id);
+  const largeSnapshot = largeResult.snapshots.find(item => item.source_id === largeSource.body.id);
+  assert(largeSnapshot, 'bounded large response should yield a partial snapshot');
+  assert.equal(largeSnapshot.capture_complete, false);
+  assert.equal(largeSnapshot.capture_limit_kind, 'content_length');
+  assert.equal(largeSnapshot.interpretation_status, 'partial');
+  assert.equal(largeSnapshot.extracted.plans[0].amount, '10');
+  assert.equal((await b.call('page-sources')).body.snapshots.some(item => item.id === largeSnapshot.id), false);
+  const releaseSource = await a.call('page-sources', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, source_type: 'release_notes',
+    url: 'https://example.com/changelog-vercel', check_interval_minutes: 1440,
+  }) });
+  assert.equal(releaseSource.status, 201);
+  const releaseRun = await analyst.call(`page-sources/${releaseSource.body.id}/check`, { method: 'POST' });
+  assert.equal(releaseRun.status, 200);
+  const releaseResult = await waitForPageRun(analyst, releaseRun.body.id);
+  const releaseSnapshot = releaseResult.snapshots.find(item => item.source_id === releaseSource.body.id);
+  assert.equal(releaseSnapshot.interpretation_status, 'confirmed');
+  assert.equal(releaseSnapshot.extracted.entries[0].date_evidence, '25 September');
+  const pageHistoryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await pageHistoryDb.connect();
+    const old = { ...releaseSnapshot.extracted, entries: [], status: 'unconfirmed',
+      reason: 'release_entries_missing', extractor_version: 2 };
+    await pageHistoryDb.query('UPDATE marketrift.source_snapshots SET extracted=$1::jsonb,'
+      + 'interpretation_version=2,interpretation_status=$2,interpretation_reason=$3 '
+      + 'WHERE id=$4 AND tenant_id=$5',
+    [JSON.stringify(old), 'unconfirmed', 'release_entries_missing', releaseSnapshot.id, registeredA.body.tenant_id]);
+    await pageHistoryDb.query('DELETE FROM marketrift.snapshot_interpretations WHERE snapshot_id=$1 AND tenant_id=$2',
+      [releaseSnapshot.id, registeredA.body.tenant_id]);
+    await pageHistoryDb.query('INSERT INTO marketrift.snapshot_interpretations '
+      + '(tenant_id,source_id,snapshot_id,rule_version,status,interpretation_status,reason,extracted,basis) '
+      + "VALUES ($1,$2,$3,2,'completed','unconfirmed','release_entries_missing',$4::jsonb,'initial_capture')",
+    [registeredA.body.tenant_id, releaseSource.body.id, releaseSnapshot.id, JSON.stringify(old)]);
+  } finally { await pageHistoryDb.end(); }
+  assert.equal((await viewer.call(`page-sources/snapshots/${releaseSnapshot.id}/reinterpret`, { method: 'POST' })).status, 403);
+  assert.equal((await b.call(`page-sources/snapshots/${releaseSnapshot.id}/reinterpret`, { method: 'POST' })).status, 404);
+  const reinterpreted = await analyst.call(`page-sources/snapshots/${releaseSnapshot.id}/reinterpret`, { method: 'POST' });
+  assert.equal(reinterpreted.status, 200);
+  assert.equal(reinterpreted.body.rule_version, 3);
+  assert.equal(reinterpreted.body.status, 'pending');
+  let reassessed;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const state = (await a.call('page-sources')).body;
+    reassessed = state.interpretations.find(item => item.id === reinterpreted.body.id);
+    if (reassessed?.status === 'completed') break;
+    await delay(200);
+  }
+  assert.equal(reassessed?.status, 'completed');
+  const revised = (await a.call('page-sources')).body;
+  assert.equal(revised.snapshots.filter(item => item.source_id === releaseSource.body.id).length, 1);
+  assert.equal(revised.snapshots.find(item => item.id === releaseSnapshot.id).interpretation_status, 'confirmed');
+  assert.equal(revised.interpretations.filter(item => item.snapshot_id === releaseSnapshot.id).length, 2);
+  assert.equal((await a.call(`page-sources/${largeSource.body.id}/pause`, { method: 'POST' })).status, 200);
+  assert.equal((await a.call(`page-sources/${releaseSource.body.id}/pause`, { method: 'POST' })).status, 200);
+  // These controlled checks must not consume the scheduler's six-checks-per-minute test budget.
+  const pageClockDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await pageClockDb.connect();
+    await pageClockDb.query("UPDATE marketrift.source_runs SET started_at=now()-interval '2 minutes',"
+      + "finished_at=now()-interval '2 minutes' WHERE tenant_id=$1 AND source_id=ANY($2::uuid[])",
+    [registeredA.body.tenant_id, [largeSource.body.id, releaseSource.body.id]]);
+  } finally { await pageClockDb.end(); }
   assert.equal((await viewer.call('reviewable-signals/refresh', { method: 'POST' })).status, 403);
   assert.equal((await analyst.call('reviewable-signals/refresh', { method: 'POST' })).status, 403);
   assert.equal((await a.call('reviewable-signals/refresh', { method: 'POST', withoutCsrf: true })).status, 403);
@@ -1184,6 +1278,13 @@ try {
   assert.equal((await viewer.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' })).status, 403);
   assert.equal((await analyst.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' })).status, 403);
   assert.equal((await b.call(`page-sources/${autoSource.body.id}/pause`, { method: 'POST' })).status, 404);
+  const schedulerClockDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await schedulerClockDb.connect();
+    await schedulerClockDb.query("UPDATE marketrift.source_runs SET started_at=now()-interval '2 minutes',"
+      + "finished_at=now()-interval '2 minutes' WHERE tenant_id=$1 AND run_kind='web_page' "
+      + "AND status IN ('succeeded','failed')", [registeredA.body.tenant_id]);
+  } finally { await schedulerClockDb.end(); }
   const schedulerA = launchScheduler();
   const schedulerB = launchScheduler();
   const scheduledFirst = await waitForScheduledPageRun(a, autoSource.body.id, 1);
@@ -1564,7 +1665,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

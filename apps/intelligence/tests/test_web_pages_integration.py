@@ -8,6 +8,7 @@ from uuid import uuid4
 import psycopg
 import pytest
 
+from marketrift_intelligence.page_reinterpret import reinterpret_snapshot
 from marketrift_intelligence.web_pages import PageError, check_web_page
 
 pytestmark = pytest.mark.skipif(
@@ -48,7 +49,7 @@ def test_two_tenants_snapshots_changes_replay_and_unextractable(request):
 
     def cleanup():
         with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
-            for table in ("page_changes", "source_snapshots", "source_runs", "sources", "products"):
+            for table in ("page_changes", "snapshot_interpretations", "source_snapshots", "source_runs", "sources", "products"):
                 admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id = ANY(%s::uuid[])", (tenants,))
             admin.execute("DELETE FROM marketrift.tenants WHERE id = ANY(%s::uuid[])", (tenants,))
 
@@ -101,7 +102,7 @@ def test_two_tenants_snapshots_changes_replay_and_unextractable(request):
                                  "WHERE tenant_id = %s ORDER BY version_no", (tenants[0],)).fetchall()
         assert len(versions) == 2 and [row[0] for row in versions] == [1, 2]
         assert versions[0][1] != versions[1][1]
-        assert all(row[2:] == ("confirmed", 2) for row in versions)
+        assert all(row[2:] == ("confirmed", 3) for row in versions)
         details = admin.execute("SELECT change_details FROM marketrift.page_changes "
                                 "WHERE tenant_id = %s", (tenants[0],)).fetchone()[0]
         assert details[0]["percent_change"] == "20.00"
@@ -151,3 +152,87 @@ def test_two_tenants_snapshots_changes_replay_and_unextractable(request):
                                 "WHERE tenant_id = %s", (tenants[1],)).fetchone()[0]
         assert changes[0]["kind"] == "text_changed_unconfirmed"
         assert all(item.get("percent_change") is None for item in changes)
+
+
+def test_reinterpretation_preserves_snapshot_history_and_tenant_boundary(request):
+    tenants = [str(uuid4()) for _ in range(2)]
+    product, source, run, interpretation = (str(uuid4()) for _ in range(4))
+
+    def cleanup():
+        with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+            for table in ("page_changes", "snapshot_interpretations", "source_snapshots", "source_runs", "sources", "products"):
+                admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id = ANY(%s::uuid[])", (tenants,))
+            admin.execute("DELETE FROM marketrift.tenants WHERE id = ANY(%s::uuid[])", (tenants,))
+
+    request.addfinalizer(cleanup)
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        for tenant in tenants:
+            admin.execute("INSERT INTO marketrift.tenants (id,name) VALUES (%s,'reinterpret-test')", (tenant,))
+        admin.execute("INSERT INTO marketrift.products (id,tenant_id,name,kind) "
+                      "VALUES (%s,%s,'Competitor','competitor')", (product, tenants[0]))
+        admin.execute("INSERT INTO marketrift.sources "
+                      "(id,tenant_id,product_id,source_type,url,check_interval_minutes) "
+                      "VALUES (%s,%s,%s,'release_notes','https://example.com/changelog',60)",
+                      (source, tenants[0], product))
+        admin.execute("INSERT INTO marketrift.source_runs (id,tenant_id,source_id,status,run_kind) "
+                      "VALUES (%s,%s,%s,'pending','web_page')", (run, tenants[0], source))
+    job = {"version": 1, "tenant_id": tenants[0], "source_id": source, "run_id": run,
+           "idempotency_key": f"web-page-{run}-v1"}
+    html = ("<main><h1>Changelog</h1><div>25 September</div><article>"
+            "<h2><a href='/changelog/new-feature'>New feature</a></h2>"
+            "<p>The product now supports offline exports.</p></article></main>")
+    assert invoke(job, html)["new_snapshot"] is True
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        snapshot, original_hash, original_text, old_extracted = admin.execute(
+            "SELECT id,content_sha256,normalized_text,extracted FROM marketrift.source_snapshots "
+            "WHERE tenant_id=%s AND source_id=%s", (tenants[0], source)).fetchone()
+        admin.execute("UPDATE marketrift.source_snapshots SET interpretation_version=2,"
+                      "interpretation_status='unconfirmed',interpretation_reason='release_entries_missing',"
+                      "extracted=%s::jsonb WHERE tenant_id=%s AND id=%s",
+                      (json.dumps({**old_extracted, "entries": [], "status": "unconfirmed",
+                                   "reason": "release_entries_missing"}), tenants[0], snapshot))
+        admin.execute("DELETE FROM marketrift.snapshot_interpretations WHERE tenant_id=%s AND snapshot_id=%s",
+                      (tenants[0], snapshot))
+        admin.execute("INSERT INTO marketrift.snapshot_interpretations "
+                      "(tenant_id,source_id,snapshot_id,rule_version,status,interpretation_status,"
+                      "reason,extracted,basis) VALUES (%s,%s,%s,2,'completed','unconfirmed',"
+                      "'release_entries_missing',%s::jsonb,'initial_capture')",
+                      (tenants[0], source, snapshot, json.dumps(old_extracted)))
+        admin.execute("INSERT INTO marketrift.snapshot_interpretations "
+                      "(id,tenant_id,source_id,snapshot_id,rule_version,status,reason,basis) "
+                      "VALUES (%s,%s,%s,%s,3,'pending','queued','stored_markup')",
+                      (interpretation, tenants[0], source, snapshot))
+        revision_before = admin.execute("SELECT requested_revision FROM marketrift.signal_reconcile_sources "
+                                        "WHERE tenant_id=%s AND source_id=%s",
+                                        (tenants[0], source)).fetchone()[0]
+    replay = {"version": 1, "tenant_id": tenants[0], "source_id": source,
+              "snapshot_id": str(snapshot), "interpretation_id": interpretation,
+              "rule_version": 3, "idempotency_key": f"page-reinterpret-{interpretation}-v1"}
+    async def work(payload):
+        return await reinterpret_snapshot(payload)
+
+    def run_async(payload):
+        return asyncio.run(work(payload), loop_factory=asyncio.SelectorEventLoop) if os.name == "nt" else asyncio.run(work(payload))
+
+    with pytest.raises(PageError, match="interpretation_not_in_tenant"):
+        run_async({**replay, "tenant_id": tenants[1]})
+    assert run_async(replay)["status"] == "completed"
+    assert run_async(replay)["replayed"] is True
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        rows = admin.execute("SELECT version_no,content_sha256,normalized_text,interpretation_version,"
+                             "interpretation_status,extracted FROM marketrift.source_snapshots "
+                             "WHERE tenant_id=%s AND source_id=%s", (tenants[0], source)).fetchall()
+        assert len(rows) == 1
+        assert rows[0][:4] == (1, original_hash, original_text, 3)
+        assert rows[0][4] == "confirmed"
+        assert rows[0][5]["entries"][0]["date_evidence"] == "25 September"
+        history = admin.execute("SELECT rule_version,status,interpretation_status "
+                                "FROM marketrift.snapshot_interpretations WHERE tenant_id=%s "
+                                "AND snapshot_id=%s ORDER BY rule_version", (tenants[0], snapshot)).fetchall()
+        assert history == [(2, "completed", "unconfirmed"), (3, "completed", "confirmed")]
+        assert admin.execute("SELECT count(*) FROM marketrift.page_changes WHERE tenant_id=%s",
+                             (tenants[0],)).fetchone()[0] == 0
+        revision_after = admin.execute("SELECT requested_revision FROM marketrift.signal_reconcile_sources "
+                                       "WHERE tenant_id=%s AND source_id=%s",
+                                       (tenants[0], source)).fetchone()[0]
+        assert revision_after == revision_before + 1

@@ -13,8 +13,9 @@ from .g2_reviews import sync_g2_reviews
 from .github_discussions import sync_github_discussions
 from .github_issues import sync_github_issues
 from .ingest import ingest, mark_failed
-from .steam_reviews import sync_steam_reviews
+from .page_reinterpret import reinterpret_snapshot
 from .source_discovery import discover
+from .steam_reviews import sync_steam_reviews
 from .web_pages import check_web_page, e2e_fetch_public_page
 
 logger = logging.getLogger(__name__)
@@ -79,6 +80,10 @@ async def process_web_page(job, _token):
     return await index_after(job, result)
 
 
+async def process_page_reinterpret(job, _token):
+    return await reinterpret_snapshot(job.data)
+
+
 async def process_index(job, _token):
     return await index_source(job.data)
 
@@ -104,13 +109,16 @@ async def main() -> None:
     steam_worker = Worker("steam-reviews", process_steam, {"connection": os.environ["REDIS_URL"]})
     g2_worker = Worker("g2-reviews", process_g2, {"connection": os.environ["REDIS_URL"]})
     web_page_worker = Worker("web-pages", process_web_page, {"connection": os.environ["REDIS_URL"]})
+    reinterpret_worker = Worker("page-reinterpret", process_page_reinterpret,
+                                {"connection": os.environ["REDIS_URL"]})
     index_worker = Worker("evidence-index", process_index, {"connection": os.environ["REDIS_URL"]})
     discovery_worker = Worker("source-discovery", process_discovery, {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
         await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(), discussions_worker.close(),
-                             steam_worker.close(), g2_worker.close(), web_page_worker.close(), index_worker.close(),
+                             steam_worker.close(), g2_worker.close(), web_page_worker.close(),
+                             reinterpret_worker.close(), index_worker.close(),
                              discovery_worker.close())
 
 

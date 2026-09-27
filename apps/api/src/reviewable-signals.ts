@@ -269,6 +269,10 @@ export async function signalFacts(db: Db, client: PoolClient): Promise<Fact[]> {
       WHERE s.enabled AND s.source_type IN ('pricing_page','release_notes')
         AND prev.interpretation_version >= 2 AND next.interpretation_version >= 2
         AND prev.interpretation_status='confirmed' AND next.interpretation_status='confirmed'
+        AND NOT EXISTS (SELECT 1 FROM marketrift.snapshot_interpretations i
+          WHERE i.tenant_id=c.tenant_id AND i.snapshot_id IN (prev.id,next.id)
+            AND i.basis <> 'initial_capture' AND i.status='completed'
+            AND i.finished_at > c.detected_at)
       ORDER BY c.detected_at DESC, c.id LIMIT 2001`);
     if (pages.length > 2000) throw new ConflictException('Mais de 2000 mudanças; reduza o lote antes de gerar sinais');
     const preliminaries = pages.flatMap(row => row.change_details.map(detail => pageFact(row, detail, [row.product_id]))

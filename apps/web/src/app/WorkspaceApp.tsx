@@ -27,12 +27,18 @@ type Document = { id: string; source_id: string; product_id: string; product_nam
 type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
 type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null; trigger_kind: 'manual' | 'scheduled' };
 type PagePlan = { name: string; amount: string | null; currency: string | null; period: string | null; conditions: string; confirmed: boolean; evidence: string };
-type PageEntry = { title: string; date: string | null; url: string; evidence: string };
+type PageEntry = { title: string; date: string | null; url: string; evidence: string;
+  title_evidence?: string; date_evidence?: string | null; url_evidence?: string };
 type PageExtract = { kind: string; text: string; status: string; reason?: string; excerpt: string; plans?: PagePlan[]; entries?: PageEntry[] };
-type PageSnapshot = { id: string; source_id: string; version_no: number; final_url: string; content_sha256: string; normalized_text: string; extracted: PageExtract; fetched_at: string; interpretation_version: number | null; interpretation_status: string; interpretation_reason: string };
+type PageSnapshot = { id: string; source_id: string; version_no: number; final_url: string; content_sha256: string; normalized_text: string; extracted: PageExtract; fetched_at: string; interpretation_version: number | null; interpretation_status: string; interpretation_reason: string;
+  can_reinterpret: boolean; markup_observed_at: string | null; capture_complete: boolean; capture_limit_kind: string | null };
+type PageInterpretation = { id: string; source_id: string; snapshot_id: string; rule_version: number;
+  status: string; interpretation_status: string | null; reason: string; basis: string;
+  created_at: string; finished_at: string | null };
 type PageDetail = { kind: string; name?: string; previous?: string | PagePlan | PageEntry | null; current?: string | PagePlan | PageEntry | null; percent_change?: string | null };
 type PageChange = { id: string; source_id: string; previous_snapshot_id: string; current_snapshot_id: string; change_details: PageDetail[]; detected_at: string };
-type PageData = { sources: PageSource[]; runs: PageRun[]; snapshots: PageSnapshot[]; changes: PageChange[] };
+type PageData = { sources: PageSource[]; runs: PageRun[]; snapshots: PageSnapshot[]; changes: PageChange[];
+  interpretations: PageInterpretation[]; active_rule_version: number };
 type DiscoveryProfile = { product_id: string; product_name: string; official_domain: string; aliases: string[];
   country_code: string | null; languages: string[]; official_urls: string[]; identity_version: number;
   discovery_paused: boolean };
@@ -66,7 +72,8 @@ export function WorkspaceNavigation({ view }: { view: View }) {
       {item.title}</Link>)}
   </nav>;
 }
-const emptyPageData: PageData = { sources: [], runs: [], snapshots: [], changes: [] };
+const emptyPageData: PageData = { sources: [], runs: [], snapshots: [], changes: [],
+  interpretations: [], active_rule_version: 3 };
 const emptyDiscoveryData: DiscoveryData = { profiles: [], runs: [], candidates: [], search_provider: 'not_configured' };
 function pageEvidence(value: PageDetail['previous']): string {
   if (!value) return 'ausente nesta versão';
@@ -89,6 +96,9 @@ const interpretationReasons: Record<string, string> = {
   price_fields_missing: 'Plano, valor, moeda ou período não estão explícitos.',
   some_plans_unconfirmed: 'Alguns planos não têm todos os campos explícitos.',
   price_plans_confirmed: 'Planos com valor, moeda e período explícitos.',
+  capture_truncated: 'Somente uma parte limitada da resposta pôde ser lida. A cobertura não confirma a página inteira.',
+  historical_markup_unavailable: 'O HTML com links e datas não foi preservado nesta captura antiga.',
+  historical_markup_text_mismatch: 'O HTML disponível não corresponde ao texto histórico; interpretação bloqueada.',
 };
 const pageErrorReasons: Record<string, string> = {
   access_denied: 'A origem recusou o acesso.', robots_disallowed: 'A origem não permite esta coleta em robots.txt.',
@@ -560,11 +570,25 @@ export default function WorkspaceApp({ view }: { view: View }) {
               })}>Verificar agora (1 página)</button>}
               {snapshots.length > 0 && <div className="page-history"><h3>Capturas verificáveis</h3><ul>{snapshots.slice(0, 5).map(snapshot => <li key={snapshot.id}>
                 Versão {snapshot.version_no} · {new Date(snapshot.fetched_at).toLocaleString('pt-BR')} · hash <code>{snapshot.content_sha256.slice(0, 12)}</code> · <a href={snapshot.final_url} target="_blank" rel="noreferrer">URL final ↗</a>
-                <p>Interpretação: <strong>{interpretationStatus[snapshot.interpretation_status] ?? snapshot.interpretation_status}</strong> · {interpretationReasons[snapshot.interpretation_reason] ?? snapshot.interpretation_reason}</p>
+                <p>Interpretação ativa: <strong>{interpretationStatus[snapshot.interpretation_status] ?? snapshot.interpretation_status}</strong> · regra v{snapshot.interpretation_version ?? 'legada'} · {interpretationReasons[snapshot.interpretation_reason] ?? snapshot.interpretation_reason}</p>
+                {!snapshot.capture_complete && <p className="coverage-warning">Captura parcial: o limite de leitura foi atingido por {snapshot.capture_limit_kind === 'content_length' ? 'Content-Length' : 'bytes recebidos'}. Nenhuma mudança desta captura é confirmada.</p>}
+                {!snapshot.can_reinterpret && snapshot.interpretation_version !== pageData.active_rule_version &&
+                  <p>Esta captura antiga não guarda o HTML com links e datas. Verifique a página novamente quando permitido; se o texto estiver igual, não será criada outra versão. Depois você poderá revisar a interpretação usando a nova observação, identificada por data própria.</p>}
+                {snapshot.markup_observed_at && new Date(snapshot.markup_observed_at).getTime() > new Date(snapshot.fetched_at).getTime() + 1000 &&
+                  <p>HTML estrutural observado novamente em {new Date(snapshot.markup_observed_at).toLocaleString('pt-BR')}; ele não pertence à captura original.</p>}
+                {session.role !== 'viewer' && snapshot.can_reinterpret && snapshot.interpretation_version !== pageData.active_rule_version &&
+                  <button className="small" disabled={busy} onClick={() => void run(async () => {
+                    await api(`page-sources/snapshots/${snapshot.id}/reinterpret`, session, { method: 'POST' });
+                    await refresh(session);
+                  })}>Reavaliar interpretação (regra v{pageData.active_rule_version})</button>}
+                {pageData.interpretations.filter(item => item.snapshot_id === snapshot.id).length > 0 &&
+                  <p>Histórico de regras: {pageData.interpretations.filter(item => item.snapshot_id === snapshot.id)
+                    .map(item => `v${item.rule_version} ${item.status}${item.interpretation_status ? ` (${interpretationStatus[item.interpretation_status] ?? item.interpretation_status})` : ''}${item.basis === 'later_same_text_capture' ? ' — HTML de verificação posterior' : ''}`)
+                    .join('; ')}.</p>}
                 {snapshot.interpretation_status === 'needs_review' ? <p>Trecho histórico para revisão: “{snapshot.extracted.excerpt}”</p> : <>
                   {snapshot.interpretation_status !== 'confirmed' && <p>Trecho da página: “{snapshot.extracted.excerpt}”</p>}
                   {snapshot.extracted.plans?.map(plan => <p key={plan.name}><strong>{plan.name}</strong>: {plan.confirmed ? `${plan.currency} ${plan.amount} / ${plan.period}` : 'preço não confirmado'} · trecho: “{plan.evidence}”</p>)}
-                  {snapshot.extracted.entries?.map((entry, index) => <p key={`${entry.url}-${index}`}><strong>{entry.title}</strong> · {entry.date ?? 'data não informada'} · <a href={entry.url} target="_blank" rel="noreferrer">entrada confirmada ↗</a></p>)}
+                  {snapshot.extracted.entries?.map((entry, index) => <p key={`${entry.url}-${index}`}><strong>{entry.title}</strong> · {entry.date ?? 'data não informada'} · <a href={entry.url} target="_blank" rel="noreferrer">entrada observada ↗</a> · evidência: “{entry.evidence}”{entry.date_evidence && <> · data literal: “{entry.date_evidence}”</>}</p>)}
                 </>}
               </li>)}</ul></div>}
               {changes.length > 0 && <div className="page-history"><h3>Mudanças observadas</h3>{changes.slice(0, 5).map(change => <article key={change.id}>

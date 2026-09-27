@@ -33,6 +33,7 @@ export class PageScheduler {
         + 'JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id '
         + "WHERE r.run_kind = 'web_page' AND r.status = 'pending' "
         + "AND s.monitoring_enabled AND s.enabled AND r.started_at < now() - interval '15 seconds' "
+        + (process.env.MARKETRIFT_TEST_MODE === '1' ? '' : "AND s.access_environment IS DISTINCT FROM 'sandbox' ")
         + (testTenant ? 'AND r.tenant_id = $1 ' : '')
         + 'ORDER BY r.started_at LIMIT 1 FOR UPDATE OF r SKIP LOCKED', scope);
       if (oldPending.rows[0]) {
@@ -50,6 +51,7 @@ export class PageScheduler {
             'SELECT s.id, s.tenant_id, s.check_interval_minutes FROM marketrift.sources s '
             + "WHERE s.source_type IN ('pricing_page', 'release_notes') AND s.enabled "
             + 'AND s.monitoring_enabled AND s.next_check_at <= now() '
+            + (process.env.MARKETRIFT_TEST_MODE === '1' ? '' : "AND s.access_environment IS DISTINCT FROM 'sandbox' ")
             + 'AND NOT EXISTS (SELECT 1 FROM marketrift.source_runs r WHERE r.tenant_id = s.tenant_id '
             + "AND r.source_id = s.id AND r.run_kind = 'web_page' AND r.status IN ('pending', 'running')) "
             + 'AND NOT EXISTS (SELECT 1 FROM marketrift.source_runs r WHERE r.tenant_id = s.tenant_id '

@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
+from html import escape
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
@@ -40,7 +41,15 @@ RELEASE_EVIDENCE = re.compile(r"(?:\b(?:release|version|v\d+(?:\.\d+)*|fixed|add
                               r"atualizad[oa])\b)", re.IGNORECASE)
 PRICING_CONTEXT = re.compile(r"(?:pricing|prices|plans?[-_/ ]?(?:and[-_/ ]?)?pricing|"
                              r"pre[cç]os?|planos?)", re.IGNORECASE)
-EXTRACTOR_VERSION = 2
+EXTRACTOR_VERSION = 3
+PRODUCT_CHANGE_EVIDENCE = re.compile(
+    r"\b(?:fixed|added|adds|improved|changed|shipped|supports|enabled|enables|allows|logs|"
+    r"removes|removed|introduced)\b|\b(?:is|are) now available\b|\bcan now\b|\bno longer\b",
+    re.IGNORECASE)
+DATE_LITERAL = re.compile(
+    r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|"
+    r"November|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\b|\b\d{4}-\d{2}-\d{2}\b",
+    re.IGNORECASE)
 
 
 class PageError(Exception):
@@ -114,6 +123,44 @@ def request_pinned(url: str, ip: str) -> tuple[int, dict[str, str], bytes]:
         connection.close()
 
 
+def request_pinned_capture(url: str, ip: str) -> tuple[int, dict[str, str], bytes]:
+    """Capture a bounded prefix; an oversized success is explicitly marked incomplete."""
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    connection = http.client.HTTPSConnection(host, 443, timeout=8, context=ssl.create_default_context())
+    connection._create_connection = lambda _address, timeout, source_address=None: socket.create_connection(
+        (ip, 443), timeout, source_address)
+    try:
+        connection.request("GET", parts.path, headers={"Host": host, "User-Agent": USER_AGENT,
+                           "Accept": "text/html, text/plain;q=0.8", "Accept-Encoding": "identity",
+                           "Connection": "close"})
+        response = connection.getresponse()
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        if response.status != 200:
+            return response.status, headers, b""
+        declared = response.length
+        chunks: list[bytes] = []
+        size = 0
+        ceiling = MAX_BYTES if declared is not None and declared > MAX_BYTES else MAX_BYTES + 1
+        while size < ceiling:
+            chunk = response.read(min(65_536, ceiling - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            chunks.append(chunk)
+        incomplete = declared is not None and declared > MAX_BYTES or size > MAX_BYTES
+        if declared is not None and size < min(declared, MAX_BYTES):
+            raise PageError("response_truncated")
+        if incomplete:
+            headers["x-marketrift-capture-complete"] = "false"
+            headers["x-marketrift-limit-kind"] = "content_length" if declared and declared > MAX_BYTES else "actual_bytes"
+        return response.status, headers, b"".join(chunks)[:MAX_BYTES]
+    except (OSError, ssl.SSLError, http.client.HTTPException) as error:
+        raise PageError("network_failure") from error
+    finally:
+        connection.close()
+
+
 def retry_after(headers: dict[str, str]) -> datetime | None:
     raw = headers.get("retry-after")
     if not raw:
@@ -129,7 +176,8 @@ def retry_after(headers: dict[str, str]) -> datetime | None:
 
 def fetch_public_page(start_url: str, *, lookup: Callable = socket.getaddrinfo,
                       request: Callable = request_pinned,
-                      last_checked_at: datetime | None = None) -> tuple[str, str]:
+                      last_checked_at: datetime | None = None,
+                      return_details: bool = False) -> tuple:
     """Fetch robots and one HTML page, pinning every connection to a checked public IP."""
     url = canonical_url(start_url)
     host = urlsplit(url).hostname or ""
@@ -141,8 +189,16 @@ def fetch_public_page(start_url: str, *, lookup: Callable = socket.getaddrinfo,
     elif status != 200:
         raise PageError("robots_unavailable", retry_after(headers))
     else:
+        if headers.get("x-marketrift-capture-complete") == "false":
+            raise PageError("robots_unavailable")
         parser = RobotFileParser()
-        parser.parse(body.decode("utf-8", errors="replace").splitlines())
+        try:
+            robots_text = body.decode("utf-8-sig")
+        except UnicodeDecodeError as error:
+            raise PageError("robots_unavailable") from error
+        if "\x00" in robots_text or not re.search(r"(?im)^\s*user-agent\s*:", robots_text):
+            raise PageError("robots_unavailable")
+        parser.parse(robots_text.splitlines())
         if not parser.can_fetch(USER_AGENT, url):
             raise PageError("robots_disallowed")
         delay = parser.crawl_delay(USER_AGENT)
@@ -174,13 +230,22 @@ def fetch_public_page(start_url: str, *, lookup: Callable = socket.getaddrinfo,
             raise PageError("unsupported_content_type")
         charset = re.search(r"charset=([a-z0-9_-]+)", content_type)
         try:
-            return url, body.decode(charset.group(1) if charset else "utf-8", errors="replace")
+            html = body.decode(charset.group(1) if charset else "utf-8", errors="replace")
+            if return_details:
+                return url, html, headers.get("x-marketrift-capture-complete") != "false", \
+                    headers.get("x-marketrift-limit-kind")
+            return url, html
         except LookupError as error:
             raise PageError("unsupported_charset") from error
     raise PageError("redirect_limit")
 
 
-def e2e_fetch_public_page(start_url: str, *, last_checked_at: datetime | None = None) -> tuple[str, str]:
+def capture_public_page(start_url: str, *, last_checked_at: datetime | None = None) -> tuple:
+    return fetch_public_page(start_url, request=request_pinned_capture, last_checked_at=last_checked_at,
+                             return_details=True)
+
+
+def e2e_fetch_public_page(start_url: str, *, last_checked_at: datetime | None = None) -> tuple:
     """E2E-only transport. The public URL still passes the normal URL and redirect checks."""
     if os.getenv("MARKETRIFT_TEST_MODE") != "1":
         raise PageError("test_transport_disabled")
@@ -199,14 +264,23 @@ def e2e_fetch_public_page(start_url: str, *, last_checked_at: datetime | None = 
         try:
             connection.request("GET", "/web-page" + urlsplit(url).path)
             response = connection.getresponse()
-            body = response.read(MAX_BYTES + 1)
-            if len(body) > MAX_BYTES:
-                raise PageError("response_too_large")
-            return response.status, {key.lower(): value for key, value in response.getheaders()}, body
+            headers = {key.lower(): value for key, value in response.getheaders()}
+            if response.status != 200:
+                return response.status, headers, b""
+            declared = response.length
+            ceiling = MAX_BYTES if declared is not None and declared > MAX_BYTES else MAX_BYTES + 1
+            body = response.read(ceiling)
+            if declared is not None and len(body) < min(declared, MAX_BYTES):
+                raise PageError("response_truncated")
+            if declared is not None and declared > MAX_BYTES or len(body) > MAX_BYTES:
+                headers["x-marketrift-capture-complete"] = "false"
+                headers["x-marketrift-limit-kind"] = "content_length" if declared and declared > MAX_BYTES else "actual_bytes"
+            return response.status, headers, body[:MAX_BYTES]
         finally:
             connection.close()
 
-    return fetch_public_page(start_url, lookup=lookup, request=request, last_checked_at=last_checked_at)
+    return fetch_public_page(start_url, lookup=lookup, request=request,
+                             last_checked_at=last_checked_at, return_details=True)
 
 
 @dataclass
@@ -214,6 +288,7 @@ class Node:
     tag: str
     attrs: dict[str, str] = field(default_factory=dict)
     children: list["Node | str"] = field(default_factory=list)
+    parent: "Node | None" = field(default=None, repr=False, compare=False)
 
 
 class TreeParser(HTMLParser):
@@ -223,7 +298,7 @@ class TreeParser(HTMLParser):
         self.stack = [self.root]
 
     def handle_starttag(self, tag, attrs):
-        node = Node(tag, {key: value or "" for key, value in attrs})
+        node = Node(tag, {key: value or "" for key, value in attrs}, parent=self.stack[-1])
         self.stack[-1].children.append(node)
         if tag not in ("br", "hr", "img", "meta", "link", "input", "source", "wbr"):
             self.stack.append(node)
@@ -278,9 +353,104 @@ def content_blocks(root: Node) -> list[str]:
     return blocks
 
 
-def page_content(html: str, kind: str, final_url: str) -> dict:
+def reparse_markup(html: str) -> str | None:
+    """Keep only bounded public structural markup needed for later local reinterpretation."""
+    parser = TreeParser()
+    parser.feed(html)
+    root = next(descendants(parser.root, "main"), None) or next(descendants(parser.root, "body"), parser.root)
+    allowed = {"main", "article", "section", "div", "ul", "li", "h1", "h2", "h3", "h4",
+               "p", "span", "time", "a", "strong", "em"}
+
+    def render(node: Node | str) -> str:
+        if isinstance(node, str):
+            return escape(node)
+        if ignored(node):
+            return ""
+        inner = "".join(render(child) for child in node.children)
+        if node.tag not in allowed:
+            return inner
+        attrs = "".join(f' {name}="{escape(node.attrs[name], quote=True)}"'
+                        for name in ("class", "id", "href", "datetime") if node.attrs.get(name))
+        return f"<{node.tag}{attrs}>{inner}</{node.tag}>"
+
+    markup = render(root)
+    return markup if len(markup.encode("utf-8")) <= 300_000 else None
+
+
+def release_date(card: Node) -> tuple[str | None, str | None]:
+    time_node = next(descendants(card, "time"), None)
+    if time_node:
+        literal = node_text(time_node)
+        return time_node.attrs.get("datetime") or literal or None, literal or time_node.attrs.get("datetime")
+    current = card
+    for _ in range(5):
+        parent = current.parent
+        if parent is None:
+            break
+        index = next(index for index, child in enumerate(parent.children) if child is current)
+        for sibling in reversed(parent.children[max(0, index - 2):index]):
+            if isinstance(sibling, Node) and not any(True for _ in descendants(sibling, "article")):
+                value = node_text(sibling)[:150]
+                match = DATE_LITERAL.search(value)
+                if match:
+                    return match.group(), match.group()
+        current = parent
+    return None, None
+
+
+def release_entries(root: Node, final_url: str) -> tuple[list[dict], int]:
+    cards = list(descendants(root, "article"))
+    cards.extend(node for node in descendants(root, "li")
+                 if not any(True for _ in descendants(node, "article")) and
+                 any(True for _ in descendants(node, "h2")))
+    entries: list[dict] = []
+    candidates = 0
+    seen: set[tuple[str, str]] = set()
+    source_path = urlsplit(final_url).path.rstrip("/") + "/"
+    for card in cards[:100]:
+        heading = next((node for node in descendants(card) if node.tag in ("h1", "h2", "h3", "h4")), None)
+        if heading is None:
+            continue
+        title = node_text(heading)[:300]
+        text = node_text(card)[:1000]
+        detail = text[len(title):].strip() if text.startswith(title) else text
+        marker = card.attrs.get("class", "").lower()
+        if (not title or len(detail) < 8 or not PRODUCT_CHANGE_EVIDENCE.search(detail)
+                or any(word in marker for word in ("blog", "news", "insight", "editorial"))
+                or "author:" in detail.lower() and "read more" in detail.lower()):
+            continue
+        candidates += 1
+        date, date_quote = release_date(card)
+        if not date:
+            continue
+        for anchor in descendants(card, "a"):
+            href = anchor.attrs.get("href", "")
+            if not href:
+                continue
+            try:
+                link = canonical_url(urljoin(final_url, href), expected_host=urlsplit(final_url).hostname)
+            except PageError:
+                continue
+            path = urlsplit(link).path
+            if path.startswith("/docs/") or link == final_url or not (path.startswith(source_path) or re.search(
+                    r"/(?:changelog|releases?|release-notes|updates)/[^/]+", path)):
+                continue
+            key = (link, title)
+            if key not in seen:
+                entries.append({"title": title, "date": date, "url": link,
+                                "evidence": text[:500], "title_evidence": title,
+                                "date_evidence": date_quote, "url_evidence": href})
+                seen.add(key)
+            break
+    return entries[:50], candidates
+
+
+def page_content(html: str, kind: str, final_url: str, *, complete: bool = True) -> dict:
     if len(html) > MAX_BYTES:
         raise PageError("response_too_large")
+    if not complete:
+        endings = list(re.finditer(r"</(?:article|section|div|main)\s*>", html, re.IGNORECASE))
+        html = html[:endings[-1].end()] if endings else html
     parser = TreeParser()
     parser.feed(html)
     root = next(descendants(parser.root, "main"), None) or next(descendants(parser.root, "body"), parser.root)
@@ -291,40 +461,14 @@ def page_content(html: str, kind: str, final_url: str) -> dict:
     heading = next(descendants(root, "h1"), None)
     context = (urlsplit(final_url).path + " " + (node_text(heading) if heading else ""))
     result: dict = {"kind": kind, "text": text, "status": "unconfirmed", "reason": "source_type_unverified",
-                    "extractor_version": EXTRACTOR_VERSION, "excerpt": text[:500]}
+                    "extractor_version": EXTRACTOR_VERSION, "excerpt": text[:500],
+                    "capture_complete": complete}
     if kind == "release_notes":
-        entries = []
         if not RELEASE_CONTEXT.search(context):
-            result.update(entries=entries, reason="release_context_missing")
+            result.update(entries=[], reason="release_context_missing")
             return result
-        candidate_count = 0
-        for article in descendants(root, "article"):
-            heading = next((node for node in descendants(article) if node.tag in ("h1", "h2", "h3", "h4")), None)
-            if not heading:
-                continue
-            title = node_text(heading)[:300]
-            evidence = node_text(article)[:500]
-            marker = article.attrs.get("class", "").lower()
-            if any(word in marker for word in ("blog", "news", "insight", "editorial")) or (
-                    "author:" in evidence.lower() and "read more" in evidence.lower()):
-                continue
-            if not title or not RELEASE_EVIDENCE.search(evidence):
-                continue
-            candidate_count += 1
-            date_node = next(descendants(article, "time"), None)
-            date = (date_node.attrs.get("datetime") or node_text(date_node))[:80] if date_node else None
-            anchor = next((node for node in descendants(article, "a") if node.attrs.get("href")), None)
-            if not anchor:
-                continue
-            link = urljoin(final_url, anchor.attrs["href"])
-            try:
-                link = canonical_url(link, expected_host=urlsplit(final_url).hostname)
-            except PageError:
-                continue
-            if link == final_url:
-                continue
-            entries.append({"title": title, "date": date, "url": link, "evidence": evidence})
-        result["entries"] = entries[:50]
+        entries, candidate_count = release_entries(root, final_url)
+        result["entries"] = entries
         result["status"] = "confirmed" if entries and len(entries) == candidate_count else (
             "partial" if entries else "unconfirmed")
         result["reason"] = ("release_entries_confirmed" if result["status"] == "confirmed" else
@@ -375,6 +519,9 @@ def page_content(html: str, kind: str, final_url: str) -> dict:
                             "some_plans_unconfirmed" if confirmed_count else "price_fields_missing")
     else:
         raise PageError("invalid_source_type")
+    if not complete:
+        result["status"] = "partial" if result.get("entries") or result.get("plans") else "unconfirmed"
+        result["reason"] = "capture_truncated"
     return result
 
 
@@ -463,7 +610,7 @@ async def mark_failed(job: dict, error: PageError) -> None:
                     (delay_seconds, error.retry_at, job["tenant_id"], job["source_id"]))
 
 
-async def check_web_page(payload: object, fetcher: Callable = fetch_public_page) -> dict:
+async def check_web_page(payload: object, fetcher: Callable = capture_public_page) -> dict:
     job = validate_job(payload)
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
@@ -489,8 +636,12 @@ async def check_web_page(payload: object, fetcher: Callable = fetch_public_page)
         await connection.execute("UPDATE marketrift.source_runs SET status = 'running', started_at = now() "
                                  "WHERE tenant_id = %s AND id = %s", (job["tenant_id"], job["run_id"]))
     try:
-        final_url, html = await asyncio.to_thread(fetcher, source[0], last_checked_at=source[2])
-        content = page_content(html, source[1], final_url)
+        fetched = await asyncio.to_thread(fetcher, source[0], last_checked_at=source[2])
+        final_url, html = fetched[:2]
+        complete = fetched[2] if len(fetched) > 2 else True
+        limit_kind = fetched[3] if len(fetched) > 3 else None
+        content = page_content(html, source[1], final_url, complete=complete)
+        markup = reparse_markup(html)
         digest = semantic_hash(content)
         async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
             await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
@@ -509,12 +660,22 @@ async def check_web_page(payload: object, fetcher: Callable = fetch_public_page)
                 inserted = await (await connection.execute(
                     "INSERT INTO marketrift.source_snapshots (tenant_id, source_id, run_id, source_url, "
                     "storage_key, content_sha256, version_no, final_url, normalized_text, extracted, "
-                    "interpretation_version, interpretation_status, interpretation_reason) "
-                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s) RETURNING id",
+                    "interpretation_version, interpretation_status, interpretation_reason, reparse_markup, "
+                    "markup_observed_at, capture_complete, capture_limit_kind) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, "
+                    "CASE WHEN %s::text IS NULL THEN NULL ELSE now() END, %s, %s) RETURNING id",
                     (job["tenant_id"], job["source_id"], job["run_id"], source[0],
                      f"db:page-snapshot/{job['run_id']}", digest, (previous[1] + 1) if previous else 1,
                      final_url, content["text"], json.dumps(content, ensure_ascii=False),
-                     EXTRACTOR_VERSION, content["status"], content["reason"]))).fetchone()
+                     EXTRACTOR_VERSION, content["status"], content["reason"], markup, markup,
+                     complete, limit_kind))).fetchone()
+                await connection.execute(
+                    "INSERT INTO marketrift.snapshot_interpretations "
+                    "(tenant_id,source_id,snapshot_id,rule_version,status,interpretation_status,reason,"
+                    "extracted,basis,finished_at) VALUES (%s,%s,%s,%s,'completed',%s,%s,%s::jsonb,"
+                    "'initial_capture',now())",
+                    (job["tenant_id"], job["source_id"], inserted[0], EXTRACTOR_VERSION,
+                     content["status"], content["reason"], json.dumps(content, ensure_ascii=False)))
                 if previous:
                     details = compare_pages(previous[3], content,
                                             before_trusted=previous[6] == EXTRACTOR_VERSION and
@@ -528,6 +689,12 @@ async def check_web_page(payload: object, fetcher: Callable = fetch_public_page)
                         "ON CONFLICT DO NOTHING",
                         (job["tenant_id"], job["source_id"], previous[0], inserted[0],
                          json.dumps(details, ensure_ascii=False)))
+            elif markup and complete and previous:
+                # A later identical-text observation supplies markup for review, not a new historical snapshot.
+                await connection.execute(
+                    "UPDATE marketrift.source_snapshots SET reparse_markup=%s,markup_observed_at=now() "
+                    "WHERE tenant_id=%s AND id=%s AND reparse_markup IS NULL",
+                    (markup, job["tenant_id"], previous[0]))
             await connection.execute(
                 "UPDATE marketrift.source_runs SET status = 'succeeded', documents_seen = 1, "
                 "documents_new = %s, finished_at = now() WHERE tenant_id = %s AND id = %s",

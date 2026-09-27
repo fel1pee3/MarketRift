@@ -7,6 +7,7 @@ import { Accounts, Role } from '../src/accounts';
 import { Db } from '../src/db';
 import { Jobs } from '../src/queue';
 import { makeWebPageJob } from '../src/web-page-job';
+import { makePageReinterpretJob } from '../src/page-reinterpret-job';
 import { publicPageUrl } from '../src/web-page-url';
 import { WebPagesController } from '../src/web-pages';
 
@@ -32,6 +33,40 @@ test('TypeScript page job is accepted by Python worker contract', () => {
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(result.stdout.trim(), 'valid');
+});
+
+test('reinterpretation job carries IDs only and matches the Python consumer contract', () => {
+  const snapshot = '36d33e8e-650a-429f-b31d-d7cd976da20c';
+  const interpretation = 'f3e56e4f-4186-44c3-a30d-2e8af72f50b9';
+  const job = makePageReinterpretJob(tenant, source, snapshot, interpretation);
+  assert.deepEqual(Object.keys(job).sort(), ['idempotency_key', 'interpretation_id', 'rule_version',
+    'snapshot_id', 'source_id', 'tenant_id', 'version']);
+  const python = join(__dirname, '../../intelligence/.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
+  const result = spawnSync(python, ['-c', 'import json,sys; from marketrift_intelligence.page_reinterpret import validate_job;'
+    + ' validate_job(json.load(sys.stdin)); print("valid")'], {
+    input: JSON.stringify(job), encoding: 'utf8', cwd: join(__dirname, '../../intelligence'),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.stdout.trim(), 'valid');
+});
+
+test('reinterpretation refuses historical capture without markup and foreign tenant', async () => {
+  const snapshot = '36d33e8e-650a-429f-b31d-d7cd976da20c';
+  const accounts = { principal: async (_request: Request, allowed: Role[]) => {
+    assert(allowed.includes('analyst'));
+    return { tenantId: tenant, role: 'analyst' };
+  } } as unknown as Accounts;
+  const missing = { tenant: async (_tenantId: string, callback: (client: object) => Promise<unknown>) =>
+    callback({}), rows: async () => [] } as unknown as Db;
+  await assert.rejects(new WebPagesController(missing, {} as Jobs, accounts)
+    .reinterpret({} as Request, snapshot), { status: 404 });
+  const old = { tenant: async (_tenantId: string, callback: (client: object) => Promise<unknown>) =>
+    callback({}), rows: async () => [{ id: snapshot, source_id: source, can_reinterpret: false }] } as unknown as Db;
+  await assert.rejects(new WebPagesController(old, {} as Jobs, accounts)
+    .reinterpret({} as Request, snapshot), { status: 422 });
+  const viewer = { principal: async () => { throw Object.assign(new Error('Forbidden'), { status: 403 }); } } as unknown as Accounts;
+  await assert.rejects(new WebPagesController(old, {} as Jobs, viewer)
+    .reinterpret({} as Request, snapshot), { status: 403 });
 });
 
 test('only owner/admin create; analyst checks; viewer only reads', async () => {

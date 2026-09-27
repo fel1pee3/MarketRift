@@ -145,6 +145,10 @@ const pageEventsBase = `WITH raw AS (
   CROSS JOIN LATERAL jsonb_array_elements(c.change_details) AS detail(value)
   WHERE prev.interpretation_version >= 2 AND next.interpretation_version >= 2
     AND prev.interpretation_status = 'confirmed' AND next.interpretation_status = 'confirmed'
+    AND NOT EXISTS (SELECT 1 FROM marketrift.snapshot_interpretations i
+      WHERE i.tenant_id=c.tenant_id AND i.snapshot_id IN (prev.id,next.id)
+        AND i.basis <> 'initial_capture' AND i.status='completed'
+        AND i.finished_at > c.detected_at)
     AND ((s.source_type = 'pricing_page' AND detail.value->>'kind' = 'price_observed'
       AND detail.value->'previous'->>'confirmed' = 'true'
       AND detail.value->'current'->>'confirmed' = 'true'

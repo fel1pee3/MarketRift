@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, Inject, NotFoundException, Param, Post, Req } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, Inject, NotFoundException, Param, Post, Req, UnprocessableEntityException } from '@nestjs/common';
 import type { Request } from 'express';
 import type { QueryResultRow } from 'pg';
 import { z } from 'zod';
@@ -6,6 +6,7 @@ import { Accounts } from './accounts';
 import { Db } from './db';
 import { Jobs } from './queue';
 import { makeWebPageJob } from './web-page-job';
+import { currentPageRuleVersion, makePageReinterpretJob } from './page-reinterpret-job';
 import { publicPageUrl } from './web-page-url';
 
 const uuid = z.uuid();
@@ -21,7 +22,12 @@ type Run = QueryResultRow & { id: string; source_id: string; status: string; err
   trigger_kind: 'manual' | 'scheduled' };
 type Snapshot = QueryResultRow & { id: string; source_id: string; version_no: number; final_url: string;
   content_sha256: string; normalized_text: string; extracted: object; fetched_at: Date;
-  interpretation_version: number | null; interpretation_status: string; interpretation_reason: string };
+  interpretation_version: number | null; interpretation_status: string; interpretation_reason: string;
+  can_reinterpret: boolean; markup_observed_at: Date | null; capture_complete: boolean;
+  capture_limit_kind: string | null };
+type Interpretation = QueryResultRow & { id: string; snapshot_id: string; source_id: string;
+  rule_version: number; status: string; interpretation_status: string | null; reason: string;
+  basis: string; created_at: Date; finished_at: Date | null };
 type Change = QueryResultRow & { id: string; source_id: string; previous_snapshot_id: string;
   current_snapshot_id: string; change_details: object[]; detected_at: Date };
 
@@ -45,11 +51,12 @@ export class WebPagesController {
       return await this.db.tenant(principal.tenantId, async client => {
         const rows = await this.db.rows<Source>(client,
           "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, check_interval_minutes, "
-          + "monitoring_enabled, next_check_at) SELECT $1, id, $3, $4, $5, true, now() "
+          + "monitoring_enabled, next_check_at, access_environment) SELECT $1, id, $3, $4, $5, true, now(), $6 "
           + "FROM marketrift.products WHERE tenant_id = $1 AND id = $2 "
           + "RETURNING id, product_id, source_type, url, check_interval_minutes, last_checked_at, "
           + "monitoring_enabled, next_check_at, consecutive_failures",
-          [principal.tenantId, data.product_id, data.source_type, url, data.check_interval_minutes]);
+          [principal.tenantId, data.product_id, data.source_type, url, data.check_interval_minutes,
+            process.env.MARKETRIFT_TEST_MODE === '1' ? 'sandbox' : null]);
         if (!rows[0]) throw new NotFoundException('Product not found in active company');
         return rows[0];
       });
@@ -62,7 +69,8 @@ export class WebPagesController {
   }
 
   @Get()
-  async list(@Req() request: Request): Promise<{ sources: Source[]; runs: Run[]; snapshots: Snapshot[]; changes: Change[] }> {
+  async list(@Req() request: Request): Promise<{ sources: Source[]; runs: Run[]; snapshots: Snapshot[];
+    changes: Change[]; interpretations: Interpretation[]; active_rule_version: number }> {
     const principal = await this.accounts.principal(request);
     return this.db.tenant(principal.tenantId, async client => {
       const sources = await this.db.rows<Source>(client,
@@ -81,8 +89,9 @@ export class WebPagesController {
         + "ss.normalized_text, CASE WHEN ss.interpretation_version IS NULL THEN "
         + "jsonb_build_object('kind', ss.extracted->'kind', 'text', ss.extracted->'text', "
         + "'excerpt', ss.extracted->'excerpt') ELSE ss.extracted END AS extracted, "
-        + "ss.fetched_at, ss.interpretation_version, "
-        + "ss.interpretation_status, ss.interpretation_reason FROM marketrift.source_snapshots ss "
+        + "ss.fetched_at, ss.interpretation_version, ss.interpretation_status, ss.interpretation_reason, "
+        + "ss.reparse_markup IS NOT NULL AS can_reinterpret, ss.markup_observed_at, "
+        + "ss.capture_complete, ss.capture_limit_kind FROM marketrift.source_snapshots ss "
         + "WHERE ss.extracted IS NOT NULL ORDER BY ss.fetched_at DESC LIMIT 100");
       const changes = await this.db.rows<Change>(client,
         "SELECT c.id, c.source_id, c.previous_snapshot_id, c.current_snapshot_id, "
@@ -95,8 +104,54 @@ export class WebPagesController {
         + 'JOIN marketrift.source_snapshots next_ss '
         + 'ON next_ss.tenant_id = c.tenant_id AND next_ss.id = c.current_snapshot_id '
         + 'ORDER BY c.detected_at DESC LIMIT 100');
-      return { sources, runs, snapshots, changes };
+      const interpretations = await this.db.rows<Interpretation>(client,
+        'SELECT id,source_id,snapshot_id,rule_version,status,interpretation_status,reason,basis,'
+        + 'created_at,finished_at FROM marketrift.snapshot_interpretations '
+        + 'ORDER BY created_at DESC,id DESC LIMIT 300');
+      return { sources, runs, snapshots, changes, interpretations,
+        active_rule_version: currentPageRuleVersion };
     });
+  }
+
+  @Post('snapshots/:snapshotId/reinterpret')
+  @HttpCode(200)
+  async reinterpret(@Req() request: Request, @Param('snapshotId') value: string): Promise<Interpretation> {
+    const principal = await this.accounts.principal(request, ['owner', 'admin', 'analyst']);
+    const snapshotId = parse(uuid, value);
+    const row = await this.db.tenant(principal.tenantId, async client => {
+      const snapshots = await this.db.rows<{ id: string; source_id: string; can_reinterpret: boolean;
+        markup_observed_at: Date | null; fetched_at: Date }>(client,
+        "SELECT ss.id,ss.source_id,ss.reparse_markup IS NOT NULL AS can_reinterpret,"
+        + "ss.markup_observed_at,ss.fetched_at FROM marketrift.source_snapshots ss "
+        + "JOIN marketrift.sources s ON s.tenant_id=ss.tenant_id AND s.id=ss.source_id "
+        + "WHERE ss.tenant_id=$1 AND ss.id=$2 AND ss.version_no IS NOT NULL "
+        + "AND s.enabled AND s.source_type IN ('release_notes','pricing_page') FOR UPDATE OF ss",
+        [principal.tenantId, snapshotId]);
+      const snapshot = snapshots[0];
+      if (!snapshot) throw new NotFoundException('Snapshot not found in active company');
+      if (!snapshot.can_reinterpret) throw new UnprocessableEntityException({
+        code: 'historical_markup_unavailable', rule_version: currentPageRuleVersion,
+        message: 'Esta captura antiga guarda texto, mas não o HTML com links e datas. Faça uma nova verificação permitida; conteúdo igual não cria outra versão.' });
+      const basis = snapshot.markup_observed_at && snapshot.markup_observed_at > snapshot.fetched_at ?
+        'later_same_text_capture' : 'stored_markup';
+      const inserted = await this.db.rows<Interpretation>(client,
+        "INSERT INTO marketrift.snapshot_interpretations "
+        + "(tenant_id,source_id,snapshot_id,rule_version,status,reason,basis) "
+        + "VALUES ($1,$2,$3,$4,'pending','queued',$5) "
+        + 'ON CONFLICT (tenant_id,snapshot_id,rule_version) DO NOTHING RETURNING *',
+        [principal.tenantId, snapshot.source_id, snapshotId, currentPageRuleVersion, basis]);
+      if (inserted[0]) return inserted[0];
+      const existing = await this.db.rows<Interpretation>(client,
+        'SELECT * FROM marketrift.snapshot_interpretations WHERE tenant_id=$1 AND snapshot_id=$2 '
+        + 'AND rule_version=$3', [principal.tenantId, snapshotId, currentPageRuleVersion]);
+      return existing[0]!;
+    });
+    if (row.status === 'pending') {
+      try { await this.jobs.publishPageReinterpret(makePageReinterpretJob(principal.tenantId,
+        row.source_id, snapshotId, row.id)); }
+      catch { /* Pending row remains durable; the same manual action can republish it. */ }
+    }
+    return row;
   }
 
   @Post(':id/pause')

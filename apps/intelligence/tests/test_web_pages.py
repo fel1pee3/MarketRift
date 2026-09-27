@@ -1,5 +1,6 @@
 """Deterministic page fetching, SSRF, extraction and comparison tests."""
 
+import http.client
 import socket
 
 import pytest
@@ -11,6 +12,8 @@ from marketrift_intelligence.web_pages import (
     e2e_fetch_public_page,
     fetch_public_page,
     page_content,
+    reparse_markup,
+    request_pinned_capture,
     resolve_public,
     semantic_hash,
 )
@@ -209,3 +212,97 @@ def test_changelog_preserves_entry_title_date_link_and_diff():
     assert old["entries"][0]["date"] == "2026-01-01"
     changes = compare_pages(old, new)
     assert {change["kind"] for change in changes} == {"entry_appeared", "entry_disappeared_from_page"}
+
+
+def test_changelog_sibling_date_and_product_change_have_literal_provenance():
+    html = ("<main><h1>Changelog</h1><ul><li><div>25 September</div><article>"
+            "<h2><a href='/changelog/vcr-login-github-action'>"
+            "Push images to Vercel Container Registry from GitHub Actions</a></h2>"
+            "<p>The login action logs workflows in with GitHub OIDC, removing long-lived credentials.</p>"
+            "</article></li></ul></main>")
+    content = page_content(html, "release_notes", "https://example.com/changelog")
+    assert content["status"] == "confirmed"
+    assert len(content["entries"]) == 1
+    entry = content["entries"][0]
+    assert entry["date_evidence"] == "25 September"
+    assert entry["title_evidence"] in html
+    assert entry["url_evidence"] in html
+    assert "logs workflows" in entry["evidence"]
+    assert entry["url"] == "https://example.com/changelog/vcr-login-github-action"
+    assert page_content(reparse_markup(html), "release_notes", "https://example.com/changelog")["text"] == content["text"]
+
+
+def test_release_index_and_editorial_card_do_not_become_releases():
+    index = ("<main><h1>Release Notes</h1><article><h2>PostgreSQL 17</h2>"
+             "<time datetime='2026-09-25'>25 September</time>"
+             "<a href='/docs/release/17'>Release notes</a>"
+             "<p>Added documentation index links for older versions.</p></article></main>")
+    editorial = ("<main><h1>Changelog</h1><article class='editorial'>"
+                 "<h2>How teams work now</h2><time datetime='2026-09-25'>25 September</time>"
+                 "<a href='/changelog/blog-post'>Read article</a>"
+                 "<p>Author: Alex. Read more about how teams added new workflows.</p>"
+                 "</article></main>")
+    assert page_content(index, "release_notes", "https://example.com/docs/release/")["entries"] == []
+    assert page_content(editorial, "release_notes", "https://example.com/changelog")["entries"] == []
+
+
+def test_incomplete_large_pricing_never_confirms_plan_from_prefix():
+    html = ("<main><h1>Pricing</h1><section class='plan'><h2>Pro</h2>"
+            "<p>USD 10 per month</p><p>API access</p></section></main>" + " " * 900_000)
+    content = page_content(html, "pricing_page", "https://example.com/pricing", complete=False)
+    assert content["status"] == "partial"
+    assert content["reason"] == "capture_truncated"
+    assert "USD 10 per month" in content["plans"][0]["evidence"]
+    no_plan = page_content("<main><h1>Pricing</h1><p>Choose a plan.</p></main>",
+                           "pricing_page", "https://example.com/pricing", complete=False)
+    assert no_plan["status"] == "unconfirmed"
+    assert no_plan["plans"] == []
+
+
+@pytest.mark.parametrize("declared", [1_100_000, None])
+def test_bounded_capture_reads_only_prefix_with_or_without_content_length(monkeypatch, declared):
+    body = b"<main><h1>Pricing</h1></main>" + b" " * 1_100_000
+    class Response:
+        status = 200
+        length = declared
+        offset = 0
+
+        def getheaders(self):
+            return [("Content-Type", "text/html")]
+
+        def read(self, size):
+            chunk = body[self.offset:self.offset + size]
+            self.offset += len(chunk)
+            return chunk
+
+    response = Response()
+    class Connection:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, *_args, **_kwargs):
+            pass
+
+        def getresponse(self):
+            return response
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(http.client, "HTTPSConnection", Connection)
+    status, headers, prefix = request_pinned_capture("https://example.com/pricing", "93.184.215.14")
+    assert status == 200
+    assert len(prefix) == 1_000_000
+    assert response.offset <= 1_000_001
+    assert headers["x-marketrift-capture-complete"] == "false"
+    assert headers["x-marketrift-limit-kind"] == ("content_length" if declared else "actual_bytes")
+
+
+def test_large_robots_is_not_partially_interpreted():
+    calls = []
+    def responder(url, _ip):
+        calls.append(url)
+        return 200, {"x-marketrift-capture-complete": "false"}, b"User-agent: *\nAllow: /\n"
+    with pytest.raises(PageError, match="robots_unavailable"):
+        fetch_public_page("https://example.com/pricing", lookup=dns("93.184.215.14"), request=responder)
+    assert calls == ["https://example.com/robots.txt"]

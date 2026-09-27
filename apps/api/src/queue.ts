@@ -9,6 +9,7 @@ import { CheckWebPageJobV1 } from './web-page-job';
 import { SyncG2ReviewsJobV1 } from './g2-job';
 import { ReconcileSignalsJobV1 } from './signal-job';
 import { DiscoverSourcesJobV1 } from './source-discovery-job';
+import { ReinterpretWebPageJobV1 } from './page-reinterpret-job';
 
 export function redisConnection(): { host: string; port: number; username: string;
   password: string | undefined; db: number; tls: object | undefined; maxRetriesPerRequest: number } {
@@ -42,6 +43,15 @@ export class Jobs implements OnModuleDestroy {
   private readonly webPageQueue = new Queue<CheckWebPageJobV1>('web-pages', {
     connection: this.connection,
   });
+  private readonly pageReinterpretQueue = new Queue<ReinterpretWebPageJobV1>('page-reinterpret', {
+    connection: this.connection,
+  });
+
+  async publishPageReinterpret(job: ReinterpretWebPageJobV1): Promise<void> {
+    await this.pageReinterpretQueue.add('reinterpret-web-page.v1', job, { jobId: job.idempotency_key,
+      attempts: 2, backoff: { type: 'exponential', delay: 2000 },
+      removeOnComplete: true, removeOnFail: true });
+  }
   private readonly evidenceQueue = new Queue<{ contract_version: 'index-evidence.v1'; tenant_id: string;
     source_id: string; idempotency_key: string }>('evidence-index', { connection: this.connection });
   private readonly signalQueue = new Queue<ReconcileSignalsJobV1>('signal-reconcile',
@@ -128,5 +138,5 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.evidenceQueue.close(), this.signalQueue.close(), this.discoveryQueue.close()]); }
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.pageReinterpretQueue.close(), this.evidenceQueue.close(), this.signalQueue.close(), this.discoveryQueue.close()]); }
 }
