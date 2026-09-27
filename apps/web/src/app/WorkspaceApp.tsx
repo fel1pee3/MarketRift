@@ -45,14 +45,16 @@ type DiscoveryProfile = { product_id: string; product_name: string; official_dom
 type DiscoveryRun = { id: string; product_id: string; identity_version: number; status: string;
   error_code: string | null; pages_examined: number; candidates_seen: number; candidates_new: number;
   created_at: string; finished_at: string | null; retry_after_at: string | null; partial: boolean;
+  include_external_search: boolean; external_search_status: string; external_queries: number;
   resource_failures: { resource: string | null; url?: string | null; code: string; limit_kind: string }[] };
 type DiscoveryCandidate = { id: string; product_id: string; canonical_url: string;
-  category: 'official_site' | 'product' | 'reviews' | 'community' | 'apps' | 'social' | 'news';
+  category: 'official_site' | 'product' | 'reviews' | 'community' | 'apps' | 'social' | 'news' | 'other';
   suggested_type: string; discovered_from_url: string; discovery_method: string; association_evidence: string;
+  search_provider: string | null; search_query: string | null;
   confidence: string; status: string; linked_source_id: string | null; identity_version: number;
   first_seen_at: string; last_examined_at: string };
 type DiscoveryData = { profiles: DiscoveryProfile[]; runs: DiscoveryRun[];
-  candidates: DiscoveryCandidate[]; search_provider: 'not_configured' };
+  candidates: DiscoveryCandidate[]; search_provider: 'brave_optional' };
 type View = 'overview' | 'sources' | 'evidence' | 'questions' | 'signals' | 'retrieval-review' | 'account';
 type SignalSummary = { id: string; state: string; summary: string; source_type: string; test_data: boolean; read_at: string | null };
 type SignalResult = { signals: SignalSummary[]; alerts: SignalSummary[];
@@ -74,7 +76,7 @@ export function WorkspaceNavigation({ view }: { view: View }) {
 }
 const emptyPageData: PageData = { sources: [], runs: [], snapshots: [], changes: [],
   interpretations: [], active_rule_version: 3 };
-const emptyDiscoveryData: DiscoveryData = { profiles: [], runs: [], candidates: [], search_provider: 'not_configured' };
+const emptyDiscoveryData: DiscoveryData = { profiles: [], runs: [], candidates: [], search_provider: 'brave_optional' };
 function pageEvidence(value: PageDetail['previous']): string {
   if (!value) return 'ausente nesta versão';
   if (typeof value === 'string') return value;
@@ -745,11 +747,39 @@ const sourceLabels: Record<string, { title: string; href: string }> = {
 function displayDate(value: string | null): string { return value ? new Date(value).toLocaleString('pt-BR') : 'ainda não registrada'; }
 
 const discoveryCategories: { id: DiscoveryCandidate['category']; label: string }[] = [
-  { id: 'official_site', label: 'Site oficial' }, { id: 'product', label: 'Produto, preços e releases' },
-  { id: 'reviews', label: 'Avaliações' }, { id: 'community', label: 'Comunidades' },
-  { id: 'apps', label: 'Aplicativos' }, { id: 'social', label: 'Redes sociais' },
-  { id: 'news', label: 'Notícias e blog' },
+  { id: 'product', label: 'Produto, preços e releases' }, { id: 'reviews', label: 'Possíveis avaliações' },
+  { id: 'community', label: 'Comunidades' }, { id: 'apps', label: 'Aplicativos' },
+  { id: 'social', label: 'Redes sociais' }, { id: 'official_site', label: 'Site oficial e status' },
+  { id: 'news', label: 'Notícias e blog' }, { id: 'other', label: 'Outras menções' },
 ];
+const discoveryPriority: Record<string, number> = {
+  pricing_page: 100, release_notes: 95, g2: 90, reclameaqui: 85, app_store: 80,
+  github_repository: 75, community: 70, support: 65, social_profile: 60,
+  status_page: 45, homepage: 40, blog_or_feed: 30, external_mention: 25, documentation: 10,
+};
+const suggestionReason: Record<string, string> = {
+  pricing_page: 'caminho ou título contém termo de preços/planos',
+  release_notes: 'caminho ou título contém termo de changelog/release',
+  g2: 'URL aponta para domínio G2; produto e direitos ainda precisam ser verificados',
+  reclameaqui: 'URL aponta para Reclame Aqui; associação e direitos pendentes',
+  github_repository: 'URL aponta para repositório GitHub; associação precisa de revisão',
+  app_store: 'URL aponta para loja de aplicativos; produto precisa de revisão',
+  documentation: 'caminho ou título sugere documentação',
+  community: 'caminho ou título sugere comunidade ou fórum',
+  support: 'caminho ou título sugere suporte',
+  external_mention: 'resultado da consulta, sem classificação confirmada',
+};
+const externalStatus: Record<string, string> = {
+  not_requested: 'não solicitada', not_configured: 'credencial não configurada no worker',
+  storage_rights_unconfirmed: 'direito de armazenar resultados da busca não confirmado',
+  completed: 'concluída', invalid_credential: 'credencial inválida',
+  access_denied: 'acesso negado pelo provedor', rate_limited: 'limite do provedor atingido',
+  search_http_failure: 'falha HTTP do provedor', search_network_failure: 'falha de rede',
+  search_invalid_response: 'resposta inválida do provedor',
+  search_response_too_large: 'resposta do provedor excedeu o limite',
+  search_response_truncated: 'resposta do provedor interrompida',
+  search_timeout: 'tempo limite da busca externa excedido',
+};
 const discoveryErrors: Record<string, string> = {
   robots_disallowed: 'A origem não permite essa URL em robots.txt.',
   robots_unavailable: 'Não foi possível conferir robots.txt.',
@@ -769,10 +799,13 @@ const discoveryErrors: Record<string, string> = {
   invalid_xml: 'O XML do recurso não pôde ser interpretado.',
   unsafe_xml: 'O XML contém declarações não aceitas por segurança.',
   not_found: 'Recurso não encontrado.', http_failure: 'A origem retornou uma falha HTTP.',
+  candidate_limit: 'Mais URLs foram encontradas que o limite de 60; as mais relevantes foram priorizadas.',
+  link_limit: 'Somente parte dos links deste recurso foi examinada.',
+  entry_limit: 'Somente parte das entradas deste sitemap foi examinada.',
 };
 const discoveryResourceNames: Record<string, string> = {
   'robots.txt': 'robots.txt', homepage: 'Página inicial', sitemap: 'Sitemap', feed: 'Feed',
-  related_page: 'Página relacionada',
+  related_page: 'Página relacionada', web_search: 'Busca externa', candidates: 'Seleção de candidatas',
 };
 function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
   data: DiscoveryData; products: Product[]; role: Role; busy: boolean;
@@ -780,16 +813,27 @@ function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
   request: (path: string, init: RequestInit) => Promise<unknown>; refresh: () => Promise<void>;
 }) {
   const [runErrors, setRunErrors] = useState<Record<string, string>>({});
+  const [scope, setScope] = useState<'all' | 'official' | 'external'>('all');
+  const [kind, setKind] = useState('priority');
+  const [state, setState] = useState('all');
   const competitors = products.filter(product => product.kind === 'competitor');
   const canManage = role === 'owner' || role === 'admin';
   return <section id="descoberta" className="card wide"><h2>Descoberta de fontes por concorrente</h2>
     <p>O MarketRift examina apenas recursos públicos do domínio informado. Links encontrados são candidatos; uma pessoa confirma a associação. Isso não concede direitos para coletar reviews ou enviar textos à IA.</p>
-    <p>Busca externa: <strong>{data.search_provider === 'not_configured' ? 'não configurada' : data.search_provider}</strong>. Instagram: conector indisponível; Reclame Aqui: acesso e direitos a verificar; G2: credencial e direitos pendentes.</p>
+    <p>Busca externa opcional: <strong>Brave Search API</strong>. Só ocorre na ação específica, com até 3 consultas e 5 resultados por consulta. O worker exige credencial e direito contratual de guardar resultados; pode haver custo. Instagram: conector indisponível; Reclame Aqui e G2: acesso e direitos a verificar.</p>
+    <div className="discovery-filters"><label>Origem<select value={scope} onChange={event => setScope(event.target.value as typeof scope)}><option value="all">Todas</option><option value="official">Site oficial</option><option value="external">Busca externa</option></select></label>
+      <label>Tipo<select value={kind} onChange={event => setKind(event.target.value)}><option value="priority">Prioritárias</option><option value="all">Todos</option>{discoveryCategories.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
+      <label>Estado<select value={state} onChange={event => setState(event.target.value)}><option value="all">Todos</option><option value="pending">Pendente</option><option value="confirmed">Confirmado</option><option value="rejected">Rejeitado</option><option value="rights_pending">Direitos pendentes</option><option value="access_unavailable">Sem conector</option></select></label></div>
     {!competitors.length && <p className="empty">Cadastre primeiro um produto do tipo Concorrente.</p>}
     {competitors.map(product => {
       const profile = data.profiles.find(item => item.product_id === product.id);
       const latest = data.runs.find(item => item.product_id === product.id);
       const candidates = data.candidates.filter(item => item.product_id === product.id);
+      const visible = candidates.filter(item => (scope === 'all' || (scope === 'external') === (item.discovery_method === 'web_search'))
+        && (kind === 'all' || (kind === 'priority' ? (discoveryPriority[item.suggested_type] ?? 20) >= 60 : item.category === kind))
+        && (state === 'all' || item.status === state));
+      const onsiteCount = candidates.filter(item => item.discovery_method !== 'web_search').length;
+      const outsideCount = candidates.length - onsiteCount;
       return <div key={product.id} className="discovery-product"><h3>{product.name}</h3>
         {canManage && <form key={`${product.id}-${profile?.identity_version ?? 0}`} onSubmit={event => void act(async () => {
           const form = new FormData(event.currentTarget);
@@ -812,29 +856,41 @@ function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
           {latest && <p>Última descoberta: <strong>{latest.status}</strong>{latest.partial && <> · cobertura parcial</>} · {latest.pages_examined} requisição(ões) · {latest.candidates_seen} candidato(s) examinado(s) · {latest.candidates_new} novo(s) · {latest.finished_at ? new Date(latest.finished_at).toLocaleString('pt-BR') : 'em andamento'}.
             {latest.error_code && <> Motivo: {discoveryErrors[latest.error_code] ?? latest.error_code}.</>}
             {latest.retry_after_at && <> Aguarde até {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+          <p>Links encontrados a partir do site oficial: {onsiteCount} candidata(s), inclusive links para outros domínios. Busca externa: {outsideCount} sugestão(ões). Com os filtros: {visible.length}. {latest && <>Busca externa na última execução: {externalStatus[latest.external_search_status] ?? latest.external_search_status} ({latest.external_queries} consulta(s)).</>}</p>
           {latest?.resource_failures?.length ? <ul aria-label="Recursos não examinados completamente">{latest.resource_failures.map((failure, index) =>
-            <li key={`${failure.resource}-${index}`}>{discoveryResourceNames[failure.resource ?? ''] ?? failure.resource ?? 'Recurso não identificado'}{failure.url ? ` (${failure.url})` : ''}: {discoveryErrors[failure.code] ?? failure.code}{failure.limit_kind === 'content_length' ? ' Limite indicado pelo Content-Length.' : failure.limit_kind === 'actual_bytes' ? ' Limite atingido pelos bytes recebidos.' : ''}</li>)}</ul> :
+            <li key={`${failure.resource}-${index}`}>{discoveryResourceNames[failure.resource ?? ''] ?? failure.resource ?? 'Recurso não identificado'}{failure.url ? ` (${failure.url})` : ''}: {discoveryErrors[failure.code] ?? externalStatus[failure.code] ?? failure.code}{failure.limit_kind === 'content_length' ? ' Limite indicado pelo Content-Length.' : failure.limit_kind === 'actual_bytes' ? ' Limite atingido pelos bytes recebidos.' : ''}</li>)}</ul> :
             latest?.error_code === 'response_too_large' && <p>O recurso exato não foi registrado nesta execução antiga. Repita após o intervalo mínimo para obter o diagnóstico.</p>}
           {role !== 'viewer' && <button className="small" disabled={busy || profile.discovery_paused || latest?.status === 'running'} onClick={() => void act(async () => {
             setRunErrors(previous => ({ ...previous, [product.id]: '' }));
-            try { await request(`source-discovery/profiles/${product.id}/run`, { method: 'POST' }); await refresh(); }
+            try { await request(`source-discovery/profiles/${product.id}/run`, { method: 'POST', body: JSON.stringify({ include_external_search: false }) }); await refresh(); }
             catch (error) { setRunErrors(previous => ({ ...previous, [product.id]: error instanceof Error ? error.message : String(error) })); throw error; }
-          })}>Descobrir agora (limite pequeno)</button>}
+          })}>Descobrir no site oficial</button>}
+          {role !== 'viewer' && <button className="small ghost" disabled={busy || profile.discovery_paused || latest?.status === 'running'} onClick={() => void act(async () => {
+            setRunErrors(previous => ({ ...previous, [product.id]: '' }));
+            try { await request(`source-discovery/profiles/${product.id}/run`, { method: 'POST', body: JSON.stringify({ include_external_search: true }) }); await refresh(); }
+            catch (error) { setRunErrors(previous => ({ ...previous, [product.id]: error instanceof Error ? error.message : String(error) })); throw error; }
+          })}>Descobrir no site e buscar fora (até USD 0,015)</button>}
           {runErrors[product.id] && <p className="error" role="alert">{runErrors[product.id]}</p>}
           {canManage && <button className="small ghost" disabled={busy} onClick={() => void act(async () => {
             await request(`source-discovery/profiles/${product.id}/${profile.discovery_paused ? 'resume' : 'pause'}`, { method: 'POST' }); await refresh();
           })}>{profile.discovery_paused ? 'Retomar descobertas manuais' : 'Pausar descobertas'}</button>}
           {candidates.length === 0 && <p className="empty">Nenhuma URL candidata encontrada para este concorrente.</p>}
-          {discoveryCategories.map(category => {
-            const group = candidates.filter(item => item.category === category.id);
+          {candidates.length > 0 && visible.length === 0 && <p className="empty">Nenhuma candidata corresponde aos filtros.</p>}
+          {(['official', 'external'] as const).map(origin => {
+            const fromOrigin = visible.filter(item => (item.discovery_method === 'web_search') === (origin === 'external'));
+            if (!fromOrigin.length) return null;
+            return <div key={origin} className="discovery-origin"><h4>{origin === 'official' ? 'Links encontrados no site oficial' : 'Sugeridas pela busca externa'} ({fromOrigin.length})</h4>
+              {discoveryCategories.map(category => {
+            const group = fromOrigin.filter(item => item.category === category.id)
+              .sort((a, b) => (discoveryPriority[b.suggested_type] ?? 20) - (discoveryPriority[a.suggested_type] ?? 20));
             if (!group.length) return null;
-            return <div key={category.id}><h4>{category.label} ({group.length})</h4><ul>{group.map(item => {
+            return <div key={category.id}><h5>{category.label} ({group.length})</h5><ul>{group.map(item => {
               const stale = item.identity_version !== profile.identity_version;
               const supported = !!item.linked_source_id;
               return <li key={item.id}><a href={item.canonical_url} target="_blank" rel="noreferrer">{item.canonical_url}</a>
                 <p>Tipo sugerido: {item.suggested_type} · estado: <strong>{stale ? 'associação antiga: revisar' : item.status}</strong> · vínculo: {item.confidence === 'official_host' ? 'mesmo domínio oficial' : 'link externo, associação ambígua'}.
-                  {' '}Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a> · examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')}.</p>
-                <p>Evidência da associação: “{item.association_evidence}”. {supported ? 'Fonte cadastrada; coleta só após ação própria.' : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' ? 'Conector indisponível; não monitorada.' : 'Ainda não monitorada.'}</p>
+                  {' '}{item.discovery_method === 'web_search' ? <>Busca externa {item.search_provider}; consulta: “{item.search_query}”. Resultado não visitado automaticamente.</> : <>Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a>.</>} Examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')}.</p>
+                <p>Motivo da sugestão: {suggestionReason[item.suggested_type] ?? 'termo encontrado no caminho ou no título; exige revisão'}. {item.discovery_method === 'web_search' ? 'Título retornado pela busca (não comprova associação)' : 'Indício da associação'}: “{item.association_evidence}”. {supported ? 'Fonte cadastrada; coleta só após ação própria.' : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' ? 'Conector indisponível; não monitorada.' : item.status === 'confirmed' ? 'Associação revisada; nenhum conector foi cadastrado pela busca externa. Cadastre manualmente na seção do conector após verificar acesso e direitos.' : 'Ainda não monitorada.'}</p>
                 {canManage && !stale && item.status === 'pending' && <><button className="small" disabled={busy} onClick={() => void act(async () => {
                   await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) }); await refresh();
                 })}>Confirmar associação</button><button className="small ghost" disabled={busy} onClick={() => void act(async () => {
@@ -842,6 +898,7 @@ function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
                 })}>Rejeitar</button></>}
               </li>;
             })}</ul></div>;
+              })}</div>;
           })}
         </> : <p className="empty">Identidade ainda não cadastrada. Informe o domínio oficial antes de descobrir URLs.</p>}
       </div>;
@@ -877,7 +934,7 @@ export function Overview({ tenantName, role, products, sources, sourceRuns, page
     </section>
     <section className="card wide"><h2>Cobertura e limites das fontes</h2>
       <p>Issues e Discussions são atividade pública; reviews B2B, CSV e Steam são populações separadas. Coleta parcial, direitos pendentes e interpretações não confirmadas continuam visíveis.</p>
-      <p><Link href="/fontes#descoberta">Fontes descobertas</Link>: {discovery.candidates.length} URL(s) candidata(s),
+      <p><Link href="/fontes#descoberta">Fontes descobertas</Link>: {new Set(discovery.candidates.map(item => item.canonical_url)).size} URL(s) distinta(s) em {discovery.candidates.length} associação(ões) candidata(s),
         {' '}{discovery.candidates.filter(item => item.status === 'pending').length} pendente(s) de revisão;
         fontes cadastradas: {sources.length + pages.sources.length}; última coleta bem-sucedida:
         {' '}{[...sourceRuns.filter(run => run.status === 'succeeded'), ...pages.runs.filter(run => run.status === 'succeeded')]

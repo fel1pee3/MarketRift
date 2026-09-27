@@ -104,6 +104,15 @@ const steamMock = createServer((request, response) => {
     }
     response.writeHead(404); response.end(); return;
   }
+  if (url.pathname === '/discovery-search') {
+    response.writeHead(200, { 'Content-Type': 'application/json' });
+    response.end(JSON.stringify({ web: { results: [
+      { url: 'https://www.g2.com/products/example/reviews', title: 'Example reviews' },
+      { url: 'https://github.com/example/repo', title: 'Example repository' },
+      { url: 'https://github.com/other/example', title: 'Other example repository' },
+      { url: 'https://g2.com.evil.example/reviews', title: 'Deceptive Example result' },
+    ] } })); return;
+  }
   if (url.pathname.startsWith('/web-page/')) {
     pageRequests.push(url.pathname);
     if (url.pathname === '/web-page/robots.txt') { response.writeHead(404); response.end(); return; }
@@ -432,6 +441,45 @@ try {
     assert.equal(isolated.rowCount, 0, 'RLS must hide another company candidates');
     await discoveryRls.query('ROLLBACK');
   } finally { await discoveryRls.end(); }
+  const searchCompetitor = await a.call('products', { method: 'POST',
+    body: JSON.stringify({ name: 'Controlled search competitor', kind: 'competitor' }) });
+  assert.equal(searchCompetitor.status, 201);
+  assert.equal((await a.call('source-discovery/profiles', { method: 'POST',
+    body: JSON.stringify({ ...discoveryInput, product_id: searchCompetitor.body.id }) })).status, 200);
+  const searchRun = await analyst.call(`source-discovery/profiles/${searchCompetitor.body.id}/run`,
+    { method: 'POST', body: JSON.stringify({ include_external_search: true }) });
+  assert.equal(searchRun.status, 200, JSON.stringify(searchRun.body));
+  let searchData;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    searchData = (await a.call('source-discovery')).body;
+    if (searchData.runs.find(item => item.id === searchRun.body.id)?.status === 'succeeded') break;
+    await delay(150);
+  }
+  const searchResult = searchData.runs.find(item => item.id === searchRun.body.id);
+  assert.equal(searchResult.status, 'succeeded');
+  assert.equal(searchResult.external_search_status, 'completed');
+  assert.equal(searchResult.external_queries, 3);
+  const searchCandidates = searchData.candidates.filter(item => item.product_id === searchCompetitor.body.id
+    && item.discovery_method === 'web_search');
+  assert.equal(searchCandidates.length, 3, 'repeated search results deduplicate and official provenance wins');
+  assert(searchCandidates.every(item => item.confidence === 'ambiguous' && item.search_provider === 'brave'));
+  assert.equal((await b.call(`source-discovery/candidates/${searchCandidates[0].id}/decision`, {
+    method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) })).status, 404);
+  const externalDecision = await admin.call(`source-discovery/candidates/${searchCandidates[0].id}/decision`,
+    { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) });
+  assert.equal(externalDecision.status, 200);
+  assert.equal(externalDecision.body.linked_source_id, null,
+    'an external search result cannot activate a connector');
+  assert(['rights_pending', 'access_unavailable', 'confirmed'].includes(externalDecision.body.status));
+  const externalRepository = searchCandidates.find(item => item.canonical_url === 'https://github.com/other/example');
+  assert(externalRepository);
+  const repositoryDecision = await admin.call(`source-discovery/candidates/${externalRepository.id}/decision`,
+    { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) });
+  assert.equal(repositoryDecision.status, 200);
+  assert.equal(repositoryDecision.body.status, 'confirmed');
+  assert.equal(repositoryDecision.body.linked_source_id, null,
+    'external GitHub suggestion requires separate source registration');
+  assert.equal((await b.call('source-discovery')).body.candidates.length, 0);
   const priceCandidate = discovered.candidates.find(item => item.canonical_url === 'https://example.com/plans');
   assert(priceCandidate, 'pricing link must be discovered');
   assert.equal(priceCandidate.confidence, 'official_host');

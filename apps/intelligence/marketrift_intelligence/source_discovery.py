@@ -12,8 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Protocol
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qsl, urlencode, urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 from xml.etree import ElementTree
 
@@ -30,6 +29,10 @@ MAX_CANDIDATES = 60
 MAX_RESPONSE_BYTES = 1_000_000
 MAX_ROBOTS_BYTES = 256_000
 MAX_RESOURCE_SECONDS = 8
+MAX_SEARCH_QUERIES = 3
+MAX_SEARCH_RESULTS_PER_QUERY = 5
+MAX_SEARCH_RESPONSE_BYTES = 256_000
+BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 RELEVANT = re.compile(r"pricing|price|plans?|pre[cç]os?|changelog|release|updates?|docs?|blog|status|support|help|forum|community|github|discord|reddit|g2|reclame|instagram|linkedin|youtube|app\s?store|play\s?store|rss|atom|feed", re.IGNORECASE)
 
 
@@ -42,6 +45,8 @@ class Candidate:
     method: str
     evidence: str
     confidence: str
+    search_provider: str | None = None
+    search_query: str | None = None
 
 
 class DiscoveryError(Exception):
@@ -119,17 +124,120 @@ def request_discovery_pinned(url: str, ip: str, limit: int = MAX_RESPONSE_BYTES)
         connection.close()
 
 
-class WebSearchProvider(Protocol):
-    """Future, explicitly configured provider. Results are candidates only."""
+def candidate_priority(item: Candidate) -> int:
+    """Selection priority only; a high rank never verifies a source or its rights."""
+    return {"pricing_page": 100, "release_notes": 95, "g2": 90, "reclameaqui": 85,
+            "app_store": 80, "github_repository": 75, "community": 70, "support": 65,
+            "social_profile": 60, "status_page": 45, "homepage": 40,
+            "blog_or_feed": 30, "external_mention": 25, "documentation": 10}.get(item.suggested_type, 20)
 
-    def find_candidates(self, domain: str, max_queries: int, max_results: int) -> list[Candidate]: ...
+
+def prioritized_candidates(items: list[Candidate], limit: int = MAX_CANDIDATES) -> list[Candidate]:
+    """Keep useful source types when a sitemap contains many documentation entries."""
+    return sorted(items, key=lambda item: (-candidate_priority(item), item.url))[:limit]
 
 
-class UnconfiguredWebSearch:
-    status = "not_configured"
+def brave_request(query: str, token: str) -> tuple[int, dict[str, str], bytes]:
+    """Fixed official API host; bounded JSON read, no redirects or credential logging."""
+    target = "/res/v1/web/search?" + urlencode({"q": query, "count": MAX_SEARCH_RESULTS_PER_QUERY,
+                                                 "result_filter": "web", "safesearch": "moderate"})
+    connection = http.client.HTTPSConnection("api.search.brave.com", 443, timeout=MAX_RESOURCE_SECONDS,
+                                             context=ssl.create_default_context())
+    deadline = time.monotonic() + MAX_RESOURCE_SECONDS
+    try:
+        connection.request("GET", target, headers={"X-Subscription-Token": token,
+                           "Accept": "application/json", "Accept-Encoding": "identity"})
+        response = connection.getresponse()
+        headers = {key.lower(): value for key, value in response.getheaders()}
+        if response.status != 200:
+            return response.status, headers, b""
+        if response.length is not None and response.length > MAX_SEARCH_RESPONSE_BYTES:
+            raise DiscoveryError("search_response_too_large")
+        chunks: list[bytes] = []
+        size = 0
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise DiscoveryError("search_timeout")
+            if connection.sock is not None:
+                connection.sock.settimeout(remaining)
+            chunk = response.read(min(65_536, MAX_SEARCH_RESPONSE_BYTES + 1 - size))
+            if not chunk:
+                break
+            size += len(chunk)
+            if size > MAX_SEARCH_RESPONSE_BYTES:
+                raise DiscoveryError("search_response_too_large")
+            chunks.append(chunk)
+        if response.length is not None and size < response.length:
+            raise DiscoveryError("search_response_truncated")
+        return response.status, headers, b"".join(chunks)
+    except TimeoutError as error:
+        raise DiscoveryError("search_timeout") from error
+    except (OSError, ssl.SSLError, http.client.HTTPException) as error:
+        raise DiscoveryError("search_network_failure") from error
+    finally:
+        connection.close()
 
-    def find_candidates(self, domain: str, max_queries: int, max_results: int) -> list[Candidate]:
-        return []
+
+def search_queries(name: str, aliases: list[str], domain: str) -> list[str]:
+    label = name.split("—", 1)[0].strip()
+    brand = next((alias for alias in aliases if 2 <= len(alias.strip()) <= 60), "") \
+        or (label if 2 <= len(label) <= 60 else domain.split(".")[0])
+    brand = re.sub(r"[\r\n\"\\]", " ", brand).strip()[:60]
+    return [f'"{brand}" software reviews G2 Capterra',
+            f'"{brand}" community forum GitHub Reddit',
+            f'"{domain}" app marketplace news']
+
+
+def search_external(name: str, aliases: list[str], domain: str, *,
+                    request=brave_request, token: str | None = None,
+                    storage_rights: bool = False) -> tuple[list[Candidate], str, int, datetime | None]:
+    """Search only after an explicit run request and verified provider storage rights."""
+    if not token:
+        return [], "not_configured", 0, None
+    if not storage_rights:
+        return [], "storage_rights_unconfirmed", 0, None
+    candidates: dict[str, Candidate] = {}
+    count = 0
+    try:
+        for query in search_queries(name, aliases, domain)[:MAX_SEARCH_QUERIES]:
+            count += 1
+            status, headers, body = request(query, token)
+            if status == 401:
+                return list(candidates.values()), "invalid_credential", count, None
+            if status == 403:
+                return list(candidates.values()), "access_denied", count, None
+            if status == 429:
+                return list(candidates.values()), "rate_limited", count, retry_after(headers)
+            if status != 200:
+                return list(candidates.values()), "search_http_failure", count, None
+            if "json" not in headers.get("content-type", "application/json").lower():
+                return list(candidates.values()), "search_invalid_response", count, None
+            data = json.loads(body)
+            results = data.get("web", {}).get("results", [])
+            if not isinstance(results, list):
+                return list(candidates.values()), "search_invalid_response", count, None
+            for result in results[:MAX_SEARCH_RESULTS_PER_QUERY]:
+                if not isinstance(result, dict):
+                    continue
+                raw_url = str(result.get("url", ""))
+                if not raw_url.startswith("https://"):
+                    continue
+                url = safe_link(BRAVE_SEARCH_URL, raw_url)
+                if not url:
+                    continue
+                title = str(result.get("title", ""))[:160].strip()
+                identity = classify(url, title, domain) or ("other", "external_mention", "ambiguous")
+                category, suggested, _ = identity
+                # Search ranking does not establish identity, rights or customer status.
+                candidates.setdefault(url, Candidate(url, category, suggested, BRAVE_SEARCH_URL,
+                                     "web_search", title or "Resultado de busca; associação a verificar",
+                                     "ambiguous", "brave", query))
+    except DiscoveryError as error:
+        return list(candidates.values()), error.code, count, error.retry_at
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return list(candidates.values()), "search_invalid_response", count, None
+    return list(candidates.values()), "completed", count, None
 
 
 class Links(HTMLParser):
@@ -160,21 +268,26 @@ def classify(url: str, label: str, official_host: str) -> tuple[str, str, str] |
     host = parsed.hostname or ""
     clue = f"{parsed.path} {label} {host}".lower()
     confidence = "official_host" if host == official_host else "linked_external"
-    if "instagram.com" in host or "linkedin.com" in host or "youtube.com" in host:
+    def is_host(expected: str) -> bool:
+        return host == expected or host.endswith("." + expected)
+
+    if is_host("instagram.com") or is_host("linkedin.com") or is_host("youtube.com"):
         return "social", "social_profile", confidence
-    if "g2.com" in host:
+    if is_host("g2.com"):
         return "reviews", "g2", "ambiguous"
-    if "reclameaqui.com.br" in host:
+    if is_host("reclameaqui.com.br"):
         return "reviews", "reclameaqui", "ambiguous"
-    if "apps.apple.com" in host or "play.google.com" in host:
+    if is_host("apps.apple.com") or is_host("play.google.com"):
         return "apps", "app_store", confidence
-    if "github.com" in host:
+    if is_host("github.com"):
         return "community", "github_repository", confidence
-    if "reddit.com" in host or "discord." in host:
+    if is_host("reddit.com") or is_host("discord.gg") or is_host("discord.com"):
         return "community", "community", "ambiguous"
     if "status" in clue:
         return "official_site", "status_page", confidence
-    if re.search(r"pricing|prices|pre[cç]os?|plans?", clue):
+    if re.search(r"(?:^|/)(?:docs?|documentation)(?:/|$)", parsed.path.lower()):
+        return "product", "documentation", confidence
+    if re.search(r"\b(?:pricing|prices?|pre[cç]os?|plans?)\b", clue):
         return "product", "pricing_page", confidence if host == official_host else "ambiguous"
     if re.search(r"changelog|release|version|updates?", clue):
         return "product", "release_notes", confidence if host == official_host else "ambiguous"
@@ -189,7 +302,13 @@ def classify(url: str, label: str, official_host: str) -> tuple[str, str, str] |
 
 def safe_link(base: str, href: str) -> str | None:
     try:
-        return canonical_url(urljoin(base, href))
+        parsed = urlsplit(urljoin(base, href))
+        if parsed.query and any(not (key.lower().startswith("utm_") or key.lower() in
+                                     {"fbclid", "gclid"}) for key, _ in parse_qsl(parsed.query,
+                                                                                   keep_blank_values=True)):
+            return None
+        path = parsed.path.rstrip("/") or "/"
+        return canonical_url(urlunsplit((parsed.scheme, parsed.netloc, path, "", "")))
     except (PageError, ValueError):
         return None
 
@@ -307,8 +426,6 @@ def collect(domain: str, official_urls: list[str], *, lookup=socket.getaddrinfo,
     candidates: dict[str, Candidate] = {}
 
     def add(url: str, label: str, from_url: str, method: str, *, unverified: bool = False):
-        if len(candidates) >= MAX_CANDIDATES:
-            return
         canonical = safe_link(from_url, url)
         if not canonical:
             return
@@ -336,7 +453,10 @@ def collect(domain: str, official_urls: list[str], *, lookup=socket.getaddrinfo,
             raise DiscoveryError("unsupported_content_type", resource="homepage", attempted=checked)
         parser.feed(body.decode("utf-8", errors="replace"))
         add(home, "Official homepage", final_home, "homepage")
-        for href, label, method in parser.links[:200]:
+        if len(parser.links) > 1000:
+            failures.append({"resource": "homepage", "url": final_home,
+                             "code": "link_limit", "limit_kind": ""})
+        for href, label, method in parser.links[:1000]:
             url = safe_link(final_home, href)
             if not url:
                 continue
@@ -376,7 +496,11 @@ def collect(domain: str, official_urls: list[str], *, lookup=socket.getaddrinfo,
         except ElementTree.ParseError:
             failures.append({"resource": "sitemap", "url": sitemap, "code": "invalid_xml", "limit_kind": ""})
             continue
-        for node in list(root.iter())[:300]:
+        nodes = list(root.iter())
+        if len(nodes) > 2000:
+            failures.append({"resource": "sitemap", "url": final,
+                             "code": "entry_limit", "limit_kind": ""})
+        for node in nodes[:2000]:
             if (node.tag.endswith("}loc") or node.tag == "loc") and node.text:
                 add(node.text, "Sitemap URL", final, "sitemap")
 
@@ -412,7 +536,12 @@ def collect(domain: str, official_urls: list[str], *, lookup=socket.getaddrinfo,
                     add(target, "Public feed entry", final, "feed")
 
     # One relevant internal page expands navigation without an unrestricted crawl.
-    for link in dict.fromkeys(relevant_internal):
+    def internal_priority(link: str) -> int:
+        identity = classify(link, "", domain)
+        return candidate_priority(Candidate(link, identity[0], identity[1], home,
+                                            "homepage", "", identity[2])) if identity else 0
+
+    for link in sorted(dict.fromkeys(relevant_internal), key=internal_priority, reverse=True):
         if checked >= MAX_REQUESTS:
             break
         try:
@@ -428,10 +557,16 @@ def collect(domain: str, official_urls: list[str], *, lookup=socket.getaddrinfo,
         if headers.get("content-type", "").lower().startswith("text/html"):
             page = Links()
             page.feed(body.decode("utf-8", errors="replace"))
+            if len(page.links) > 100:
+                failures.append({"resource": "related_page", "url": final,
+                                 "code": "link_limit", "limit_kind": ""})
             for href, label, _ in page.links[:100]:
                 add(href, label, final, "homepage")
         break
-    return list(candidates.values()), checked, failures
+    if len(candidates) > MAX_CANDIDATES:
+        failures.append({"resource": "candidates", "url": home,
+                         "code": "candidate_limit", "limit_kind": ""})
+    return prioritized_candidates(list(candidates.values())), checked, failures
 
 
 def e2e_transport():
@@ -459,12 +594,30 @@ def e2e_transport():
     return lookup, request
 
 
+def e2e_search_request(query: str, _token: str) -> tuple[int, dict[str, str], bytes]:
+    """Controlled search endpoint exists only in the isolated E2E worker."""
+    from http.client import HTTPConnection
+    raw = os.getenv("DISCOVERY_TEST_BASE_URL", "")
+    parsed = urlsplit(raw)
+    if os.getenv("MARKETRIFT_TEST_MODE") != "1" or parsed.hostname != "127.0.0.1" or not parsed.port:
+        raise DiscoveryError("invalid_test_transport")
+    connection = HTTPConnection("127.0.0.1", parsed.port, timeout=5)
+    try:
+        connection.request("GET", "/discovery-search?" + urlencode({"q": query}))
+        response = connection.getresponse()
+        return response.status, {key.lower(): value for key, value in response.getheaders()}, \
+            response.read(MAX_SEARCH_RESPONSE_BYTES + 1)
+    finally:
+        connection.close()
+
+
 async def discover(payload: object) -> dict:
     job = validate_job(payload)
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
         row = await (await connection.execute(
-            "SELECT p.official_domain,p.official_urls,p.identity_version,p.discovery_paused,r.status "
+            "SELECT p.official_domain,p.official_urls,p.aliases,p.identity_version,p.discovery_paused,"
+            "r.status,r.include_external_search,pr.name "
             "FROM marketrift.competitor_profiles p JOIN marketrift.products pr "
             "ON pr.tenant_id=p.tenant_id AND pr.id=p.product_id AND pr.kind='competitor' "
             "JOIN marketrift.discovery_runs r ON r.tenant_id=p.tenant_id AND r.product_id=p.product_id "
@@ -472,7 +625,7 @@ async def discover(payload: object) -> dict:
             (job["tenant_id"], job["product_id"], job["run_id"]))).fetchone()
         if row is None:
             raise DiscoveryError("profile_or_run_not_in_tenant")
-        domain, urls, version, paused, status = row
+        domain, urls, aliases, version, paused, status, include_external, name = row
         if status == "succeeded":
             return {"status": "succeeded", "replayed": True}
         if status != "pending":
@@ -490,6 +643,25 @@ async def discover(payload: object) -> dict:
             candidates, pages, failures = await asyncio.to_thread(collect, domain, urls, lookup=lookup, request=request)
         else:
             candidates, pages, failures = await asyncio.to_thread(collect, domain, urls)
+        external_status = "not_requested"
+        external_queries = 0
+        external_retry = None
+        if include_external:
+            if os.getenv("MARKETRIFT_TEST_MODE") == "1" and os.getenv("DISCOVERY_TEST_BASE_URL"):
+                outside, external_status, external_queries, external_retry = await asyncio.to_thread(
+                    search_external, name, aliases, domain, request=e2e_search_request,
+                    token="controlled-e2e", storage_rights=True)
+            else:
+                outside, external_status, external_queries, external_retry = await asyncio.to_thread(
+                    search_external, name, aliases, domain, token=os.getenv("BRAVE_SEARCH_API_KEY"),
+                    storage_rights=os.getenv("BRAVE_SEARCH_STORAGE_RIGHTS_CONFIRMED") == "1")
+            outside = prioritized_candidates(outside, 15)
+            seen = {item.url for item in candidates}
+            external_unique = [item for item in outside if item.url not in seen]
+            candidates = candidates[:MAX_CANDIDATES - len(external_unique)] + external_unique
+            if external_status != "completed":
+                failures.append({"resource": "web_search", "url": BRAVE_SEARCH_URL,
+                                 "code": external_status, "limit_kind": ""})
         async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
             await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
             state = await (await connection.execute(
@@ -499,12 +671,19 @@ async def discover(payload: object) -> dict:
                 (job["tenant_id"], job["product_id"], job["run_id"]))).fetchone()
             if state != (version, False, "running"):
                 raise DiscoveryError("run_state_changed")
+            existing_official = {row[0] for row in await (await connection.execute(
+                "SELECT canonical_url FROM marketrift.discovery_candidates WHERE tenant_id=%s AND product_id=%s "
+                "AND discovery_method IN ('homepage','sitemap','feed')",
+                (job["tenant_id"], job["product_id"]))).fetchall()}
             inserted = 0
             for item in candidates:
+                if item.method == "web_search" and item.url in existing_official:
+                    continue
                 result = await connection.execute(
                     "INSERT INTO marketrift.discovery_candidates (tenant_id,product_id,canonical_url,category,"
-                    "suggested_type,discovered_from_url,discovery_method,association_evidence,confidence,identity_version) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "suggested_type,discovered_from_url,discovery_method,association_evidence,confidence,identity_version,"
+                    "search_provider,search_query) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (tenant_id,product_id,canonical_url) DO UPDATE SET "
                     "last_examined_at=now(),identity_version=excluded.identity_version,"
                     "status=CASE WHEN discovery_candidates.identity_version<>excluded.identity_version "
@@ -513,16 +692,20 @@ async def discover(payload: object) -> dict:
                     "THEN NULL ELSE discovery_candidates.linked_source_id END,"
                     "discovered_from_url=excluded.discovered_from_url,discovery_method=excluded.discovery_method,"
                     "association_evidence=excluded.association_evidence,confidence=excluded.confidence,"
-                    "category=excluded.category,suggested_type=excluded.suggested_type "
+                    "category=excluded.category,suggested_type=excluded.suggested_type,"
+                    "search_provider=excluded.search_provider,search_query=excluded.search_query "
                     "RETURNING (xmax=0)",
                     (job["tenant_id"], job["product_id"], item.url, item.category, item.suggested_type,
-                     item.from_url, item.method, item.evidence, item.confidence, version))
+                     item.from_url, item.method, item.evidence, item.confidence, version,
+                     item.search_provider, item.search_query))
                 inserted += int((await result.fetchone())[0])
             await connection.execute(
                 "UPDATE marketrift.discovery_runs SET status='succeeded',pages_examined=%s,candidates_seen=%s,"
-                "candidates_new=%s,partial=%s,resource_failures=%s::jsonb,finished_at=now() "
+                "candidates_new=%s,partial=%s,resource_failures=%s::jsonb,external_search_status=%s,"
+                "external_queries=%s,retry_after_at=%s,finished_at=now() "
                 "WHERE tenant_id=%s AND id=%s",
-                (pages, len(candidates), inserted, bool(failures), json.dumps(failures), job["tenant_id"], job["run_id"]))
+                (pages, len(candidates), inserted, bool(failures), json.dumps(failures), external_status,
+                 external_queries, external_retry, job["tenant_id"], job["run_id"]))
         return {"status": "succeeded", "seen": len(candidates), "new": inserted, "partial": bool(failures)}
     except (DiscoveryError, PageError) as error:
         code = error.code

@@ -17,10 +17,12 @@ const profileInput = z.object({ product_id: uuid, official_domain: z.string().tr
   languages: z.array(z.string().regex(/^[a-z]{2,3}(?:-[A-Za-z]{2})?$/)).max(5).default([]),
   official_urls: z.array(z.string().max(2048)).max(10).default([]) }).strict();
 const decisionInput = z.object({ decision: z.enum(['confirmed', 'rejected']) }).strict();
+const runInput = z.object({ include_external_search: z.boolean().default(false) }).strict();
 type Profile = QueryResultRow & { product_id: string; official_domain: string; identity_version: number;
   discovery_paused: boolean; aliases: string[]; country_code: string | null; languages: string[]; official_urls: string[] };
 type Run = QueryResultRow & { id: string; product_id: string; identity_version: number;
-  status: string; error_code: string | null; partial: boolean; resource_failures: {
+  status: string; error_code: string | null; partial: boolean; include_external_search: boolean;
+  external_search_status: string; external_queries: number; resource_failures: {
     resource: string | null; url?: string | null; code: string; limit_kind: string }[] };
 type Candidate = QueryResultRow & { id: string; product_id: string; canonical_url: string;
   suggested_type: string; confidence: string; status: string; identity_version: number };
@@ -45,7 +47,7 @@ export class SourceDiscoveryController {
 
   @Get()
   async list(@Req() request: Request): Promise<{ profiles: Profile[]; runs: Run[];
-    candidates: Candidate[]; search_provider: 'not_configured' }> {
+    candidates: Candidate[]; search_provider: 'brave_optional' }> {
     const principal = await this.accounts.principal(request);
     return this.db.tenant(principal.tenantId, async client => ({
       profiles: await this.db.rows<Profile>(client,
@@ -53,14 +55,16 @@ export class SourceDiscoveryController {
         + 'JOIN marketrift.products pr ON pr.tenant_id=p.tenant_id AND pr.id=p.product_id ORDER BY pr.name'),
       runs: await this.db.rows<Run>(client,
         'SELECT id,product_id,identity_version,status,error_code,partial,resource_failures,'
+        + 'include_external_search,external_search_status,external_queries,'
         + 'pages_examined,candidates_seen,candidates_new,'
         + 'created_at,finished_at,retry_after_at FROM marketrift.discovery_runs ORDER BY created_at DESC LIMIT 100'),
       candidates: await this.db.rows<Candidate>(client,
         'SELECT c.id,c.product_id,c.canonical_url,c.category,c.suggested_type,c.discovered_from_url,'
         + 'c.discovery_method,c.association_evidence,c.confidence,c.status,c.linked_source_id,'
-        + 'c.identity_version,c.first_seen_at,c.last_examined_at FROM marketrift.discovery_candidates c '
+        + 'c.identity_version,c.first_seen_at,c.last_examined_at,c.search_provider,c.search_query '
+        + 'FROM marketrift.discovery_candidates c '
         + 'ORDER BY c.last_examined_at DESC LIMIT 500'),
-      search_provider: 'not_configured' as const,
+      search_provider: 'brave_optional' as const,
     }));
   }
 
@@ -122,9 +126,10 @@ export class SourceDiscoveryController {
 
   @Post('profiles/:productId/run')
   @HttpCode(200)
-  async run(@Req() request: Request, @Param('productId') value: string): Promise<Run> {
+  async run(@Req() request: Request, @Param('productId') value: string, @Body() body: unknown): Promise<Run> {
     const principal = await this.accounts.principal(request, ['owner', 'admin', 'analyst']);
     const productId = parse(uuid, value);
+    const { include_external_search: includeExternalSearch } = parse(runInput, body ?? {});
     const run = await this.db.tenant(principal.tenantId, async client => {
       const profiles = await this.db.rows<Profile>(client,
         'SELECT p.* FROM marketrift.competitor_profiles p JOIN marketrift.products pr '
@@ -138,17 +143,25 @@ export class SourceDiscoveryController {
         + "finished_at=now() WHERE tenant_id=$1 AND product_id=$2 AND status IN ('pending','running') "
         + "AND created_at<now()-interval '10 minutes'", [principal.tenantId, productId]);
       const active = await this.db.rows<Run>(client,
-        "SELECT id,product_id,identity_version,status FROM marketrift.discovery_runs WHERE tenant_id=$1 "
+        "SELECT id,product_id,identity_version,status,include_external_search FROM marketrift.discovery_runs WHERE tenant_id=$1 "
         + "AND product_id=$2 AND status IN ('pending','running')", [principal.tenantId, productId]);
       if (active[0]?.status === 'running') throw new ConflictException({ code: 'run_active',
         message: 'Já existe uma descoberta em execução para este concorrente.', run_id: active[0].id });
-      if (active[0]) return active[0]; // A pending row can be republished after a queue outage.
-      const blocked = await this.db.rows<{ retry_after_at: Date }>(client,
-        'SELECT retry_after_at FROM marketrift.discovery_runs WHERE tenant_id=$1 AND product_id=$2 '
+      if (active[0]) {
+        if (active[0].include_external_search !== includeExternalSearch)
+          throw new ConflictException({ code: 'run_active',
+            message: 'Já existe uma descoberta pendente com outro modo de busca.' });
+        return active[0]; // A pending row can be republished after a queue outage.
+      }
+      const blocked = await this.db.rows<{ retry_after_at: Date; external_search_status: string }>(client,
+        'SELECT retry_after_at,external_search_status FROM marketrift.discovery_runs WHERE tenant_id=$1 AND product_id=$2 '
         + 'AND retry_after_at>now() ORDER BY retry_after_at DESC LIMIT 1',
         [principal.tenantId, productId]);
-      if (blocked[0]) throw new ConflictException({ code: 'origin_rate_limit',
-        message: 'A origem limitou as requisições.', retry_after_at: blocked[0].retry_after_at.toISOString() });
+      if (blocked[0]) throw new ConflictException({
+        code: blocked[0].external_search_status === 'rate_limited' ? 'search_rate_limit' : 'origin_rate_limit',
+        message: blocked[0].external_search_status === 'rate_limited'
+          ? 'A API de busca externa limitou as consultas.' : 'A origem limitou as requisições.',
+        retry_after_at: blocked[0].retry_after_at.toISOString() });
       const recent = await this.db.rows<{ retry_at: Date }>(client,
         "SELECT finished_at + interval '5 minutes' AS retry_at FROM marketrift.discovery_runs "
         + "WHERE tenant_id=$1 AND product_id=$2 AND finished_at>now()-interval '5 minutes' "
@@ -157,9 +170,9 @@ export class SourceDiscoveryController {
       if (recent[0]) throw new ConflictException({ code: 'minimum_interval',
         message: 'Aguarde cinco minutos entre descobertas.', retry_after_at: recent[0].retry_at.toISOString() });
       return (await this.db.rows<Run>(client,
-        'INSERT INTO marketrift.discovery_runs (tenant_id,product_id,identity_version) VALUES ($1,$2,$3) '
-        + 'RETURNING id,product_id,identity_version,status',
-        [principal.tenantId, productId, profile.identity_version]))[0]!;
+        'INSERT INTO marketrift.discovery_runs (tenant_id,product_id,identity_version,include_external_search) '
+        + 'VALUES ($1,$2,$3,$4) RETURNING id,product_id,identity_version,status,include_external_search',
+        [principal.tenantId, productId, profile.identity_version, includeExternalSearch]))[0]!;
     });
     if (run.status === 'pending') {
       try { await this.jobs.publishDiscovery(makeDiscoveryJob(principal.tenantId, productId,
@@ -191,7 +204,7 @@ export class SourceDiscoveryController {
       let sourceId: string | null = null;
       let recordedDecision: string = decision;
       if (decision === 'confirmed' && ['pricing_page', 'release_notes'].includes(candidate.suggested_type)
-          && candidate.confidence === 'official_host') {
+          && candidate.confidence === 'official_host' && candidate.discovery_method !== 'web_search') {
         const sourceUrl = publicPageUrl(candidate.canonical_url);
         if (new URL(sourceUrl).hostname !== profile[0].official_domain)
           throw new ConflictException('Candidate is no longer on the confirmed official domain');
@@ -202,7 +215,8 @@ export class SourceDiscoveryController {
           [principal.tenantId, candidate.product_id, candidate.suggested_type, sourceUrl]);
         sourceId = source[0]!.id;
       }
-      if (decision === 'confirmed' && candidate.suggested_type === 'github_repository') {
+      if (decision === 'confirmed' && candidate.suggested_type === 'github_repository'
+          && candidate.discovery_method !== 'web_search') {
         const repository = canonicalGitHubRepository(candidate.canonical_url);
         const source = await this.db.rows<{ id: string }>(client,
           "INSERT INTO marketrift.sources (tenant_id,product_id,source_type,url) "
@@ -212,7 +226,10 @@ export class SourceDiscoveryController {
         sourceId = source[0]!.id;
       }
       if (decision === 'confirmed' && !sourceId) recordedDecision =
-        ['g2', 'reclameaqui'].includes(candidate.suggested_type) ? 'rights_pending' : 'access_unavailable';
+        ['g2', 'reclameaqui'].includes(candidate.suggested_type) ? 'rights_pending'
+          : candidate.discovery_method === 'web_search'
+            && ['pricing_page', 'release_notes', 'github_repository'].includes(candidate.suggested_type)
+            ? 'confirmed' : 'access_unavailable';
       const updated = await this.db.rows<Candidate>(client,
         'UPDATE marketrift.discovery_candidates SET status=$3,linked_source_id=$4,reviewed_by=$5,reviewed_at=now() '
         + 'WHERE tenant_id=$1 AND id=$2 RETURNING *',

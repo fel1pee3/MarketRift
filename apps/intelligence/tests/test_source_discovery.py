@@ -8,8 +8,10 @@ from marketrift_intelligence.source_discovery import (
     DiscoveryError,
     classify,
     collect,
+    prioritized_candidates,
     request_discovery_pinned,
     safe_link,
+    search_external,
     validate_job,
 )
 
@@ -329,3 +331,144 @@ def test_transport_preserves_rate_limit_headers_without_reading_error_body(monke
     assert status == 429
     assert headers["retry-after"] == "90"
     assert body == b""
+
+
+def test_sixty_documentation_links_cannot_hide_pricing_and_changelog():
+    docs = "".join(f'<a href="/docs/guide-{number}">Documentation</a>' for number in range(85))
+    html = (docs + '<a href="/pricing">Pricing</a><a href="/changelog">Changelog</a>').encode()
+
+    def request(url, _ip):
+        if url.endswith("robots.txt"):
+            return 200, {}, b"User-agent: *\nAllow: /\n"
+        if url == "https://example.com/":
+            return 200, {"content-type": "text/html"}, html
+        if url.endswith("sitemap.xml"):
+            return 404, {}, b""
+        return 200, {"content-type": "text/html"}, b"<main>Test</main>"
+
+    found, pages, failures = collect("example.com", [], lookup=dns(), request=request)
+    assert len(found) == 60
+    assert found[0].suggested_type == "pricing_page"
+    assert found[1].suggested_type == "release_notes"
+    assert {item.suggested_type for item in found} >= {"pricing_page", "release_notes", "documentation"}
+    assert pages <= 7 and any(item["code"] == "candidate_limit" for item in failures)
+
+
+def test_optional_search_requires_key_and_confirmed_storage_rights():
+    def never(_query, _token):
+        raise AssertionError("provider must not be called")
+
+    assert search_external("Example", [], "example.com", request=never) == ([], "not_configured", 0, None)
+    assert search_external("Example", [], "example.com", request=never, token="test") == \
+        ([], "storage_rights_unconfirmed", 0, None)
+
+
+def test_external_search_is_bounded_deduplicated_and_unverified():
+    import json
+    calls = []
+
+    def request(query, token):
+        assert token == "controlled"
+        calls.append(query)
+        return 200, {"content-type": "application/json"}, json.dumps({"web": {"results": [
+            {"url": "https://www.g2.com/products/example/reviews", "title": "Example reviews"},
+            {"url": "https://github.com/example/repo", "title": "Example community"},
+            {"url": "https://g2.com.evil.example/reviews", "title": "Example review lookalike"},
+            {"url": "http://127.0.0.1/private", "title": "Example"},
+        ]}}).encode()
+
+    found, status, query_count, retry_at = search_external("Example", ["Example"], "example.com",
+        request=request, token="controlled", storage_rights=True)
+    assert status == "completed" and query_count == 3 and retry_at is None
+    assert len(calls) == 3 and len(found) == 3
+    assert all(item.method == "web_search" and item.confidence == "ambiguous" for item in found)
+    assert all(item.search_provider == "brave" and item.search_query in calls for item in found)
+    assert next(item for item in found if "evil" in item.url).suggested_type != "g2"
+    assert next(item for item in found if "g2.com/" in item.url).suggested_type == "g2"
+
+
+def test_external_search_stops_on_rate_limit_without_extra_calls():
+    calls = []
+
+    def request(query, _token):
+        calls.append(query)
+        return 429, {"retry-after": "90"}, b""
+
+    found, status, count, retry_at = search_external("Example", [], "example.com", request=request,
+        token="controlled", storage_rights=True)
+    assert found == [] and status == "rate_limited" and count == 1
+    assert retry_at is not None and len(calls) == 1
+
+
+def test_external_search_caps_results_even_if_provider_returns_more():
+    import json
+    calls = []
+
+    def request(query, _token):
+        calls.append(query)
+        items = [{"url": f"https://outside.example.com/item-{len(calls)}-{number}",
+                  "title": "Example mention"} for number in range(20)]
+        return 200, {"content-type": "application/json"}, json.dumps({"web": {"results": items}}).encode()
+
+    found, status, count, _retry = search_external("Example", [], "example.com", request=request,
+        token="controlled", storage_rights=True)
+    assert status == "completed" and count == 3 and len(calls) == 3
+    assert len(found) == 15
+
+
+def test_brave_transport_rejects_oversized_response_before_read(monkeypatch):
+    import marketrift_intelligence.source_discovery as discovery
+
+    class Response:
+        status = 200
+        length = 256_001
+
+        def getheaders(self):
+            return [("content-type", "application/json")]
+
+        def read(self, _size):
+            raise AssertionError("oversized body must not be read")
+
+    class Connection:
+        sock = None
+
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def request(self, method, target, headers):
+            assert method == "GET" and target.startswith("/res/v1/web/search?")
+            assert headers["X-Subscription-Token"] == "controlled"
+
+        def getresponse(self):
+            return Response()
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(discovery.http.client, "HTTPSConnection", Connection)
+    with pytest.raises(DiscoveryError, match="search_response_too_large"):
+        discovery.brave_request("example reviews", "controlled")
+
+
+def test_candidate_priority_is_stable_on_duplicate_urls():
+    request, _seen = site()
+    found, _pages, _failures = collect("example.com", [], lookup=dns(), request=request)
+    assert len({item.url for item in found}) == len(found)
+    assert prioritized_candidates(found) == found
+
+
+def test_equivalent_urls_deduplicate_without_accepting_functional_queries():
+    base = "https://example.com/"
+    assert safe_link(base, "/pricing/") == safe_link(base, "/pricing#plans")
+    assert safe_link(base, "/pricing?utm_source=newsletter") == "https://example.com/pricing"
+    assert safe_link(base, "/reviews?page=2") is None
+    assert safe_link(base, "https://127.0.0.1/pricing?utm_source=test") is None
+
+
+def test_documentation_with_pricing_words_is_not_a_confirmed_price_page():
+    assert classify("https://example.com/docs/pricing", "Pricing documentation", "example.com")[1] \
+        == "documentation"
+    assert classify("https://example.com/docs/explanation", "Guide", "example.com")[1] \
+        == "documentation"
+    assert classify("https://example.com/pricing", "Plans", "example.com")[1] \
+        == "pricing_page"

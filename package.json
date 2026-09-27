@@ -41,7 +41,8 @@
     "db:migrate:signal-reconciliation": "node --env-file=.env scripts/migrate-signal-reconciliation.mjs",
     "db:migrate:source-discovery": "node --env-file=.env scripts/migrate-source-discovery.mjs",
     "db:migrate:discovery-resource-failures": "node --env-file=.env scripts/migrate-discovery-resource-failures.mjs",
-    "db:migrate:page-reinterpretation": "node --env-file=.env scripts/migrate-page-reinterpretation.mjs"
+    "db:migrate:page-reinterpretation": "node --env-file=.env scripts/migrate-page-reinterpretation.mjs",
+    "db:migrate:discovery-search": "node --env-file=.env scripts/migrate-discovery-search.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }
