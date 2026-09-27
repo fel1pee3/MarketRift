@@ -9,8 +9,18 @@ import psycopg
 from pydantic import ValidationError
 
 from .b2b_eval import (
-    DEFAULT_DATASET, DEFAULT_PROGRESS, DEFAULT_SAMPLE, B2BItem, B2BProgress, B2BSample,
-    item_digest, item_id, labeled_dataset, load_progress, load_sample, select_items,
+    DEFAULT_DATASET,
+    DEFAULT_PROGRESS,
+    DEFAULT_SAMPLE,
+    B2BItem,
+    B2BProgress,
+    B2BSample,
+    item_digest,
+    item_id,
+    labeled_dataset,
+    load_progress,
+    load_sample,
+    select_items,
 )
 from .quality_eval import GoldIssue, GoldLabel, load_dataset
 from .steam_eval import LabelEntry, private_path, write_json_atomic
@@ -46,7 +56,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def _source_condition(synthetic: bool) -> str:
     if synthetic:
         return "s.access_environment = 'sandbox' AND d.synthetic AND d.review_data_status = 'synthetic_fixture'"
-    return ("s.access_environment = 'production' AND s.external_ai_permitted "
+    return ("s.access_environment = 'production' AND s.rights_expires_at > now() "
+            "AND s.rights_reference IS NOT NULL AND s.external_ai_permitted "
             "AND s.ai_provider = 'openai' AND s.ai_rights_reference IS NOT NULL "
             "AND s.ai_rights_expires_at > now() AND s.ai_rights_revoked_at IS NULL "
             "AND NOT d.synthetic AND d.review_data_status = 'declared_real'")

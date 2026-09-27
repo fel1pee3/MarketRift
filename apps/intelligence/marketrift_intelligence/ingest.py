@@ -19,7 +19,8 @@ async def ingest(payload: object) -> dict[str, Any]:
             # RLS and explicit source/import checks must both succeed, including on replay.
             source = await (
                 await connection.execute(
-                    "SELECT source_type, storage_permitted, rights_reference, access_environment, url FROM marketrift.sources "
+                    "SELECT source_type, storage_permitted, rights_reference, access_environment, url, "
+                    "rights_expires_at > now() FROM marketrift.sources "
                     "WHERE tenant_id = %s AND id = %s AND enabled "
                     "AND source_type IN ('manual_review', 'b2b_csv_review') FOR UPDATE",
                     (job["tenant_id"], job["source_id"]),
@@ -28,7 +29,8 @@ async def ingest(payload: object) -> dict[str, Any]:
             if source is None:
                 raise ValueError("source does not belong to job tenant")
             b2b = source[0] == "b2b_csv_review"
-            if b2b and (not source[1] or not source[2]):
+            if b2b and (not source[1] or not source[2] or
+                        (source[3] == "production" and source[5] is not True)):
                 raise ValueError("b2b source lacks declared storage rights")
             imported = await (
                 await connection.execute(
@@ -52,6 +54,7 @@ async def ingest(payload: object) -> dict[str, Any]:
             if b2b and any(urlparse(row[1]).hostname != urlparse(source[4]).hostname for row in rows):
                 raise ValueError("review URL host differs from registered B2B source")
             new_documents = 0
+            updated_documents = 0
             if not replayed:
                 await connection.execute(
                     "UPDATE marketrift.imports SET status = 'processing', last_error = NULL "
@@ -59,6 +62,47 @@ async def ingest(payload: object) -> dict[str, Any]:
                     (job["tenant_id"], job["import_id"]),
                 )
                 for external_key, source_url, published_at, body, synthetic, language, rating in rows:
+                    existing = None
+                    if b2b:
+                        existing = await (await connection.execute(
+                            "SELECT id, source_url, published_at, body, synthetic, review_language, review_rating "
+                            "FROM marketrift.documents WHERE tenant_id = %s AND source_id = %s "
+                            "AND external_key = %s FOR UPDATE",
+                            (job["tenant_id"], job["source_id"], external_key))).fetchone()
+                    if existing is not None:
+                        if existing[4] != synthetic:
+                            raise ValueError("b2b review synthetic status cannot change on reimport")
+                        changed = (existing[1] != source_url or existing[2] != published_at or
+                                   existing[3] != body or existing[5] != language or existing[6] != rating)
+                        if changed:
+                            # Old evidence and analyses refer to an earlier text/version. Never reuse them.
+                            await connection.execute(
+                                "DELETE FROM marketrift.insights WHERE tenant_id = %s AND document_id = %s",
+                                (job["tenant_id"], existing[0]))
+                            await connection.execute(
+                                "DELETE FROM marketrift.document_analyses WHERE tenant_id = %s AND document_id = %s",
+                                (job["tenant_id"], existing[0]))
+                            await connection.execute(
+                                "DELETE FROM marketrift.evidence_chunks WHERE tenant_id = %s AND document_id = %s",
+                                (job["tenant_id"], existing[0]))
+                            await connection.execute(
+                                "DELETE FROM marketrift.document_embeddings WHERE tenant_id = %s AND document_id = %s",
+                                (job["tenant_id"], existing[0]))
+                            await connection.execute(
+                                "UPDATE marketrift.documents SET source_url = %s, published_at = %s, body = %s, "
+                                "review_language = %s, review_rating = %s, collected_at = now() "
+                                "WHERE tenant_id = %s AND id = %s",
+                                (source_url, published_at, body, language, rating, job["tenant_id"], existing[0]))
+                            updated_documents += 1
+                        # Raw CSV rows also contain review text. Keep only the latest
+                        # submitted copy; an old completed job cannot restore old text.
+                        await connection.execute(
+                            "DELETE FROM marketrift.import_rows r USING marketrift.imports i "
+                            "WHERE r.tenant_id = i.tenant_id AND r.import_id = i.id "
+                            "AND i.tenant_id = %s AND i.source_id = %s AND r.external_key = %s "
+                            "AND i.id <> %s",
+                            (job["tenant_id"], job["source_id"], external_key, job["import_id"]))
+                        continue
                     cursor = await connection.execute(
                         "INSERT INTO marketrift.documents "
                         "(tenant_id, source_id, document_type, external_key, source_url, published_at, body, synthetic, "
@@ -108,7 +152,8 @@ async def ingest(payload: object) -> dict[str, Any]:
         # The document and analysis row are committed before their IDs enter Redis.
         # If publishing fails, BullMQ retries ingestion and this replay path republishes pending rows.
         await publish_analyses(job["tenant_id"], document_ids)
-        return {"status": "completed", "new_documents": new_documents, "replayed": replayed,
+        return {"status": "completed", "new_documents": new_documents,
+                "updated_documents": updated_documents, "replayed": replayed,
                 "analysis_queued": len(document_ids)}
 
 

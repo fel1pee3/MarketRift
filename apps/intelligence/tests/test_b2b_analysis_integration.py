@@ -61,16 +61,16 @@ def test_b2b_rights_rechecked_at_worker_and_replay_is_idempotent(request, monkey
                           "VALUES (%s, %s, 'Disposable fixture', 'competitor')", (product, company))
             if company == other:
                 continue
-            for scenario in ("storage_only", "active", "revoked", "expired"):
+            for scenario in ("storage_only", "active", "revoked", "expired", "storage_expired"):
                 source, document = str(uuid4()), str(uuid4())
                 source_ids[scenario], document_ids[scenario] = source, document
-                active = scenario in ("active", "revoked", "expired")
+                active = scenario in ("active", "revoked", "expired", "storage_expired")
                 admin.execute(
                     "INSERT INTO marketrift.sources (id, tenant_id, product_id, source_type, url, "
-                    "access_environment, rights_reference, storage_permitted, external_ai_permitted, "
+                    "access_environment, rights_reference, rights_expires_at, storage_permitted, external_ai_permitted, "
                     "ai_provider, ai_rights_reference, ai_rights_attested_at, ai_rights_expires_at) "
                     "VALUES (%s, %s, %s, 'b2b_csv_review', %s, "
-                    "'production', 'disposable-test-storage-basis', true, %s, %s, %s, now(), "
+                    "'production', 'disposable-test-storage-basis', now() + interval '1 day', true, %s, %s, %s, now(), "
                     "now() + interval '1 day')",
                     (source, tenant, product, f"https://authorized-vendor.io/reviews/{scenario}",
                      active, "openai" if active else None,
@@ -95,8 +95,10 @@ def test_b2b_rights_rechecked_at_worker_and_replay_is_idempotent(request, monkey
                       "ai_rights_revoked_at = now() WHERE id = %s", (source_ids["revoked"],))
         admin.execute("UPDATE marketrift.sources SET ai_rights_expires_at = now() - interval '1 day' "
                       "WHERE id = %s", (source_ids["expired"],))
+        admin.execute("UPDATE marketrift.sources SET rights_expires_at = now() - interval '1 day' "
+                      "WHERE id = %s", (source_ids["storage_expired"],))
 
-    for scenario in ("storage_only", "revoked", "expired"):
+    for scenario in ("storage_only", "revoked", "expired", "storage_expired"):
         job = make_analysis_job(tenant, document_ids[scenario], EXTRACTOR_VERSION)
         assert run(job)["status"] == "unavailable"
     assert calls == []

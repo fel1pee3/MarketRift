@@ -4,6 +4,8 @@
 
 **Status:** piloto implementado em 2026-09-24. Sem acesso comprovado a reviews reais da G2.
 
+**Atualização de 2026-09-27:** a documentação oficial do [G2 MCP / Market Intelligence](https://documentation.g2.com/docs/g2-mcp-server) agora descreve reviews de concorrentes para contas Enterprise autorizadas, também via API. Isso estabelece um caminho contratual, mas não prova entitlement nem direitos de retenção e IA da conta local. O [ADR 0024](0024-ciclo-vida-reviews-b2b-autorizadas.md) registra a pesquisa e o ciclo de vida CSV implementado enquanto o acesso é negociado.
+
 ## Evidência documental e decisão
 
 O [Developer Portal G2](https://documentation.g2.com/docs/developer-portal) distingue permissões de endpoint e tokens; `products.reviews.read` não garante acesso a produtos de concorrentes. O [guia de syndication](https://documentation.g2.com/partners/docs/get-started-with-g2-review-syndication) documenta uma credencial específica fornecida pela G2, Product ID mapeado, `GET /api/2018-01-01/syndication/reviews`, paginação e `is_public`. Os [Terms of Use](https://legal.g2.com/terms-of-use) exigem consentimento escrito expresso para certos usos automatizados, armazenamento e usos ligados a modelos. O [guia MCP](https://documentation.g2.com/docs/g2-mcp-server) informa limite global da API subjacente de 100 requisições/s. Consultados em 2026-09-24. Não obtivemos confirmação pública da URL de sandbox para syndication, direitos de retenção/IA por esta conta, feed de exclusões nem acesso a concorrentes. A referência interativa não respondeu neste ambiente. O acordo particular prevalece; o software não presume essas permissões.

@@ -52,7 +52,7 @@ def sample(tenant_id: str, source_id: str, limit: int, output: Path) -> int:
                    OR (d.document_type = 'b2b_review' AND s.source_type = 'b2b_csv_review'
                      AND d.review_data_status = 'declared_real' AND s.storage_permitted
                      AND s.rights_reference IS NOT NULL AND s.access_environment = 'production'
-                     AND (s.rights_expires_at IS NULL OR s.rights_expires_at > now()))))
+                     AND s.rights_expires_at > now())))
                  OR (ss.id IS NOT NULL AND e.content_version = md5(ss.normalized_text)
                    AND strpos(ss.normalized_text, e.text_content) > 0
                    AND s.source_type IN ('pricing_page', 'release_notes')

@@ -51,11 +51,11 @@ export async function sourceIndexStatus(db: Db, client: PoolClient, model: strin
         OR (d.document_type = 'review' AND d.synthetic AND d.review_data_status = 'synthetic_fixture')
         OR (d.document_type = 'b2b_review' AND s.source_type = 'b2b_csv_review'
           AND s.storage_permitted AND s.rights_reference IS NOT NULL
+          AND (s.access_environment = 'sandbox' OR s.rights_expires_at > now())
           AND ((d.synthetic AND d.review_data_status = 'synthetic_fixture')
             OR (NOT d.synthetic AND d.review_data_status = 'declared_real'
               AND s.access_environment = 'production'
-              AND (s.rights_expires_at IS NULL OR s.rights_expires_at > now()))))
-      )
+              AND s.rights_expires_at > now()))))
     UNION ALL
     SELECT ss.source_id, ss.id, 'snapshot'::text, ss.normalized_text, md5(ss.normalized_text)
     FROM marketrift.source_snapshots ss

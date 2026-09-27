@@ -1041,10 +1041,31 @@ try {
       body: JSON.stringify({ source_id: b2bSource.body.id }) })).status, 201);
     for (let attempt = 0; attempt < 50; attempt++) { await delay(100); }
     assert.equal(await count(), beforeReplay);
-    await indexDb.query('UPDATE marketrift.documents SET body = $1 WHERE id = $2 AND tenant_id = $3',
-      ['Exemplo sintético: a integração falhou ao salvar.', b2bDocuments[0].id, registeredA.body.tenant_id]);
-    assert.equal((await viewer.call('evidence/questions', { method: 'POST',
-      body: JSON.stringify({ ...question, include_synthetic: true }) })).body.citations.length, 0);
+    const editedCsv = b2bCsv.replace('a exportação de faturas falhou duas vezes.',
+      'a integração falhou ao salvar.');
+    const editedImport = await importB2B(editedCsv);
+    assert.equal(editedImport.status, 201);
+    await waitForImport(a, editedImport.body.id);
+    const editedReview = (await a.call('documents')).body.find(item => item.id === b2bDocuments[0].id);
+    assert.ok(editedReview.body.includes('integração falhou'));
+    assert.equal(editedReview.analysis_status, null);
+    assert.equal(editedReview.issues.length, 0);
+    const stale = await indexDb.query(
+      "SELECT count(*)::integer AS n FROM marketrift.evidence_chunks WHERE tenant_id = $1 "
+      + "AND source_id = $2 AND text_content LIKE '%exportação de faturas%'",
+      [registeredA.body.tenant_id, b2bSource.body.id]);
+    assert.equal(stale.rows[0].n, 0);
+    const oldRaw = await indexDb.query(
+      'SELECT count(*)::integer AS n FROM marketrift.import_rows WHERE import_id = $1',
+      [b2bFirst.body.id]);
+    assert.equal(oldRaw.rows[0].n, 0);
+    assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 1);
+    const replayEdit = await importB2B(editedCsv);
+    await waitForImport(a, replayEdit.body.id);
+    assert.equal((await a.call('documents')).body.filter(item => item.id === b2bDocuments[0].id).length, 1);
+    const afterEditAnswer = await viewer.call('evidence/questions', { method: 'POST',
+      body: JSON.stringify({ ...question, include_synthetic: true }) });
+    assert.ok(afterEditAnswer.body.citations.every(item => !item.quote.includes('exportação de faturas')));
     assert.equal((await analyst.call('evidence/reindex', { method: 'POST',
       body: JSON.stringify({ source_id: b2bSource.body.id }) })).status, 201);
     let changed;
@@ -1097,6 +1118,26 @@ try {
   assert.equal((await b.call('evidence/search?source_type=b2b_review')).body.total, 0);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 1);
   assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/analyze`, { method: 'POST' })).status, 404);
+  const viewerDelete = await viewer.call(`documents/${b2bDocuments[0].id}/b2b-review`, { method: 'DELETE' });
+  assert.equal(viewerDelete.status, 403, JSON.stringify(viewerDelete.body));
+  assert.equal((await analyst.call(`documents/${b2bDocuments[0].id}/b2b-review`, { method: 'DELETE' })).status, 403);
+  assert.equal((await b.call(`documents/${b2bDocuments[0].id}/b2b-review`, { method: 'DELETE' })).status, 404);
+  const removableImport = await importB2B(b2bCsv.replace('b2b-test-1', 'b2b-delete-1'));
+  assert.equal(removableImport.status, 201);
+  await waitForImport(a, removableImport.body.id);
+  const removableReview = (await a.call('documents')).body.find(item => item.external_key === 'b2b-delete-1');
+  assert.ok(removableReview);
+  assert.equal((await a.call(`documents/${removableReview.id}/b2b-review`, { method: 'DELETE' })).status, 200);
+  assert.equal((await a.call(`documents/${removableReview.id}/b2b-review`, { method: 'DELETE' })).status, 404);
+  assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 1);
+  const removedRowDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await removedRowDb.connect();
+  try {
+    const remainingRaw = await removedRowDb.query(
+      'SELECT count(*)::integer AS n FROM marketrift.import_rows WHERE import_id = $1 AND external_key = $2',
+      [removableImport.body.id, 'b2b-delete-1']);
+    assert.equal(remainingRaw.rows[0].n, 0);
+  } finally { await removedRowDb.end(); }
   assert.equal((await viewer.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 403);
   assert.equal((await b.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
   assert.equal((await a.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).body.documents_removed, 1);
@@ -1105,16 +1146,73 @@ try {
   try {
     assert.equal(Number((await purgeDb.query('SELECT count(*)::integer AS n FROM marketrift.evidence_chunks WHERE source_id = $1',
       [b2bSource.body.id])).rows[0].n), 0);
+    assert.equal(Number((await purgeDb.query('SELECT count(*)::integer AS n FROM marketrift.documents WHERE source_id = $1',
+      [b2bSource.body.id])).rows[0].n), 0);
+    assert.equal(Number((await purgeDb.query('SELECT count(*)::integer AS n FROM marketrift.import_rows r '
+      + 'JOIN marketrift.imports i ON i.id = r.import_id WHERE i.source_id = $1',
+    [b2bSource.body.id])).rows[0].n), 0);
+    assert.equal(Number((await purgeDb.query('SELECT count(*)::integer AS n FROM marketrift.imports '
+      + 'WHERE source_id = $1 AND id IN ($2, $3)',
+    [b2bSource.body.id, b2bFirst.body.id, b2bSecond.body.id])).rows[0].n), 2,
+    'revocation keeps import metadata for audit');
   } finally { await purgeDb.end(); }
+  assert.equal((await a.call(`imports/${b2bFirst.body.id}`)).body.status, 'completed');
+  assert.equal((await a.call(`imports/${b2bFirst.body.id}/requeue`, { method: 'POST' })).status, 409);
   assert.equal((await viewer.call('evidence/questions', { method: 'POST',
     body: JSON.stringify({ ...question, include_synthetic: true }) })).body.citations.length, 0);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 0);
   const realRightsSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify({
     product_id: competitor.body.id, url: 'https://authorized-vendor.io/reviews',
     rights_reference: 'E2E storage permission declaration', storage_permitted: true,
-    external_ai_permitted: false, synthetic_only: false,
+    external_ai_permitted: false, synthetic_only: false, rights_expires_at: '2030-01-01T00:00:00Z',
   }) });
   assert.equal(realRightsSource.status, 201, JSON.stringify(realRightsSource.body));
+  const storagePath = `sources/b2b-csv/${realRightsSource.body.id}/storage-rights`;
+  const storageRenewal = { rights_reference: 'E2E renewed storage declaration', storage_permitted: true,
+    rights_expires_at: '2031-01-01T00:00:00Z' };
+  assert.equal((await viewer.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 403);
+  assert.equal((await analyst.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 403);
+  assert.equal((await b.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 404);
+  assert.equal((await a.call(storagePath, { method: 'POST', body: JSON.stringify({
+    ...storageRenewal, rights_expires_at: '2020-01-01T00:00:00Z',
+  }) })).status, 400);
+  assert.equal((await a.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 200);
+  const realTestCsv = 'external_key,source_url,published_at,body,language,rating,synthetic\n'
+    + 'zz-existing,https://authorized-vendor.io/reviews/fixture,2026-09-01T10:00:00Z,Exemplo sintético para rollback.,,,true\n';
+  const importToRealTestSource = async csv => {
+    const data = new FormData(); data.set('source_id', realRightsSource.body.id);
+    data.set('file', new Blob([csv], { type: 'text/csv' }), 'controlled.csv');
+    return analyst.call('imports/b2b-reviews', { method: 'POST', body: data });
+  };
+  const realTestImport = await importToRealTestSource(realTestCsv);
+  assert.equal(realTestImport.status, 201);
+  await waitForImport(a, realTestImport.body.id);
+  const mixedCsv = realTestCsv.replace('zz-existing', 'aa-new')
+    + 'zz-existing,https://authorized-vendor.io/reviews/fixture,2026-09-01T10:00:00Z,Texto alterado.,,,false\n';
+  const rejectedMixed = await importToRealTestSource(mixedCsv);
+  assert.equal(rejectedMixed.status, 201);
+  let failedMixed;
+  for (let attempt = 0; attempt < 60; attempt++) {
+    failedMixed = await a.call(`imports/${rejectedMixed.body.id}`);
+    if (failedMixed.body.status === 'failed') break;
+    await delay(100);
+  }
+  assert.equal(failedMixed.body.status, 'failed');
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'aa-new'), false);
+  const expiryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await expiryDb.connect();
+  try {
+    await expiryDb.query("UPDATE marketrift.sources SET rights_expires_at = now() - interval '1 day' WHERE id = $1",
+      [realRightsSource.body.id]);
+  } finally { await expiryDb.end(); }
+  const expiredImport = new FormData(); expiredImport.set('source_id', realRightsSource.body.id);
+  expiredImport.set('file', new Blob([realTestCsv], { type: 'text/csv' }), 'expired.csv');
+  assert.equal((await analyst.call('imports/b2b-reviews', { method: 'POST', body: expiredImport })).status, 404);
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'zz-existing'), false);
+  assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.items
+    .some(item => item.source_id === realRightsSource.body.id), false);
+  assert.equal((await a.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 200);
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'zz-existing'), true);
   const aiRightsPath = `sources/b2b-csv/${realRightsSource.body.id}/ai-rights`;
   const aiRights = { provider: 'openai', rights_reference: 'E2E external processing declaration',
     external_ai_permitted: true, rights_expires_at: '2030-01-01T00:00:00Z' };

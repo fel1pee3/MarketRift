@@ -25,11 +25,13 @@ async def _b2b_rights_current(connection, job: dict, analysis_id, attempt: int) 
         "JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id AND a.document_id = d.id "
         "WHERE s.tenant_id = %s AND d.id = %s AND a.id = %s AND a.attempt_count = %s "
         "AND a.status = 'processing' AND s.enabled AND s.storage_permitted "
+        "AND s.rights_reference IS NOT NULL "
         "AND s.source_type = 'b2b_csv_review' AND d.document_type = 'b2b_review' "
         "AND ((a.requested_provider = 'test' AND d.synthetic "
         "AND d.review_data_status = 'synthetic_fixture' AND s.access_environment = 'sandbox') "
         "OR (a.requested_provider = 'openai' AND NOT d.synthetic "
         "AND d.review_data_status = 'declared_real' AND s.access_environment = 'production' "
+        "AND s.rights_expires_at > now() "
         "AND s.external_ai_permitted AND s.ai_provider = 'openai' "
         "AND s.ai_rights_reference IS NOT NULL AND s.ai_rights_expires_at > now() "
         "AND s.ai_rights_revoked_at IS NULL)) FOR SHARE OF s, d, a",

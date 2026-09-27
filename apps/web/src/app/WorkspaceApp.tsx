@@ -16,12 +16,23 @@ export function sessionIdentity(value: Pick<Session, 'user_id' | 'tenant_id' | '
 type Member = { user_id: string; email: string; display_name: string; role: Role };
 type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null;
+  enabled: boolean;
   external_product_id: string | null; access_environment: 'sandbox' | 'production' | null; access_status: string;
   rights_recorded: boolean; rights_expires_at: string | null; storage_permitted: boolean; external_ai_permitted: boolean;
   ai_rights_recorded: boolean; ai_provider: string | null; ai_rights_expires_at: string | null;
   ai_rights_revoked_at: string | null };
+function importableB2BSource(source: Source): boolean {
+  return source.source_type === 'b2b_csv_review' && source.enabled && source.storage_permitted
+    && source.rights_recorded && (source.access_environment === 'sandbox'
+      || (!!source.rights_expires_at && new Date(source.rights_expires_at) > new Date()));
+}
+function storageExpiry(value: FormDataEntryValue | null): string {
+  const day = String(value ?? '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Informe a validade do armazenamento para uma fonte real.');
+  return new Date(`${day}T23:59:59`).toISOString();
+}
 type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
-type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null };
+type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: string };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
 type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: Issue[] };
 type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
@@ -164,6 +175,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
   const [sources, setSources] = useState<Source[]>([]);
   const [sourceRuns, setSourceRuns] = useState<SourceRun[]>([]);
   const [imports, setImports] = useState<Import[]>([]);
+  const [lastB2BImportId, setLastB2BImportId] = useState<string | null>(null);
   const [documents, setDocuments] = useState<Document[]>([]);
   const [pageData, setPageData] = useState<PageData>(emptyPageData);
   const [discoveryData, setDiscoveryData] = useState<DiscoveryData>(emptyDiscoveryData);
@@ -223,7 +235,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
     finally { setBusy(false); }
   }
   function clearTenantData(): void {
-    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setDocuments([]); setMembers([]);
+    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setLastB2BImportId(null); setDocuments([]); setMembers([]);
     setPageData(emptyPageData); setSignalResult(null); setDiscoveryData(emptyDiscoveryData);
     setDataLoaded(false); setIssuedInvite('');
   }
@@ -342,24 +354,45 @@ export default function WorkspaceApp({ view }: { view: View }) {
               product_id: data.get('product_id'), url: data.get('url'),
               rights_reference: data.get('rights_reference'), storage_permitted: data.get('storage_permitted') === 'on',
               external_ai_permitted: false, synthetic_only: data.get('synthetic_only') === 'on',
+              ...(data.get('synthetic_only') === 'on' ? {} : {
+                rights_expires_at: storageExpiry(data.get('rights_expires_at')),
+              }),
             }) }); form.reset(); await refresh(session);
           })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
             <label>URL HTTPS da origem<input name="url" type="url" placeholder="https://fornecedor.example/reviews" required /></label>
             <label>Referência da autorização de armazenamento<input name="rights_reference" placeholder="Contrato/licença e seção, sem segredo" minLength={8} required /></label>
+            <label>Validade do armazenamento para fonte real<input name="rights_expires_at" type="date" /></label>
             <label><input name="synthetic_only" type="checkbox" /> Fonte somente de teste: todas as linhas deverão ter <code>synthetic=true</code>.</label>
             <label><input name="storage_permitted" type="checkbox" required /> Confirmo que tenho permissão para armazenar estes textos.</label>
             <button disabled={busy || !products.length}>Cadastrar origem B2B</button></form>}
           <form onSubmit={event => void run(async () => {
             const data = formValues(event); const form = event.currentTarget;
-            await api('imports/b2b-reviews', session, { method: 'POST', body: data });
+            const accepted = await api<{ id: string }>('imports/b2b-reviews', session, { method: 'POST', body: data });
+            setLastB2BImportId(accepted.id);
             form.reset(); await refresh(session);
-          })}><label>Origem autorizada<select name="source_id" required>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source =>
+          })}><label>Origem autorizada<select name="source_id" required>{sources.filter(importableB2BSource).map(source =>
             <option key={source.id} value={source.id}>{products.find(p => p.id === source.product_id)?.name}: {source.url}</option>)}</select></label>
             <label>CSV autorizado (real ou sintético conforme a fonte)<input name="file" type="file" accept=".csv,text/csv" required /></label>
-            <button disabled={busy || session.role === 'viewer' || !sources.some(source => source.source_type === 'b2b_csv_review')}>Importar avaliações B2B</button></form>
-          <p>Colunas: <code>external_key,source_url,published_at,body</code>; opcionais: <code>language,rating,synthetic</code>. Até 100 linhas. Uma linha real com URL fictícia é recusada. Fonte de teste aceita apenas linhas <code>synthetic=true</code>. Reenviar o mesmo ID na mesma origem não duplica a review.</p>
+            <button disabled={busy || session.role === 'viewer' || !sources.some(importableB2BSource)}>Importar avaliações B2B</button></form>
+          {lastB2BImportId && <p role="status" aria-live="polite">Importação recebida: <code>{lastB2BImportId}</code>.{' '}
+            Estado: {imports.find(item => item.id === lastB2BImportId)?.status ?? 'aguardando atualização'}.{' '}
+            <a href="#importacoes">Ver importações</a> e <a href="/evidencias#documentos">documentos</a>.
+          </p>}
+          <p>Colunas: <code>external_key,source_url,published_at,body</code>; opcionais: <code>language,rating,synthetic</code>. Até 100 linhas. Uma linha real com URL fictícia é recusada. Fonte de teste aceita apenas linhas <code>synthetic=true</code>. Reenviar o mesmo ID na mesma origem não duplica a review; se texto ou metadados mudarem, a revisão existente é atualizada e análise/índice antigos são invalidados.</p>
           <ul>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source => <li key={source.id}>
             {products.find(p => p.id === source.product_id)?.name} · {source.url} · {source.access_environment === 'sandbox' ? 'TESTE, somente sintético' : 'direitos declarados'} · armazenamento declarado: {source.storage_permitted ? 'sim' : 'não'} · referência registrada: {source.rights_recorded ? 'sim' : 'não'}
+            {source.access_environment === 'production' && <p>Validade do armazenamento: {source.rights_expires_at && new Date(source.rights_expires_at) > new Date() ?
+              `até ${new Date(source.rights_expires_at).toLocaleDateString('pt-BR')}` :
+              'ausente ou vencida; novas importações e consultas desta fonte ficam bloqueadas até renovação ou revogação' }.</p>}
+            {canManage && source.access_environment === 'production' && source.storage_permitted && <form onSubmit={event => void run(async () => {
+              const data = formValues(event); const form = event.currentTarget;
+              await api(`sources/b2b-csv/${source.id}/storage-rights`, session, { method: 'POST', body: JSON.stringify({
+                rights_reference: data.get('rights_reference'), storage_permitted: true,
+                rights_expires_at: storageExpiry(data.get('rights_expires_at')),
+              }) }); form.reset(); await refresh(session);
+            })}><label>Referência atual da permissão de armazenamento<input name="rights_reference" minLength={8} required /></label>
+              <label>Nova validade<input name="rights_expires_at" type="date" required /></label>
+              <button disabled={busy}>Registrar ou renovar armazenamento</button></form>}
             {source.access_environment === 'production' && <p>Envio à IA externa: {source.external_ai_permitted && source.ai_rights_expires_at && new Date(source.ai_rights_expires_at) > new Date() && !source.ai_rights_revoked_at ?
               `declarado para ${source.ai_provider} até ${new Date(source.ai_rights_expires_at).toLocaleDateString('pt-BR')}` :
               source.ai_rights_revoked_at ? 'revogado' : 'não autorizado ou expirado'}. A declaração não verifica o contrato automaticamente.</p>}
@@ -619,8 +652,13 @@ export default function WorkspaceApp({ view }: { view: View }) {
         </section>
         <section id="importacoes" className="card"><h2>Importações</h2><p>O estado é atualizado automaticamente.</p>
           {imports.length ? <ul>{imports.map(item => <li key={item.id}><strong>{item.status}</strong> · {item.processed_rows}/{item.total_rows} linhas
+            {' · '}{sources.find(source => source.id === item.source_id)?.url ?? 'fonte não disponível'}
+            {' · '}{new Date(item.created_at).toLocaleString('pt-BR')}
+            {sources.find(source => source.id === item.source_id)?.storage_permitted === false &&
+              <small> Textos apagados; somente o histórico da importação permanece.</small>}
             {item.last_error && <small>{item.last_error}</small>}
-            {item.status === 'pending' && session.role !== 'viewer' && <button className="small" onClick={() => void run(async () => {
+            {item.status === 'pending' && session.role !== 'viewer' &&
+              sources.find(source => source.id === item.source_id)?.enabled && <button className="small" onClick={() => void run(async () => {
               await api(`imports/${item.id}/requeue`, session, { method: 'POST' }); await refresh(session);
             })}>Reenfileirar</button>}</li>)}</ul> : <p className="empty">Nenhuma importação ainda.</p>}
         </section></>}
@@ -689,7 +727,16 @@ export default function WorkspaceApp({ view }: { view: View }) {
                   <label>Orçamento estimado máximo (USD, até 0,05)<input name="budget_usd" type="number" min="0.0001" max="0.05" step="0.0001" defaultValue="0.05" required /></label>
                   <label><input name="allow_paid" type="checkbox" required /> Autorizo esta chamada paga de uma review.</label>
                   <button disabled={busy}>Analisar esta review (1 chamada paga)</button></form>}
-            </div>}</article>)}</div> :
+            </div>}
+            {canManage && document.document_type === 'b2b_review' && <button className="small" disabled={busy}
+              onClick={() => {
+                if (!window.confirm('Apagar esta review B2B, suas importações brutas, análises e trechos indexados?')) return;
+                void run(async () => {
+                  await api(`documents/${document.id}/b2b-review`, session, { method: 'DELETE' });
+                  await refresh(session);
+                });
+              }}>Apagar esta review B2B</button>}
+          </article>)}</div> :
             <p className="empty">Os documentos aparecerão após o worker concluir a importação.</p>}
         </section></>}
         {view === 'account' && <section className="card wide"><h2>Membros e convites</h2>

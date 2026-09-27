@@ -8,11 +8,11 @@ from pathlib import Path
 from typing import Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 import psycopg
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, model_validator
 
-from .quality_eval import EvalDataset, EvalExample, GoldLabel, Source
-from .steam_eval import LabelEntry, private_path, write_json_atomic
+from .quality_eval import EvalDataset, EvalExample, Source
+from .steam_eval import LabelEntry, private_path
 
 PRIVATE_ROOT = Path(__file__).resolve().parents[3] / "evalsets/private"
 DEFAULT_SAMPLE = PRIVATE_ROOT / "b2b-sample-v1.json"
@@ -143,7 +143,7 @@ async def extract_with_current_rights(example: EvalExample, extractor):
     if scope.kind != "b2b_csv" or example.synthetic or not all(
             (scope.tenant_id, scope.source_id, scope.document_id, scope.external_key)):
         raise PermissionError("ExternalAIRightsUnavailable")
-    async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
+    async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:  # noqa: SIM117 - transaction lock spans the provider call
         async with connection.transaction():
             await connection.execute("SELECT set_config('app.tenant_id', %s, true)",
                                      (str(scope.tenant_id),))
@@ -154,7 +154,8 @@ async def extract_with_current_rights(example: EvalExample, extractor):
                 "AND d.external_key = %s AND d.document_type = 'b2b_review' "
                 "AND NOT d.synthetic AND d.review_data_status = 'declared_real' "
                 "AND s.source_type = 'b2b_csv_review' AND s.access_environment = 'production' "
-                "AND s.enabled AND s.storage_permitted AND s.external_ai_permitted "
+                "AND s.enabled AND s.storage_permitted AND s.rights_reference IS NOT NULL "
+                "AND s.rights_expires_at > now() AND s.external_ai_permitted "
                 "AND s.ai_provider = 'openai' AND s.ai_rights_reference IS NOT NULL "
                 "AND s.ai_rights_expires_at > now() AND s.ai_rights_revoked_at IS NULL "
                 "FOR SHARE OF s, d",

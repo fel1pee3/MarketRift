@@ -57,11 +57,13 @@ def eligible_document(row: tuple[Any, ...]) -> bool:
     if document_type == "b2b_review":
         if source_type != "b2b_csv_review" or not storage or not reference:
             return False
-        if synthetic:
-            return data_status == "synthetic_fixture"
         from datetime import UTC, datetime
+        if environment == "production" and (expires is None or expires <= datetime.now(UTC)):
+            return False
+        if synthetic:
+            return data_status == "synthetic_fixture" and environment == "sandbox"
         return data_status == "declared_real" and environment == "production" and (
-            expires is None or expires > datetime.now(UTC))
+            expires is not None and expires > datetime.now(UTC))
     if document_type == "review":
         return bool(synthetic and data_status == "synthetic_fixture")
     # Steam source rights for local processing have not been confirmed.

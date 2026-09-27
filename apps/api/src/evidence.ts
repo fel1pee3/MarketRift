@@ -67,6 +67,9 @@ const evidenceBase = `WITH raw AS (
   JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id
   JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
   WHERE d.document_type IN ('review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion')
+    AND (d.document_type <> 'b2b_review' OR (s.enabled AND s.storage_permitted
+      AND s.rights_reference IS NOT NULL
+      AND (s.access_environment = 'sandbox' OR s.rights_expires_at > now())))
   UNION ALL
   SELECT ss.id, ss.source_id, s.product_id, p.name, s.source_type,
     jsonb_build_array(coalesce(ss.final_url, s.url), ss.content_sha256)::text,
@@ -112,6 +115,9 @@ const reviewsBase = `WITH all_reviews AS (
   LEFT JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id
     AND a.document_id = d.id AND a.extractor_version = $5
   WHERE d.document_type IN ('review', 'b2b_review', 'g2_review', 'steam_review')
+    AND (d.document_type <> 'b2b_review' OR (s.enabled AND s.storage_permitted
+      AND s.rights_reference IS NOT NULL
+      AND (s.access_environment = 'sandbox' OR s.rights_expires_at > now())))
 ), origin_flags AS (
   SELECT source_type, origin_key, bool_or(synthetic) AS any_synthetic
   FROM all_reviews GROUP BY source_type, origin_key

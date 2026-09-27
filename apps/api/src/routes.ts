@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Controller, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, ConflictException, Controller, Delete, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
@@ -26,7 +26,14 @@ const githubSourceInput = z.object({ product_id: uuid, repository: z.string().tr
 const steamSourceInput = z.object({ product_id: uuid, app: z.string().trim().min(1).max(300) }).strict();
 const b2bSourceInput = z.object({ product_id: uuid, url: httpUrl,
   rights_reference: z.string().trim().min(8).max(300), storage_permitted: z.literal(true),
-  external_ai_permitted: z.literal(false).default(false), synthetic_only: z.boolean().default(false) }).strict();
+  external_ai_permitted: z.literal(false).default(false), synthetic_only: z.boolean().default(false),
+  rights_expires_at: z.iso.datetime({ offset: true }).optional() }).strict().refine(data =>
+    data.synthetic_only || (!!data.rights_expires_at && new Date(data.rights_expires_at).getTime() > Date.now()),
+    'Production B2B sources require a future storage rights expiry');
+const b2bStorageRightsInput = z.object({ rights_reference: z.string().trim().min(8).max(300),
+  storage_permitted: z.literal(true), rights_expires_at: z.iso.datetime({ offset: true }) }).strict()
+  .refine(data => new Date(data.rights_expires_at).getTime() > Date.now(),
+    'Storage rights expiry must be in the future');
 const g2SourceInput = z.object({ product_id: uuid, g2_product_id: z.string().trim().regex(/^[A-Za-z0-9-]{1,80}$/),
   product_url: z.url().refine(value => /^https:\/\/www\.g2\.com\/products\/[a-z0-9-]+\/?$/i.test(value), 'G2 product URL required'),
   environment: z.enum(['sandbox', 'production']) }).strict();
@@ -78,6 +85,7 @@ function b2bPaidRates(): { input: number; output: number } {
 }
 type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
 type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: string; url: string; last_checked_at?: Date | null;
+  enabled?: boolean;
   external_product_id?: string | null; access_environment?: string | null; access_status?: string;
   rights_recorded?: boolean; rights_expires_at?: Date | null; storage_permitted?: boolean; external_ai_permitted?: boolean;
   ai_rights_recorded?: boolean; ai_provider?: string | null; ai_rights_expires_at?: Date | null;
@@ -144,7 +152,7 @@ export class ApiController {
   async sources(@Req() request: Request): Promise<SourceRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRow>(client,
-      'SELECT id, product_id, source_type, url, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at FROM marketrift.sources ORDER BY id'));
+      'SELECT id, product_id, source_type, url, enabled, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at FROM marketrift.sources ORDER BY id'));
   }
 
   @Post('sources/b2b-csv/:id/ai-rights')
@@ -158,7 +166,8 @@ export class ApiController {
       "UPDATE marketrift.sources SET external_ai_permitted = true, ai_provider = $2, ai_rights_reference = $3, "
       + "ai_rights_attested_at = now(), ai_rights_expires_at = $4, ai_rights_revoked_at = NULL "
       + "WHERE id = $1 AND source_type = 'b2b_csv_review' AND access_environment = 'production' "
-      + "AND enabled AND storage_permitted AND rights_reference IS NOT NULL RETURNING id",
+      + "AND enabled AND storage_permitted AND rights_reference IS NOT NULL "
+      + "AND rights_expires_at > now() RETURNING id",
       [id, data.provider, data.rights_reference, data.rights_expires_at]));
     if (!rows[0]) throw new NotFoundException('Eligible B2B source not found');
     return { status: 'declared' };
@@ -193,14 +202,31 @@ export class ApiController {
       throw new BadRequestException('Test URLs cannot be declared real');
     try { return await this.db.tenant(principal.tenantId, async client => {
       const rows = await this.db.rows<SourceRow>(client,
-        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, access_environment, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_attested_at) "
-        + "SELECT $1, id, 'b2b_csv_review', $3, $6, $7, $4, true, $5, now() FROM marketrift.products WHERE id = $2 "
-        + 'RETURNING id, product_id, source_type, url, access_status, rights_reference, storage_permitted, external_ai_permitted',
+        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, access_environment, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_attested_at, rights_expires_at) "
+        + "SELECT $1, id, 'b2b_csv_review', $3, $6, $7, $4, true, $5, now(), $8 FROM marketrift.products WHERE id = $2 "
+        + 'RETURNING id, product_id, source_type, url, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_expires_at',
         [principal.tenantId, data.product_id, data.url, data.rights_reference, data.external_ai_permitted,
-          data.synthetic_only ? 'sandbox' : 'production', data.synthetic_only ? 'sandbox_only' : 'not_assessed']);
+          data.synthetic_only ? 'sandbox' : 'production', data.synthetic_only ? 'sandbox_only' : 'not_assessed',
+          data.synthetic_only ? null : data.rights_expires_at]);
       if (!rows[0]) throw new NotFoundException('Product not found');
       return rows[0];
     }); } catch (error) { return conflict(error); }
+  }
+
+  @Post('sources/b2b-csv/:id/storage-rights')
+  @HttpCode(200)
+  async renewB2BStorageRights(@Req() request: Request, @Param('id') idValue: string,
+    @Body() body: unknown): Promise<{ status: 'declared' }> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, idValue);
+    const data = input(b2bStorageRightsInput, body);
+    const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<{ id: string }>(client,
+      "UPDATE marketrift.sources SET rights_reference = $2, storage_permitted = true, "
+      + "rights_attested_at = now(), rights_expires_at = $3 WHERE id = $1 "
+      + "AND source_type = 'b2b_csv_review' AND access_environment = 'production' AND enabled "
+      + 'RETURNING id', [id, data.rights_reference, data.rights_expires_at]));
+    if (!rows[0]) throw new NotFoundException('B2B production source not found');
+    return { status: 'declared' };
   }
 
   @Post('sources/g2')
@@ -242,14 +268,44 @@ export class ApiController {
       const source = await this.db.rows<{ id: string }>(client,
         "SELECT id FROM marketrift.sources WHERE id = $1 AND source_type IN ('g2', 'b2b_csv_review') FOR UPDATE", [id]);
       if (!source[0]) throw new NotFoundException('Review source not found');
+      await client.query('DELETE FROM marketrift.signal_evidence WHERE document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)', [id]);
+      await client.query('DELETE FROM marketrift.chat_citations WHERE document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)', [id]);
       await client.query('DELETE FROM marketrift.insights WHERE document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)', [id]);
       const deleted = await client.query('DELETE FROM marketrift.documents WHERE source_id = $1', [id]);
-      await client.query('DELETE FROM marketrift.imports WHERE source_id = $1', [id]);
+      // Raw import rows contain the submitted text. Preserve only import metadata
+      // so a later investigation can still establish when and how a batch ran.
+      await client.query('DELETE FROM marketrift.import_rows r USING marketrift.imports i '
+        + 'WHERE r.tenant_id = i.tenant_id AND r.import_id = i.id AND i.source_id = $1', [id]);
       await client.query("UPDATE marketrift.sources SET enabled = false, storage_permitted = false, "
         + "external_ai_permitted = false, access_status = 'denied', rights_expires_at = now(), "
         + "ai_rights_revoked_at = CASE WHEN source_type = 'b2b_csv_review' THEN now() ELSE ai_rights_revoked_at END "
         + "WHERE id = $1", [id]);
       return { status: 'purged', documents_removed: deleted.rowCount ?? 0 };
+    });
+  }
+
+  @Delete('documents/:id/b2b-review')
+  async deleteB2BReview(@Req() request: Request, @Param('id') idValue: string): Promise<{ status: 'purged' }> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, idValue);
+    return this.db.tenant(principal.tenantId, async client => {
+      const document = await this.db.rows<{ id: string; source_id: string; external_key: string }>(client,
+        "SELECT d.id, d.source_id, d.external_key FROM marketrift.documents d "
+        + "JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id "
+        + "WHERE d.id = $1 AND d.document_type = 'b2b_review' "
+        + "AND s.source_type = 'b2b_csv_review' FOR UPDATE OF s, d", [id]);
+      if (!document[0]) throw new NotFoundException('B2B review not found');
+      const review = document[0];
+      await client.query('DELETE FROM marketrift.signal_evidence WHERE document_id = $1', [id]);
+      await client.query('DELETE FROM marketrift.chat_citations WHERE document_id = $1', [id]);
+      await client.query('DELETE FROM marketrift.insights WHERE document_id = $1', [id]);
+      await client.query('DELETE FROM marketrift.documents WHERE id = $1', [id]);
+      // Import rows contain the original text. Remove every historical copy so a
+      // delayed or repeated import job cannot recreate a review after deletion.
+      await client.query('DELETE FROM marketrift.import_rows r USING marketrift.imports i '
+        + 'WHERE r.tenant_id = i.tenant_id AND r.import_id = i.id AND i.source_id = $1 '
+        + 'AND r.external_key = $2', [review.source_id, review.external_key]);
+      return { status: 'purged' };
     });
   }
 
@@ -370,7 +426,8 @@ export class ApiController {
     const created = await this.db.tenant(principal.tenantId, async client => {
       const sources = await this.db.rows<{ id: string; access_environment: string; url: string }>(client,
         "SELECT id, access_environment, url FROM marketrift.sources WHERE id = $1 AND source_type = 'b2b_csv_review' "
-        + "AND enabled AND storage_permitted AND rights_reference IS NOT NULL FOR UPDATE", [sourceId]);
+        + "AND enabled AND storage_permitted AND rights_reference IS NOT NULL "
+        + "AND (access_environment = 'sandbox' OR rights_expires_at > now()) FOR UPDATE", [sourceId]);
       if (!sources[0]) throw new NotFoundException('Authorized B2B CSV source not found');
       if (sources[0].access_environment === 'sandbox' && rows.some(row => row.synthetic !== 'true'))
         throw new BadRequestException('Sandbox sources accept synthetic rows only');
@@ -430,9 +487,16 @@ export class ApiController {
   async requeue(@Req() request: Request, @Param('id') idValue: string): Promise<{ status: 'completed' | 'queued' }> {
     const principal = await this.principal(request, ['owner', 'admin', 'analyst']);
     const id = input(uuid, idValue);
-    const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<{ source_id: string; status: string }>(client,
-      'SELECT source_id, status FROM marketrift.imports WHERE id = $1', [id]));
+    const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<{
+      source_id: string; status: string; source_eligible: boolean }>(client,
+      "SELECT i.source_id, i.status, (s.enabled AND (s.source_type <> 'b2b_csv_review' "
+      + "OR (s.storage_permitted AND s.rights_reference IS NOT NULL AND "
+      + "(s.access_environment = 'sandbox' OR s.rights_expires_at > now())))) AS source_eligible "
+      + 'FROM marketrift.imports i '
+      + 'JOIN marketrift.sources s ON s.tenant_id = i.tenant_id AND s.id = i.source_id '
+      + 'WHERE i.id = $1', [id]));
     if (!rows[0]) throw new NotFoundException();
+    if (!rows[0].source_eligible) throw new ConflictException('Source is disabled or storage rights were revoked');
     if (rows[0].status === 'completed') return { status: 'completed' };
     await this.jobs.publish(makeJob(principal.tenantId, id, rows[0].source_id));
     await this.db.tenant(principal.tenantId, client => client.query("UPDATE marketrift.imports SET status = 'queued' WHERE id = $1 AND status = 'pending'", [id]));
@@ -477,6 +541,7 @@ export class ApiController {
           WHEN d.document_type = 'b2b_review' AND d.synthetic THEN 'synthetic_not_eligible'
           WHEN d.document_type = 'b2b_review' AND d.review_data_status = 'declared_real'
             AND s.access_environment = 'production' AND s.storage_permitted
+            AND s.rights_expires_at > now()
             AND s.external_ai_permitted AND s.ai_provider = 'openai'
             AND s.ai_rights_reference IS NOT NULL AND s.ai_rights_expires_at > now()
             AND s.ai_rights_revoked_at IS NULL THEN 'paid_opt_in'
@@ -492,6 +557,9 @@ export class ApiController {
         JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
         LEFT JOIN marketrift.document_analyses a ON a.tenant_id = d.tenant_id
           AND a.document_id = d.id AND a.extractor_version = $1
+        WHERE d.document_type <> 'b2b_review' OR (s.enabled AND s.storage_permitted
+          AND s.rights_reference IS NOT NULL
+          AND (s.access_environment = 'sandbox' OR s.rights_expires_at > now()))
         ORDER BY d.collected_at DESC, d.id LIMIT 100`, [activeExtractorVersion]));
   }
 
@@ -512,7 +580,9 @@ export class ApiController {
         + "s.ai_rights_expires_at, s.ai_rights_revoked_at FROM marketrift.documents d "
         + "JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id "
         + "WHERE d.id = $1 AND d.document_type = 'b2b_review' AND s.source_type = 'b2b_csv_review' "
-        + "AND s.enabled FOR SHARE OF d, s", [id]);
+        + "AND s.enabled AND s.storage_permitted AND s.rights_reference IS NOT NULL "
+        + "AND (s.access_environment = 'sandbox' OR s.rights_expires_at > now()) "
+        + "FOR SHARE OF d, s", [id]);
       const review = rows[0];
       if (!review) throw new NotFoundException('B2B review not found');
       let estimated = 0;
