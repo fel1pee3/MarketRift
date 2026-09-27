@@ -5,6 +5,7 @@ import { Jobs } from './queue';
 import { Accounts, AccountsController } from './accounts';
 import { WebPagesController } from './web-pages';
 import { EvidenceController } from './evidence';
+import { EvidenceTimelineController } from './evidence-timeline';
 import { SemanticController } from './semantic';
 import { RetrievalReviewController } from './retrieval-review';
 import { ReviewableSignalsController } from './reviewable-signals';
@@ -12,6 +13,6 @@ import { SourceDiscoveryController } from './source-discovery';
 import { ActionHypothesesController } from './action-hypotheses';
 
 @Module({ controllers: [ApiController, AccountsController, WebPagesController, EvidenceController, SemanticController,
-  RetrievalReviewController, ReviewableSignalsController, ActionHypothesesController,
+  EvidenceTimelineController, RetrievalReviewController, ReviewableSignalsController, ActionHypothesesController,
   SourceDiscoveryController], providers: [Db, Jobs, Accounts] })
 export class AppModule {}

@@ -720,6 +720,13 @@ try {
   assert.equal(partialEvidence.status, 200, JSON.stringify(partialEvidence.body));
   assert.equal(partialEvidence.body.counts[0].count, 1);
   assert(partialEvidence.body.partial_sources.some(item => item.source_id === discussionSource.body.id));
+  const partialTimeline = await viewer.call('evidence/timeline?source_types=github_discussion');
+  assert.equal(partialTimeline.status, 200, JSON.stringify(partialTimeline.body));
+  assert.equal(partialTimeline.body.items.length, 1);
+  assert.equal(partialTimeline.body.items[0].coverage, 'partial_cursor');
+  assert.equal(partialTimeline.body.items[0].kind, 'document');
+  assert(partialTimeline.body.items[0].origin_reported_at);
+  assert(partialTimeline.body.items[0].observed_at);
   assert.equal((await a.call('reviewable-signals/refresh', { method: 'POST' })).status, 201);
   assert((await analyst.call('reviewable-signals')).body.signals.some(item =>
     item.signal_type === 'github_discussion_activity' && item.evidence.coverage === 'partial_cursor'));
@@ -1161,6 +1168,7 @@ try {
   assert.equal((await viewer.call('evidence/questions', { method: 'POST',
     body: JSON.stringify({ ...question, include_synthetic: true }) })).body.citations.length, 0);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.total, 0);
+  assert.equal((await a.call('evidence/timeline?source_types=b2b_review')).body.total, 0);
   const realRightsSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify({
     product_id: competitor.body.id, url: 'https://authorized-vendor.io/reviews',
     rights_reference: 'E2E storage permission declaration', storage_permitted: true,
@@ -1211,6 +1219,8 @@ try {
   assert.equal((await a.call('documents')).body.some(item => item.external_key === 'zz-existing'), false);
   assert.equal((await a.call('evidence/search?source_type=b2b_review')).body.items
     .some(item => item.source_id === realRightsSource.body.id), false);
+  assert.equal((await a.call('evidence/timeline?source_types=b2b_review')).body.items
+    .some(item => item.source_ids.includes(realRightsSource.body.id)), false);
   assert.equal((await a.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 200);
   assert.equal((await a.call('documents')).body.some(item => item.external_key === 'zz-existing'), true);
   const aiRightsPath = `sources/b2b-csv/${realRightsSource.body.id}/ai-rights`;
@@ -1368,7 +1378,8 @@ try {
     const old = { ...releaseSnapshot.extracted, entries: [], status: 'unconfirmed',
       reason: 'release_entries_missing', extractor_version: 2 };
     await pageHistoryDb.query('UPDATE marketrift.source_snapshots SET extracted=$1::jsonb,'
-      + 'interpretation_version=2,interpretation_status=$2,interpretation_reason=$3 '
+      + "interpretation_version=2,interpretation_status=$2,interpretation_reason=$3,"
+      + "markup_observed_at=fetched_at+interval '1 day' "
       + 'WHERE id=$4 AND tenant_id=$5',
     [JSON.stringify(old), 'unconfirmed', 'release_entries_missing', releaseSnapshot.id, registeredA.body.tenant_id]);
     await pageHistoryDb.query('DELETE FROM marketrift.snapshot_interpretations WHERE snapshot_id=$1 AND tenant_id=$2',
@@ -1396,6 +1407,39 @@ try {
   assert.equal(revised.snapshots.filter(item => item.source_id === releaseSource.body.id).length, 1);
   assert.equal(revised.snapshots.find(item => item.id === releaseSnapshot.id).interpretation_status, 'confirmed');
   assert.equal(revised.interpretations.filter(item => item.snapshot_id === releaseSnapshot.id).length, 2);
+  assert.equal(reassessed.basis, 'later_same_text_capture');
+  const releaseTimeline = await viewer.call('evidence/timeline?source_types=release_notes');
+  assert.equal(releaseTimeline.status, 200, JSON.stringify(releaseTimeline.body));
+  const releaseEntry = releaseTimeline.body.items.find(item => item.kind === 'changelog_entry'
+    && item.title === releaseSnapshot.extracted.entries[0].title);
+  assert(releaseEntry, 'confirmed entry must be visible separately from its snapshot');
+  assert.equal(releaseEntry.origin_reported_at, null, '25 September does not specify a year');
+  assert.equal(releaseEntry.origin_date_literal, '25 September');
+  assert.equal(releaseEntry.interpretation_basis, 'later_same_text_capture');
+  assert(new Date(releaseEntry.observed_at) > new Date(releaseEntry.capture_at));
+  assert.equal(releaseEntry.rule_version, '3');
+  const priceTimeline = await viewer.call('evidence/timeline?source_types=pricing_page');
+  assert.equal(priceTimeline.status, 200, JSON.stringify(priceTimeline.body));
+  const partialPrice = priceTimeline.body.items.find(item => item.kind === 'snapshot'
+    && item.item_id === largeSnapshot.id);
+  assert.equal(partialPrice?.status, 'partial');
+  assert.equal(priceTimeline.body.items.some(item => item.kind === 'price_change'
+    && item.source_url === largeSource.body.url), false);
+  const confirmedPrice = priceTimeline.body.items.find(item => item.kind === 'price_change'
+    && item.item_id === priceChange.id);
+  assert.equal(confirmedPrice?.status, 'confirmed', 'two comparable captures produce the price event');
+  assert.equal((await b.call('evidence/timeline?source_types=pricing_page')).body.total, 0);
+  assert.equal((await b.call(`evidence/timeline?product_id=${competitor.body.id}`)).status, 404);
+  for (const role of [a, admin, analyst, viewer])
+    assert.equal((await role.call('evidence/timeline?limit=1')).status, 200);
+  const firstTimelinePage = (await viewer.call('evidence/timeline?limit=1')).body;
+  const secondTimelinePage = (await viewer.call('evidence/timeline?limit=1&offset=1')).body;
+  assert.equal(firstTimelinePage.total, secondTimelinePage.total);
+  assert.notEqual(firstTimelinePage.items[0].event_id, secondTimelinePage.items[0].event_id);
+  assert.equal((await viewer.call('evidence/timeline?source_types=pricing_page&from=2026-09-01&to=2026-09-02')).body.total, 0);
+  for (const invalid of ['source_types=bad', 'source_types=pricing_page,pricing_page',
+    'limit=51', 'offset=-1', 'from=2026-09-28&to=2026-09-27'])
+    assert.equal((await viewer.call(`evidence/timeline?${invalid}`)).status, 400);
   assert.equal((await a.call(`page-sources/${largeSource.body.id}/pause`, { method: 'POST' })).status, 200);
   assert.equal((await a.call(`page-sources/${releaseSource.body.id}/pause`, { method: 'POST' })).status, 200);
   // These controlled checks must not consume the scheduler's six-checks-per-minute test budget.
@@ -1480,6 +1524,13 @@ try {
   assert.equal(approvedHypothesis.facts.length, 2);
   assert.equal(approvedHypothesis.own_advantage_claim, null);
   assert.deepEqual(approvedHypothesis.history.map(item => item.action), ['created', 'submitted', 'approved']);
+  const linkedPrice = (await viewer.call('evidence/timeline?source_types=pricing_page')).body.items
+    .find(item => item.kind === 'price_change' && item.item_id === priceChange.id);
+  assert(linkedPrice.links.some(link => link.signal_id === priceSignal.id
+    && link.signal_state === 'approved' && link.hypothesis_id === draftHypothesis.body.id
+    && link.hypothesis_status === 'approved'));
+  assert(linkedPrice.links.some(link => link.signal_id === priceSignal.id
+    && link.signal_reviewed_at && link.hypothesis_reviewed_at));
   const capabilityInput = { product_id: product.body.id, topic: 'condições comerciais',
     claim: 'Existe uma página pública sobre nossos planos.', evidence_url: 'https://example.com/our-plans' };
   const capability = await a.call('action-hypotheses/capabilities', { method: 'POST',
@@ -1699,6 +1750,7 @@ try {
 
   const anonymousEvidence = await new Browser().call('evidence/search');
   assert.equal(anonymousEvidence.status, 401);
+  assert.equal((await new Browser().call('evidence/timeline')).status, 401);
   for (const invalid of ['source_type=other', 'limit=51', 'offset=-1',
     'from=2026-09-03&to=2026-09-01', `product_id=${encodeURIComponent('bad')}`]) {
     assert.equal((await viewer.call(`evidence/search?${invalid}`)).status, 400);
@@ -1718,6 +1770,12 @@ try {
   const sharedReview = allEvidence.body.items.find(item => item.source_type === 'steam_review');
   assert.equal(sharedReview.association_count, 2);
   assert.equal(sharedReview.duplicate_rows, 2);
+  const sharedTimeline = await viewer.call('evidence/timeline?source_types=steam_review,github_discussion');
+  assert.equal(sharedTimeline.status, 200, JSON.stringify(sharedTimeline.body));
+  assert.equal(sharedTimeline.body.items.filter(item => item.source_type === 'steam_review').length, 1);
+  assert.equal(sharedTimeline.body.items.filter(item => item.source_type === 'github_discussion').length, 2);
+  assert(sharedTimeline.body.items.every(item => item.association_count === 2));
+  assert.equal((await viewer.call(`evidence/timeline?product_id=${product.body.id}&source_types=steam_review`)).body.total, 1);
   assert.equal((await viewer.call(`evidence/search?product_id=${product.body.id}&source_type=steam_review`)).body.total, 1);
   assert.equal((await viewer.call('evidence/search?source_type=steam_review&limit=1&offset=1')).body.items.length, 0);
   const filteredEvidence = await viewer.call('evidence/search?from=2026-09-01&to=2026-09-02&q=facilidade');
@@ -1792,6 +1850,10 @@ try {
   assert.equal(obsoleteDiscussionHypothesis.status, 'needs_review');
   assert.deepEqual(obsoleteDiscussionHypothesis.facts, []);
   assert.equal(obsoleteDiscussionHypothesis.history.at(-1).action, 'signal_obsolete');
+  const obsoleteDiscussionTimeline = (await analyst.call('evidence/timeline?source_types=github_discussion')).body.items;
+  assert(obsoleteDiscussionTimeline.some(item => item.links.some(link =>
+    link.signal_id === discussionSignal.id && link.signal_state === 'obsolete'
+      && link.hypothesis_status === 'needs_review')));
   assert.equal((await viewer.call('action-hypotheses')).body.some(item =>
     item.id === discussionHypothesis.body.id), false);
   const replacement = autoSignals.signals.find(item => item.signal_type === 'github_discussion_activity'
@@ -1821,6 +1883,12 @@ try {
     item.id === draftHypothesis.body.id);
   assert.equal(obsoletePriceHypothesis.status, 'needs_review');
   assert.deepEqual(obsoletePriceHypothesis.facts, []);
+  const obsoletePriceTimeline = (await analyst.call('evidence/timeline?source_types=pricing_page')).body.items
+    .find(item => item.kind === 'price_change' && item.item_id === priceChange.id);
+  assert(obsoletePriceTimeline.links.some(link => link.signal_id === priceSignal.id
+    && link.signal_state === 'obsolete' && link.hypothesis_status === 'needs_review'));
+  assert.equal((await viewer.call('evidence/timeline?source_types=pricing_page')).body.items
+    .find(item => item.kind === 'price_change' && item.item_id === priceChange.id).links.length, 0);
   assert.equal((await viewer.call('action-hypotheses')).body.length, 0);
   signalSchedulerA.kill(); signalSchedulerB.kill();
   const revokedRefresh = await a.call('reviewable-signals/refresh', { method: 'POST' });

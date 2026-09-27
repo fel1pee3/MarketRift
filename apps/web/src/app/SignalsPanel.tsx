@@ -196,7 +196,7 @@ export default function SignalsPanel({ tenantId, userId, csrfToken, role, ownPro
               <button disabled={busy}>Salvar rascunho</button></form>
           </details>}
         {hypotheses.filter(plan => plan.signal_id === item.id).map(plan =>
-          <section key={plan.id} className="card" aria-label="Hipótese ligada ao sinal">
+          <section key={plan.id} id={`hypothesis-${plan.id}`} className="card" aria-label="Hipótese ligada ao sinal">
             <h5>Hipótese {plan.hypothesis_kind === 'product' ? 'de produto' : 'de marketing'} · {plan.status}
               {plan.signal_test_data && ' · TESTE'}</h5>
             <p><a href={`#signal-${item.id}`}>Sinal de origem {item.id}</a> · versão {plan.signal_rule_version}

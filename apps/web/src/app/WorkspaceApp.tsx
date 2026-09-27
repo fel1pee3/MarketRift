@@ -3,6 +3,7 @@
 import React, { FormEvent, useCallback, useEffect, useRef, useState } from 'react';
 import Link from 'next/link';
 import EvidencePanel from './EvidencePanel';
+import EvidenceTimeline from './EvidenceTimeline';
 import SignalsPanel from './SignalsPanel';
 import QuestionsPanel from './QuestionsPanel';
 import RetrievalReviewPanel from './RetrievalReviewPanel';
@@ -301,9 +302,11 @@ export default function WorkspaceApp({ view }: { view: View }) {
           role={session.role} products={products} sources={sources} sourceRuns={sourceRuns}
           pages={pageData} signals={signalResult} discovery={discoveryData} />}
         {view === 'evidence' && <section className="card wide source-jump" aria-label="Ir para evidências">
-          <h2>Encontre uma evidência</h2><div className="jump-links"><a href="#explorar">Busca e indicadores</a>
+          <h2>Encontre uma evidência</h2><div className="jump-links"><a href="#linha-do-tempo">Linha do tempo</a>
+            <a href="#explorar">Busca e indicadores</a>
             <a href="#discussions-coletadas">Discussions públicas</a><a href="#documentos">Documentos e análises</a></div>
         </section>}
+        {view === 'evidence' && <EvidenceTimeline key={`timeline-${session.tenant_id}`} products={products} />}
         {view === 'evidence' && <EvidencePanel key={session.tenant_id} products={products} />}
         {view === 'signals' && <SignalsPanel key={`signals-${session.tenant_id}`} tenantId={session.tenant_id}
           userId={session.user_id} csrfToken={session.csrf_token} role={session.role}
