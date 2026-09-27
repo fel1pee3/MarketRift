@@ -25,7 +25,15 @@ type Run = QueryResultRow & { id: string; product_id: string; identity_version: 
   external_search_status: string; external_queries: number; resource_failures: {
     resource: string | null; url?: string | null; code: string; limit_kind: string }[] };
 type Candidate = QueryResultRow & { id: string; product_id: string; canonical_url: string;
-  suggested_type: string; confidence: string; status: string; identity_version: number };
+  suggested_type: string; confidence: string; status: string; identity_version: number;
+  existing_source_id: string | null; classification_version: number };
+
+export function monitorablePageCandidate(type: string, url: string): boolean {
+  const path = new URL(url).pathname.toLowerCase().replace(/\/$/, '');
+  if (type === 'pricing_page') return /(?:^|\/)\b(?:pricing|prices|plans?|precos)$/.test(path);
+  if (type === 'release_notes') return /(?:^|\/)\b(?:changelog|release-notes|releases)$/.test(path);
+  return false;
+}
 
 function parse<T>(schema: z.ZodType<T>, value: unknown): T {
   const result = schema.safeParse(value);
@@ -61,8 +69,12 @@ export class SourceDiscoveryController {
       candidates: await this.db.rows<Candidate>(client,
         'SELECT c.id,c.product_id,c.canonical_url,c.category,c.suggested_type,c.discovered_from_url,'
         + 'c.discovery_method,c.association_evidence,c.confidence,c.status,c.linked_source_id,'
-        + 'c.identity_version,c.first_seen_at,c.last_examined_at,c.search_provider,c.search_query '
-        + 'FROM marketrift.discovery_candidates c '
+        + 'c.identity_version,c.first_seen_at,c.last_examined_at,c.search_provider,c.search_query,'
+        + 'c.classification_version,c.first_discovered_from_url,c.first_discovery_method,'
+        + 'existing.id AS existing_source_id '
+        + 'FROM marketrift.discovery_candidates c LEFT JOIN marketrift.sources existing '
+        + 'ON existing.tenant_id=c.tenant_id AND existing.product_id=c.product_id '
+        + 'AND existing.source_type=c.suggested_type AND existing.url=c.canonical_url '
         + 'ORDER BY c.last_examined_at DESC LIMIT 500'),
       search_provider: 'brave_optional' as const,
     }));
@@ -201,6 +213,10 @@ export class SourceDiscoveryController {
         throw new ConflictException('Competitor domain changed; review the association before confirming');
       if (candidate.status === decision || (decision === 'confirmed' &&
         ['rights_pending', 'access_unavailable'].includes(candidate.status))) return candidate;
+      if (decision === 'confirmed' && ['pricing_page', 'release_notes'].includes(candidate.suggested_type)
+          && !monitorablePageCandidate(candidate.suggested_type, candidate.canonical_url))
+        throw new ConflictException({ code: 'candidate_not_monitorable',
+          message: 'Esta URL não é um índice de preços ou changelog monitorável. Atualize a classificação antes de confirmar.' });
       let sourceId: string | null = null;
       let recordedDecision: string = decision;
       if (decision === 'confirmed' && ['pricing_page', 'release_notes'].includes(candidate.suggested_type)

@@ -51,8 +51,9 @@ type DiscoveryCandidate = { id: string; product_id: string; canonical_url: strin
   category: 'official_site' | 'product' | 'reviews' | 'community' | 'apps' | 'social' | 'news' | 'other';
   suggested_type: string; discovered_from_url: string; discovery_method: string; association_evidence: string;
   search_provider: string | null; search_query: string | null;
-  confidence: string; status: string; linked_source_id: string | null; identity_version: number;
-  first_seen_at: string; last_examined_at: string };
+  confidence: string; status: string; linked_source_id: string | null; existing_source_id: string | null;
+  identity_version: number; classification_version: number; first_discovered_from_url: string;
+  first_discovery_method: string; first_seen_at: string; last_examined_at: string };
 type DiscoveryData = { profiles: DiscoveryProfile[]; runs: DiscoveryRun[];
   candidates: DiscoveryCandidate[]; search_provider: 'brave_optional' };
 type View = 'overview' | 'sources' | 'evidence' | 'questions' | 'signals' | 'retrieval-review' | 'account';
@@ -755,11 +756,14 @@ const discoveryCategories: { id: DiscoveryCandidate['category']; label: string }
 const discoveryPriority: Record<string, number> = {
   pricing_page: 100, release_notes: 95, g2: 90, reclameaqui: 85, app_store: 80,
   github_repository: 75, community: 70, support: 65, social_profile: 60,
-  status_page: 45, homepage: 40, blog_or_feed: 30, external_mention: 25, documentation: 10,
+  changelog_entry: 60, status_page: 45, homepage: 40, product_mention: 35,
+  blog_or_feed: 30, external_mention: 25, documentation: 10,
 };
 const suggestionReason: Record<string, string> = {
-  pricing_page: 'caminho ou título contém termo de preços/planos',
-  release_notes: 'caminho ou título contém termo de changelog/release',
+  pricing_page: 'caminho aponta para um índice de preços ou planos; conteúdo da página candidata não foi lido',
+  release_notes: 'caminho aponta para um índice de changelog ou releases; conteúdo da página candidata não foi lido',
+  changelog_entry: 'URL individual sob um índice de changelog; não há conector de página principal para esta entrada',
+  product_mention: 'o link menciona preços ou lançamentos, mas o caminho não comprova um índice monitorável',
   g2: 'URL aponta para domínio G2; produto e direitos ainda precisam ser verificados',
   reclameaqui: 'URL aponta para Reclame Aqui; associação e direitos pendentes',
   github_repository: 'URL aponta para repositório GitHub; associação precisa de revisão',
@@ -807,7 +811,7 @@ const discoveryResourceNames: Record<string, string> = {
   'robots.txt': 'robots.txt', homepage: 'Página inicial', sitemap: 'Sitemap', feed: 'Feed',
   related_page: 'Página relacionada', web_search: 'Busca externa', candidates: 'Seleção de candidatas',
 };
-function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
+export function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
   data: DiscoveryData; products: Product[]; role: Role; busy: boolean;
   act: (action: () => Promise<void>) => Promise<void>;
   request: (path: string, init: RequestInit) => Promise<unknown>; refresh: () => Promise<void>;
@@ -823,7 +827,7 @@ function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
     <p>Busca externa opcional: <strong>Brave Search API</strong>. Só ocorre na ação específica, com até 3 consultas e 5 resultados por consulta. O worker exige credencial e direito contratual de guardar resultados; pode haver custo. Instagram: conector indisponível; Reclame Aqui e G2: acesso e direitos a verificar.</p>
     <div className="discovery-filters"><label>Origem<select value={scope} onChange={event => setScope(event.target.value as typeof scope)}><option value="all">Todas</option><option value="official">Site oficial</option><option value="external">Busca externa</option></select></label>
       <label>Tipo<select value={kind} onChange={event => setKind(event.target.value)}><option value="priority">Prioritárias</option><option value="all">Todos</option>{discoveryCategories.map(item => <option key={item.id} value={item.id}>{item.label}</option>)}</select></label>
-      <label>Estado<select value={state} onChange={event => setState(event.target.value)}><option value="all">Todos</option><option value="pending">Pendente</option><option value="confirmed">Confirmado</option><option value="rejected">Rejeitado</option><option value="rights_pending">Direitos pendentes</option><option value="access_unavailable">Sem conector</option></select></label></div>
+      <label>Estado<select value={state} onChange={event => setState(event.target.value)}><option value="all">Todos</option><option value="existing">Fonte existente</option><option value="pending">Pendente</option><option value="confirmed">Confirmado</option><option value="rejected">Rejeitado</option><option value="rights_pending">Direitos pendentes</option><option value="access_unavailable">Sem conector</option></select></label></div>
     {!competitors.length && <p className="empty">Cadastre primeiro um produto do tipo Concorrente.</p>}
     {competitors.map(product => {
       const profile = data.profiles.find(item => item.product_id === product.id);
@@ -831,7 +835,7 @@ function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
       const candidates = data.candidates.filter(item => item.product_id === product.id);
       const visible = candidates.filter(item => (scope === 'all' || (scope === 'external') === (item.discovery_method === 'web_search'))
         && (kind === 'all' || (kind === 'priority' ? (discoveryPriority[item.suggested_type] ?? 20) >= 60 : item.category === kind))
-        && (state === 'all' || item.status === state));
+        && (state === 'all' || (state === 'existing' ? !!item.existing_source_id : item.status === state)));
       const onsiteCount = candidates.filter(item => item.discovery_method !== 'web_search').length;
       const outsideCount = candidates.length - onsiteCount;
       return <div key={product.id} className="discovery-product"><h3>{product.name}</h3>
@@ -882,18 +886,21 @@ function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
             return <div key={origin} className="discovery-origin"><h4>{origin === 'official' ? 'Links encontrados no site oficial' : 'Sugeridas pela busca externa'} ({fromOrigin.length})</h4>
               {discoveryCategories.map(category => {
             const group = fromOrigin.filter(item => item.category === category.id)
-              .sort((a, b) => (discoveryPriority[b.suggested_type] ?? 20) - (discoveryPriority[a.suggested_type] ?? 20));
+              .sort((a, b) => (discoveryPriority[b.suggested_type] ?? 20) - (discoveryPriority[a.suggested_type] ?? 20)
+                || Number(!!b.existing_source_id) - Number(!!a.existing_source_id)
+                || a.canonical_url.localeCompare(b.canonical_url));
             if (!group.length) return null;
             return <div key={category.id}><h5>{category.label} ({group.length})</h5><ul>{group.map(item => {
               const stale = item.identity_version !== profile.identity_version;
-              const supported = !!item.linked_source_id;
+              const supported = !!(item.linked_source_id || item.existing_source_id);
+              const relatedContent = item.suggested_type === 'changelog_entry' || item.suggested_type === 'product_mention';
               return <li key={item.id}><a href={item.canonical_url} target="_blank" rel="noreferrer">{item.canonical_url}</a>
                 <p>Tipo sugerido: {item.suggested_type} · estado: <strong>{stale ? 'associação antiga: revisar' : item.status}</strong> · vínculo: {item.confidence === 'official_host' ? 'mesmo domínio oficial' : 'link externo, associação ambígua'}.
-                  {' '}{item.discovery_method === 'web_search' ? <>Busca externa {item.search_provider}; consulta: “{item.search_query}”. Resultado não visitado automaticamente.</> : <>Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a>.</>} Examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')}.</p>
-                <p>Motivo da sugestão: {suggestionReason[item.suggested_type] ?? 'termo encontrado no caminho ou no título; exige revisão'}. {item.discovery_method === 'web_search' ? 'Título retornado pela busca (não comprova associação)' : 'Indício da associação'}: “{item.association_evidence}”. {supported ? 'Fonte cadastrada; coleta só após ação própria.' : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' ? 'Conector indisponível; não monitorada.' : item.status === 'confirmed' ? 'Associação revisada; nenhum conector foi cadastrado pela busca externa. Cadastre manualmente na seção do conector após verificar acesso e direitos.' : 'Ainda não monitorada.'}</p>
-                {canManage && !stale && item.status === 'pending' && <><button className="small" disabled={busy} onClick={() => void act(async () => {
+                  {' '}{item.discovery_method === 'web_search' ? <>Busca externa {item.search_provider}; consulta: “{item.search_query}”. Resultado não visitado automaticamente.</> : <>Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a>.</>} Examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')} · regra v{item.classification_version}.</p>
+                <p>Motivo da sugestão: {suggestionReason[item.suggested_type] ?? 'indício no caminho ou no título; exige revisão'}. {item.discovery_method === 'web_search' ? 'Título retornado pela busca (não comprova associação)' : 'Texto do link na origem lida; o destino não foi examinado'}: “{item.association_evidence}”. {supported ? <><strong>Fonte existente.</strong> <a href="#paginas">Ver cadastro ↗</a>; nenhuma nova fonte será criada.</> : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' || relatedContent ? 'Conteúdo relacionado, sem conector de índice; não monitorado como página de preços.' : item.status === 'confirmed' ? 'Associação revisada; nenhum conector foi cadastrado pela busca externa. Cadastre manualmente na seção do conector após verificar acesso e direitos.' : 'Ainda não monitorada.'}</p>
+                {canManage && !stale && !supported && item.status === 'pending' && <><button className="small" disabled={busy} onClick={() => void act(async () => {
                   await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) }); await refresh();
-                })}>Confirmar associação</button><button className="small ghost" disabled={busy} onClick={() => void act(async () => {
+                })}>{relatedContent ? 'Marcar como conteúdo relacionado' : 'Confirmar associação'}</button><button className="small ghost" disabled={busy} onClick={() => void act(async () => {
                   await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'rejected' }) }); await refresh();
                 })}>Rejeitar</button></>}
               </li>;
@@ -935,7 +942,7 @@ export function Overview({ tenantName, role, products, sources, sourceRuns, page
     <section className="card wide"><h2>Cobertura e limites das fontes</h2>
       <p>Issues e Discussions são atividade pública; reviews B2B, CSV e Steam são populações separadas. Coleta parcial, direitos pendentes e interpretações não confirmadas continuam visíveis.</p>
       <p><Link href="/fontes#descoberta">Fontes descobertas</Link>: {new Set(discovery.candidates.map(item => item.canonical_url)).size} URL(s) distinta(s) em {discovery.candidates.length} associação(ões) candidata(s),
-        {' '}{discovery.candidates.filter(item => item.status === 'pending').length} pendente(s) de revisão;
+        {' '}{discovery.candidates.filter(item => item.status === 'pending' && !item.existing_source_id).length} pendente(s) de revisão;
         fontes cadastradas: {sources.length + pages.sources.length}; última coleta bem-sucedida:
         {' '}{[...sourceRuns.filter(run => run.status === 'succeeded'), ...pages.runs.filter(run => run.status === 'succeeded')]
           .sort((a, b) => Date.parse(b.finished_at ?? '') - Date.parse(a.finished_at ?? ''))[0]?.finished_at

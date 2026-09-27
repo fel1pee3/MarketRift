@@ -32,6 +32,7 @@ MAX_RESOURCE_SECONDS = 8
 MAX_SEARCH_QUERIES = 3
 MAX_SEARCH_RESULTS_PER_QUERY = 5
 MAX_SEARCH_RESPONSE_BYTES = 256_000
+CLASSIFICATION_VERSION = 2
 BRAVE_SEARCH_URL = "https://api.search.brave.com/res/v1/web/search"
 RELEVANT = re.compile(r"pricing|price|plans?|pre[cç]os?|changelog|release|updates?|docs?|blog|status|support|help|forum|community|github|discord|reddit|g2|reclame|instagram|linkedin|youtube|app\s?store|play\s?store|rss|atom|feed", re.IGNORECASE)
 
@@ -129,6 +130,7 @@ def candidate_priority(item: Candidate) -> int:
     return {"pricing_page": 100, "release_notes": 95, "g2": 90, "reclameaqui": 85,
             "app_store": 80, "github_repository": 75, "community": 70, "support": 65,
             "social_profile": 60, "status_page": 45, "homepage": 40,
+            "changelog_entry": 60, "product_mention": 35,
             "blog_or_feed": 30, "external_mention": 25, "documentation": 10}.get(item.suggested_type, 20)
 
 
@@ -227,7 +229,8 @@ def search_external(name: str, aliases: list[str], domain: str, *,
                 if not url:
                     continue
                 title = str(result.get("title", ""))[:160].strip()
-                identity = classify(url, title, domain) or ("other", "external_mention", "ambiguous")
+                identity = classify(url, title, domain, from_url=BRAVE_SEARCH_URL,
+                                    method="web_search") or ("other", "external_mention", "ambiguous")
                 category, suggested, _ = identity
                 # Search ranking does not establish identity, rights or customer status.
                 candidates.setdefault(url, Candidate(url, category, suggested, BRAVE_SEARCH_URL,
@@ -263,7 +266,8 @@ class Links(HTMLParser):
             self.current = None
 
 
-def classify(url: str, label: str, official_host: str) -> tuple[str, str, str] | None:
+def classify(url: str, label: str, official_host: str, *, from_url: str = "",
+             method: str = "homepage") -> tuple[str, str, str] | None:
     parsed = urlsplit(url)
     host = parsed.hostname or ""
     clue = f"{parsed.path} {label} {host}".lower()
@@ -283,14 +287,35 @@ def classify(url: str, label: str, official_host: str) -> tuple[str, str, str] |
         return "community", "github_repository", confidence
     if is_host("reddit.com") or is_host("discord.gg") or is_host("discord.com"):
         return "community", "community", "ambiguous"
-    if "status" in clue:
+    path = parsed.path.lower().rstrip("/") or "/"
+    source = urlsplit(from_url)
+    source_path = source.path.lower().rstrip("/")
+    if re.search(r"(?:^|/)(?:docs?|documentation)(?:/|$)", path):
+        return "product", "documentation", confidence
+    if re.search(r"(?:^|/)(?:blog|news|articles?)(?:/|$)", path):
+        return "news", "blog_or_feed", confidence
+    # The relation to a read index is stronger than price words in an anchor.
+    if (source.hostname == host and source_path and
+            re.search(r"(?:^|/)(?:changelog|release-notes|releases)$", source_path) and
+            path.startswith(source_path + "/") and method == "homepage"):
+        return "product", "changelog_entry", confidence
+    # A changelog child also remains an entry when found only in a sitemap.
+    changelog_path = re.search(r"(?:^|/)(?:changelog|release-notes|releases)(?:/|$)", path)
+    if changelog_path:
+        return ("product", "changelog_entry" if path[changelog_path.end():]
+                else "release_notes", confidence)
+    if re.search(r"(?:^|/)(?:pricing|prices|plans?|precos)$", path):
+        return "product", "pricing_page", confidence if host == official_host else "ambiguous"
+    if path.endswith((".rss", ".atom", ".xml")) or re.search(r"(?:^|/)(?:rss|atom|feed)(?:/|$)", path):
+        return "news", "blog_or_feed", confidence
+    if re.search(r"(?:^|/)status(?:/|$)", path):
         return "official_site", "status_page", confidence
     if re.search(r"(?:^|/)(?:docs?|documentation)(?:/|$)", parsed.path.lower()):
         return "product", "documentation", confidence
     if re.search(r"\b(?:pricing|prices?|pre[cç]os?|plans?)\b", clue):
-        return "product", "pricing_page", confidence if host == official_host else "ambiguous"
+        return "product", "product_mention", confidence if host == official_host else "ambiguous"
     if re.search(r"changelog|release|version|updates?", clue):
-        return "product", "release_notes", confidence if host == official_host else "ambiguous"
+        return "product", "product_mention", confidence if host == official_host else "ambiguous"
     if re.search(r"docs?|documentation", clue):
         return "product", "documentation", confidence
     if re.search(r"support|help|forum|community", clue):
@@ -429,7 +454,8 @@ def collect(domain: str, official_urls: list[str], *, lookup=socket.getaddrinfo,
         canonical = safe_link(from_url, url)
         if not canonical:
             return
-        identity = ("official_site", "homepage", "official_host") if canonical == home else classify(canonical, label, domain)
+        identity = (("official_site", "homepage", "official_host") if canonical == home
+                    else classify(canonical, label, domain, from_url=from_url, method=method))
         if identity is None:
             return
         category, suggested, confidence = identity
@@ -682,22 +708,36 @@ async def discover(payload: object) -> dict:
                 result = await connection.execute(
                     "INSERT INTO marketrift.discovery_candidates (tenant_id,product_id,canonical_url,category,"
                     "suggested_type,discovered_from_url,discovery_method,association_evidence,confidence,identity_version,"
-                    "search_provider,search_query) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "search_provider,search_query,classification_version,"
+                    "first_discovered_from_url,first_discovery_method) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (tenant_id,product_id,canonical_url) DO UPDATE SET "
-                    "last_examined_at=now(),identity_version=excluded.identity_version,"
-                    "status=CASE WHEN discovery_candidates.identity_version<>excluded.identity_version "
-                    "THEN 'pending' ELSE discovery_candidates.status END,"
-                    "linked_source_id=CASE WHEN discovery_candidates.identity_version<>excluded.identity_version "
-                    "THEN NULL ELSE discovery_candidates.linked_source_id END,"
-                    "discovered_from_url=excluded.discovered_from_url,discovery_method=excluded.discovery_method,"
-                    "association_evidence=excluded.association_evidence,confidence=excluded.confidence,"
-                    "category=excluded.category,suggested_type=excluded.suggested_type,"
-                    "search_provider=excluded.search_provider,search_query=excluded.search_query "
+                    "last_examined_at=now(),"
+                    "identity_version=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.identity_version ELSE discovery_candidates.identity_version END,"
+                    "discovered_from_url=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.discovered_from_url ELSE discovery_candidates.discovered_from_url END,"
+                    "discovery_method=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.discovery_method ELSE discovery_candidates.discovery_method END,"
+                    "association_evidence=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.association_evidence ELSE discovery_candidates.association_evidence END,"
+                    "confidence=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.confidence ELSE discovery_candidates.confidence END,"
+                    "category=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.category ELSE discovery_candidates.category END,"
+                    "suggested_type=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.suggested_type ELSE discovery_candidates.suggested_type END,"
+                    "classification_version=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.classification_version ELSE discovery_candidates.classification_version END,"
+                    "search_provider=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.search_provider ELSE discovery_candidates.search_provider END,"
+                    "search_query=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.search_query ELSE discovery_candidates.search_query END "
                     "RETURNING (xmax=0)",
                     (job["tenant_id"], job["product_id"], item.url, item.category, item.suggested_type,
                      item.from_url, item.method, item.evidence, item.confidence, version,
-                     item.search_provider, item.search_query))
+                     item.search_provider, item.search_query, CLASSIFICATION_VERSION,
+                     item.from_url, item.method))
                 inserted += int((await result.fetchone())[0])
             await connection.execute(
                 "UPDATE marketrift.discovery_runs SET status='succeeded',pages_examined=%s,candidates_seen=%s,"

@@ -2,6 +2,16 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import test from 'node:test';
+import { schedulerErrorLabel } from '../src/scheduler-error';
+
+test('scheduler diagnostics expose SQLSTATE without leaking connection details', () => {
+  const failure = { name: 'error', code: '42501',
+    message: 'permission denied; password=example-secret; postgres://user:secret@localhost/db' };
+  assert.equal(schedulerErrorLabel(failure), 'PostgreSQL: permissão insuficiente (SQLSTATE 42501)');
+  assert.equal(schedulerErrorLabel({ name: 'error', code: '42P01' }),
+    'PostgreSQL: tabela ausente (SQLSTATE 42P01)');
+  assert.doesNotMatch(schedulerErrorLabel(failure), /secret|postgres:\/\//);
+});
 
 test('development scheduler entry loads Nest parameter decorators from the API workspace', async () => {
   const apiDirectory = resolve(__dirname, '..');

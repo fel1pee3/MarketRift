@@ -5,6 +5,8 @@ import socket
 import pytest
 
 from marketrift_intelligence.source_discovery import (
+    CLASSIFICATION_VERSION,
+    Candidate,
     DiscoveryError,
     classify,
     collect,
@@ -118,6 +120,31 @@ def test_similarity_and_unsafe_links_are_not_official():
     assert classify("https://example.co/pricing", "pricing", "example.com")[2] == "ambiguous"
     assert safe_link("https://example.com/", "http://localhost/admin") is None
     assert safe_link("https://example.com/", "https://169.254.169.254/meta") is None
+
+
+def test_monitorable_indexes_are_distinct_from_entries_and_mentions():
+    host = "vercel.com"
+    index = classify("https://vercel.com/pricing", "Plans", host)
+    releases = classify("https://vercel.com/changelog", "Changelog", host)
+    entry = classify("https://vercel.com/changelog/unlimited-vercel-blob-stores-on-every-plan",
+                     "Unlimited Vercel Blob stores on every plan", host,
+                     from_url="https://vercel.com/changelog")
+    assert CLASSIFICATION_VERSION == 2
+    assert index == ("product", "pricing_page", "official_host")
+    assert releases == ("product", "release_notes", "official_host")
+    assert entry == ("product", "changelog_entry", "official_host")
+    assert classify("https://vercel.com/docs/pricing", "Pricing plans", host)[1] == "documentation"
+    assert classify("https://vercel.com/blog/new-plan", "New plan released", host)[1] == "blog_or_feed"
+    assert classify("https://vercel.com/product/plan-details", "Pricing plans", host)[1] == "product_mention"
+    assert classify("https://elsewhere.example/pricing", "Pricing", host)[2] == "ambiguous"
+    entries = [Candidate("https://vercel.com/changelog/a-plan", "product", "changelog_entry",
+                         "https://vercel.com/changelog", "homepage", "plan", "official_host"),
+               Candidate("https://vercel.com/changelog", "product", "release_notes",
+                         "https://vercel.com/", "homepage", "releases", "official_host"),
+               Candidate("https://vercel.com/pricing", "product", "pricing_page",
+                         "https://vercel.com/", "homepage", "prices", "official_host")]
+    assert [item.suggested_type for item in prioritized_candidates(entries)] == [
+        "pricing_page", "release_notes", "changelog_entry"]
 
 
 def test_contract_rejects_wrong_key():

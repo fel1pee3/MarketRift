@@ -81,8 +81,11 @@ const steamMock = createServer((request, response) => {
     }
     if (url.pathname === '/discovery/') {
       response.writeHead(200, { 'Content-Type': 'text/html' });
-      response.end('<a href="/plans">Pricing</a><a href="/pricing-alt">Alternative pricing</a>'
+      response.end('<a href="/plans">Pricing</a><a href="/prices">Alternative pricing</a>'
         + '<a href="/changelog">Release notes</a>'
+        + '<a href="/changelog/unlimited-stores-on-every-plan">Unlimited stores on every plan</a>'
+        + '<a href="/docs/pricing">Pricing documentation</a>'
+        + '<a href="/blog/new-plan">New plan announcement</a>'
         + '<a href="https://instagram.com/example">Instagram</a>'
         + '<a href="https://thirdparty.com/pricing">Similar company pricing</a>'
         + '<a href="https://github.com/example/repo">Community repository</a>'
@@ -483,8 +486,60 @@ try {
   const priceCandidate = discovered.candidates.find(item => item.canonical_url === 'https://example.com/plans');
   assert(priceCandidate, 'pricing link must be discovered');
   assert.equal(priceCandidate.confidence, 'official_host');
-  const secondPriceCandidate = discovered.candidates.find(item => item.canonical_url === 'https://example.com/pricing-alt');
+  const secondPriceCandidate = discovered.candidates.find(item => item.canonical_url === 'https://example.com/prices');
   assert(secondPriceCandidate);
+  const entryCandidate = discovered.candidates.find(item => item.canonical_url ===
+    'https://example.com/changelog/unlimited-stores-on-every-plan');
+  assert.equal(entryCandidate.suggested_type, 'changelog_entry');
+  assert.equal(entryCandidate.classification_version, 2);
+  assert.equal(discovered.candidates.find(item => item.canonical_url ===
+    'https://example.com/changelog').suggested_type, 'release_notes');
+  assert.equal(discovered.candidates.find(item => item.canonical_url ===
+    'https://example.com/docs/pricing').suggested_type, 'documentation');
+  assert.equal(discovered.candidates.find(item => item.canonical_url ===
+    'https://example.com/blog/new-plan').suggested_type, 'blog_or_feed');
+  const runtimeAudit = new pg.Client({ connectionString: process.env.RUNTIME_DATABASE_URL });
+  try {
+    await runtimeAudit.connect();
+    await runtimeAudit.query('BEGIN');
+    await runtimeAudit.query("SELECT set_config('app.tenant_id',$1,true)", [registeredA.body.tenant_id]);
+    await runtimeAudit.query("UPDATE marketrift.discovery_candidates SET suggested_type='product_mention' "
+      + 'WHERE tenant_id=$1 AND id=$2', [registeredA.body.tenant_id, entryCandidate.id]);
+    const recorded = await runtimeAudit.query('SELECT id FROM marketrift.discovery_classification_history '
+      + 'WHERE tenant_id=$1 AND candidate_id=$2', [registeredA.body.tenant_id, entryCandidate.id]);
+    assert.equal(recorded.rowCount, 1, 'runtime tenant can write its own classification audit');
+    await runtimeAudit.query('ROLLBACK');
+  } finally { await runtimeAudit.end(); }
+  const misleadingDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await misleadingDb.connect();
+    await misleadingDb.query("UPDATE marketrift.discovery_candidates SET suggested_type='pricing_page' "
+      + 'WHERE tenant_id=$1 AND id=$2', [registeredA.body.tenant_id, entryCandidate.id]);
+    const blocked = await admin.call(`source-discovery/candidates/${entryCandidate.id}/decision`,
+      { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) });
+    assert.equal(blocked.status, 409);
+    assert.equal(blocked.body.code, 'candidate_not_monitorable');
+    await misleadingDb.query("UPDATE marketrift.discovery_candidates SET suggested_type='changelog_entry' "
+      + 'WHERE tenant_id=$1 AND id=$2', [registeredA.body.tenant_id, entryCandidate.id]);
+    const audit = await misleadingDb.query('SELECT id FROM marketrift.discovery_classification_history '
+      + 'WHERE tenant_id=$1 AND candidate_id=$2', [registeredA.body.tenant_id, entryCandidate.id]);
+    assert.equal(audit.rowCount, 2, 'both controlled reclassifications retain history');
+  } finally { await misleadingDb.end(); }
+  const historyRls = new pg.Client({ connectionString: process.env.RUNTIME_DATABASE_URL });
+  try {
+    await historyRls.connect();
+    await historyRls.query('BEGIN');
+    await historyRls.query("SELECT set_config('app.tenant_id',$1,true)", [registeredB.body.tenant_id]);
+    const invisible = await historyRls.query('SELECT id FROM marketrift.discovery_classification_history '
+      + 'WHERE tenant_id=$1 AND candidate_id=$2', [registeredA.body.tenant_id, entryCandidate.id]);
+    assert.equal(invisible.rowCount, 0);
+    await historyRls.query('ROLLBACK');
+  } finally { await historyRls.end(); }
+  const relatedDecision = await admin.call(`source-discovery/candidates/${entryCandidate.id}/decision`,
+    { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) });
+  assert.equal(relatedDecision.status, 200);
+  assert.equal(relatedDecision.body.status, 'access_unavailable');
+  assert.equal(relatedDecision.body.linked_source_id, null);
   assert(discovered.candidates.some(item => item.canonical_url === 'https://instagram.com/example'));
   assert.equal(discovered.candidates.find(item => item.canonical_url === 'https://thirdparty.com/pricing').confidence, 'ambiguous');
   const existingDiscoveryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
@@ -497,6 +552,8 @@ try {
       [registeredA.body.tenant_id, competitor.body.id]);
     alreadyRegisteredId = registered.rows[0].id;
   } finally { await existingDiscoveryDb.end(); }
+  assert.equal((await a.call('source-discovery')).body.candidates.find(item =>
+    item.id === priceCandidate.id).existing_source_id, alreadyRegisteredId);
   assert.equal((await viewer.call(`source-discovery/candidates/${priceCandidate.id}/decision`, { method: 'POST',
     body: JSON.stringify({ decision: 'confirmed' }) })).status, 403);
   assert.equal((await b.call(`source-discovery/candidates/${priceCandidate.id}/decision`, { method: 'POST',
@@ -549,6 +606,11 @@ try {
     await delay(150);
   }
   assert.equal(discovered.runs.find(item => item.id === discoveryRepeat.body.id).candidates_new, 0);
+  assert.equal(discovered.candidates.find(item => item.id === priceCandidate.id).status, 'confirmed');
+  assert.equal(discovered.candidates.find(item => item.id === priceCandidate.id).linked_source_id,
+    alreadyRegisteredId);
+  assert.equal(discovered.candidates.find(item => item.id === entryCandidate.id).status,
+    'access_unavailable', 'repeated collection must preserve the reviewed decision');
   const partialRun = discovered.runs.find(item => item.id === discoveryRepeat.body.id);
   assert.equal(partialRun.partial, true);
   assert(partialRun.resource_failures.some(item => item.resource === 'sitemap'

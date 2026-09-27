@@ -3,7 +3,7 @@ import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import test from 'node:test';
 import { makeDiscoveryJob } from '../src/source-discovery-job';
-import { officialDomain } from '../src/source-discovery';
+import { monitorablePageCandidate, officialDomain } from '../src/source-discovery';
 
 test('official domain is normalized and unsafe destinations are rejected', () => {
   assert.equal(officialDomain('EXAMPLE.com'), 'example.com');
@@ -13,6 +13,17 @@ test('official domain is normalized and unsafe destinations are rejected', () =>
     'https://example.com:8443', 'https://user:pass@example.com']) {
     assert.throws(() => officialDomain(value));
   }
+});
+
+test('only a pricing or changelog index can be registered as a page source', () => {
+  assert.equal(monitorablePageCandidate('pricing_page', 'https://vercel.com/pricing'), true);
+  assert.equal(monitorablePageCandidate('release_notes', 'https://vercel.com/changelog'), true);
+  assert.equal(monitorablePageCandidate('pricing_page',
+    'https://vercel.com/changelog/unlimited-vercel-blob-stores-on-every-plan'), false);
+  assert.equal(monitorablePageCandidate('release_notes',
+    'https://vercel.com/changelog/unlimited-vercel-blob-stores-on-every-plan'), false);
+  assert.equal(monitorablePageCandidate('pricing_page', 'https://vercel.com/docs/pricing/limits'), false);
+  assert.equal(monitorablePageCandidate('changelog_entry', 'https://vercel.com/changelog/a-plan'), false);
 });
 
 test('TypeScript discovery job is accepted by the Python worker contract', () => {

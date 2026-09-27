@@ -3,6 +3,7 @@ import { Db } from './db';
 import { Jobs } from './queue';
 import { PageScheduler } from './page-scheduler';
 import { SignalScheduler } from './signal-scheduler';
+import { schedulerErrorLabel } from './scheduler-error';
 
 if (!process.env.PROVISION_DATABASE_URL || !process.env.REDIS_URL) {
   throw new Error('PROVISION_DATABASE_URL and REDIS_URL are required');
@@ -24,9 +25,9 @@ async function main(): Promise<void> {
   try {
     while (!stopping) {
       try { await scheduler.tick(); }
-      catch (error) { console.warn('Page scheduler tick failed:', error instanceof Error ? error.name : 'unknown'); }
+      catch (error) { console.warn('Page scheduler tick failed:', schedulerErrorLabel(error)); }
       try { await signals.tick(); }
-      catch (error) { console.warn('Signal scheduler tick failed:', error instanceof Error ? error.name : 'unknown'); }
+      catch (error) { console.warn('Signal scheduler tick failed:', schedulerErrorLabel(error)); }
       if (!stopping) await new Promise<void>(resolve => {
         const timer = setTimeout(resolve, pollMs);
         wake = () => { clearTimeout(timer); resolve(); };
