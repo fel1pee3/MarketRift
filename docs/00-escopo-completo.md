@@ -35,6 +35,8 @@ Reduzir o trabalho manual de inteligencia competitiva e ajudar equipes de produt
 
 ReclameAqui, G2, App Store, sites oficiais e outras fontes sao **candidatas**, nao conectores prometidos antes de confirmar acesso permitido, limites e dados necessarios. Cada conector tem contrato proprio e evidencia de coleta. Nunca contornar bloqueios ou assumir que uma pagina publica autoriza coleta automatizada.
 
+**Roteiro de fontes ainda sem conector:** foruns, redes sociais, lojas de aplicativos, sites de reclamacao e noticias devem ser entregas separadas, condicionadas a API/condicoes oficiais, credenciais quando necessarias, proveniencia, direitos e testes de cobertura. A descoberta de URLs nao equivale a coletar o conteudo dessas familias. O monitoramento opt-in de GitHub Issues e Discussions cobre apenas atividade publica desses repositorios, nao reviews verificadas de clientes.
+
 ## Fora das afirmacoes do produto
 
 Nao prometer identificar quem abandonou um concorrente, obter o market share real, responder em tres segundos em qualquer carga, prever receita ou provar que uma atualizacao causou reclamacoes. Apresentar distribuicao da amostra, janela, cobertura e incerteza.

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -20,6 +21,13 @@ VALIDATOR = Draft202012Validator(SCHEMA, format_checker=FormatChecker())
 REPOSITORY = re.compile(r"^https://github\.com/([A-Za-z0-9][A-Za-z0-9-]{0,38})/([A-Za-z0-9_.-]{1,100})$")
 HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28",
            "User-Agent": "MarketRift-public-issues-connector"}
+
+
+def api_base() -> str:
+    candidate = os.getenv("GITHUB_ISSUES_TEST_BASE_URL", "")
+    if os.getenv("MARKETRIFT_TEST_MODE") == "1" and re.fullmatch(r"http://127\.0\.0\.1:[0-9]{2,5}", candidate):
+        return candidate
+    return "https://api.github.com"
 
 
 class GitHubIssue(BaseModel):
@@ -90,23 +98,50 @@ def has_next(link_header: str, api_path: str, page: int) -> bool:
 
 
 async def fetch_issues(repository_url: str, cursor: str | None, max_pages: int, max_items: int,
-                       client: httpx.AsyncClient) -> tuple[list[GitHubIssue], int, int, str | None]:
+                       client: httpx.AsyncClient, before_request: Callable[[], Awaitable[None]] | None = None
+                       ) -> tuple[list[GitHubIssue], int, int, str | None]:
     owner, repo = repository_parts(repository_url)
     api_path = f"/repos/{owner}/{repo}/issues"
     result: list[GitHubIssue] = []
     skipped = 0
     pages = 0
-    latest = datetime.fromisoformat(cursor) if cursor else None
-    since = (latest - timedelta(seconds=60)).isoformat().replace("+00:00", "Z") if latest else None
-    for page in range(1, max_pages + 1):
+    try:
+        if cursor and cursor.startswith("issues-v2:"):
+            state = json.loads(cursor[len("issues-v2:"):])
+            if (state.get("v") != 2 or state.get("mode") not in ("initial", "incremental")
+                    or not isinstance(state.get("page"), int) or state["page"] < 1
+                    or not isinstance(state.get("offset"), int) or state["offset"] < 0
+                    or not isinstance(state.get("page_size"), int) or not 1 <= state["page_size"] <= 50):
+                raise ValueError("invalid cursor")
+            page, offset, page_size = state["page"], state["offset"], state["page_size"]
+            mode, watermark = state["mode"], state.get("watermark")
+            latest = datetime.fromisoformat(watermark) if watermark else None
+            since = state.get("since")
+        else:
+            page, offset, page_size = 1, 0, min(max_items, 50)
+            latest = datetime.fromisoformat(cursor) if cursor else None
+            mode = "incremental" if cursor else "initial"
+            watermark = cursor
+            since = ((latest - timedelta(seconds=60)).isoformat().replace("+00:00", "Z")
+                     if mode == "incremental" and latest else None)
+        if latest and latest.tzinfo is None:
+            raise ValueError("naive cursor")
+    except (ValueError, KeyError, TypeError, AttributeError) as error:
+        raise CollectionError("invalid_cursor") from error
+    if (mode == "incremental" and not isinstance(since, str)) or (mode == "initial" and since is not None):
+        raise CollectionError("invalid_cursor")
+    next_exists = False
+    for _ in range(max_pages):
         params: dict[str, str | int] = {"state": "all", "sort": "updated",
                                         "direction": "asc" if since else "desc",
-                                        "per_page": min(max_items, 50), "page": page}
+                                        "per_page": page_size, "page": page}
         if since:
             params["since"] = since
         for attempt in range(3):
+            if before_request:
+                await before_request()
             try:
-                response = await client.get(f"https://api.github.com{api_path}", params=params, headers=HEADERS)
+                response = await client.get(f"{api_base()}{api_path}", params=params, headers=HEADERS)
             except (httpx.TimeoutException, httpx.NetworkError) as error:
                 if attempt == 2:
                     raise CollectionError("network_failure") from error
@@ -139,7 +174,10 @@ async def fetch_issues(repository_url: str, cursor: str | None, max_pages: int, 
             payload = response.json()
             if not isinstance(payload, list):
                 raise TypeError("not a list")
-            for item in payload:
+            next_exists = has_next(response.headers.get("link", ""), api_path, page)
+            for index, item in enumerate(payload):
+                if index < offset:
+                    continue
                 if not isinstance(item, dict):
                     raise TypeError("not an object")
                 if "pull_request" in item:
@@ -153,11 +191,27 @@ async def fetch_issues(repository_url: str, cursor: str | None, max_pages: int, 
                 if latest is None or issue.updated_at > latest:
                     latest = issue.updated_at
                 if len(result) >= max_items:
-                    break
+                    next_offset = index + 1
+                    if next_offset >= len(payload):
+                        page, offset = page + 1, 0
+                        if not next_exists:
+                            return result, pages, skipped, latest.isoformat() if latest else watermark
+                    else:
+                        offset = next_offset
+                    state = {"v": 2, "mode": mode, "page": page, "offset": offset,
+                             "page_size": page_size, "since": since,
+                             "watermark": latest.isoformat() if latest else watermark}
+                    return result, pages, skipped, "issues-v2:" + json.dumps(state, separators=(",", ":"))
         except (ValueError, ValidationError, TypeError) as error:
             raise CollectionError("invalid_issue_payload") from error
-        if len(result) >= max_items or not has_next(response.headers.get("link", ""), api_path, page):
+        if not next_exists:
             break
+        page, offset = page + 1, 0
+    if next_exists:
+        state = {"v": 2, "mode": mode, "page": page, "offset": offset,
+                 "page_size": page_size, "since": since,
+                 "watermark": latest.isoformat() if latest else watermark}
+        return result, pages, skipped, "issues-v2:" + json.dumps(state, separators=(",", ":"))
     return result, pages, skipped, latest.isoformat() if latest else cursor
 
 
@@ -173,20 +227,29 @@ async def _finish_failed(job: dict, error: CollectionError) -> None:
 
 async def sync_github_issues(payload: object, client: httpx.AsyncClient | None = None) -> dict:
     job = validate_job(payload)
+    from .github_monitor import ensure_scheduled_run
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
         source = await (await connection.execute(
-            "SELECT url FROM marketrift.sources WHERE tenant_id = %s AND id = %s "
-            "AND source_type = 'github_issues' AND enabled = true",
+            "SELECT s.url,s.github_monitor_generation,s.monitoring_enabled FROM marketrift.sources s "
+            "JOIN marketrift.products p ON p.tenant_id=s.tenant_id AND p.id=s.product_id "
+            "WHERE s.tenant_id = %s AND s.id = %s "
+            "AND s.source_type = 'github_issues' AND s.enabled = true",
             (job["tenant_id"], job["source_id"]),
         )).fetchone()
         run = await (await connection.execute(
-            "SELECT status, cursor_before, max_pages, max_items FROM marketrift.source_runs "
+            "SELECT status, cursor_before, max_pages, max_items, trigger_kind,github_monitor_generation "
+            "FROM marketrift.source_runs "
             "WHERE tenant_id = %s AND id = %s AND source_id = %s FOR UPDATE",
             (job["tenant_id"], job["run_id"], job["source_id"]),
         )).fetchone()
         if source is None or run is None or run[2] is None:
             raise CollectionError("source_or_run_not_in_tenant")
+        if run[4] == "scheduled" and (not source[2] or run[5] != source[1]
+                                           or job.get("monitor_generation") != source[1]):
+            raise CollectionError("monitoring_changed")
+        if run[4] == "manual" and job.get("monitor_generation") is not None:
+            raise CollectionError("invalid_monitor_generation")
         if run[0] == "succeeded":
             return {"status": "succeeded", "replayed": True}
         if run[0] != "pending":
@@ -201,18 +264,31 @@ async def sync_github_issues(payload: object, client: httpx.AsyncClient | None =
     assert client is not None
     try:
         repository_parts(source[0])
-        issues, pages, skipped, cursor_after = await fetch_issues(source[0], run[1], run[2], run[3], client)
+        guard = (lambda: ensure_scheduled_run(job, "github_issues", source[0])) if run[4] == "scheduled" else None
+        issues, pages, skipped, cursor_after = await fetch_issues(
+            source[0], run[1], run[2], run[3], client, guard)
         owner, repo = repository_parts(source[0])
         repository = f"{owner}/{repo}"
         new_count = 0
         updated_count = 0
         async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
             await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
+            locked_source = await (await connection.execute(
+                "SELECT s.github_monitor_generation,s.monitoring_enabled FROM marketrift.sources s "
+                "JOIN marketrift.products p ON p.tenant_id=s.tenant_id AND p.id=s.product_id "
+                "WHERE s.tenant_id=%s AND s.id=%s AND s.source_type='github_issues' "
+                "AND s.enabled AND s.url=%s FOR UPDATE OF s",
+                (job["tenant_id"], job["source_id"], source[0]),
+            )).fetchone()
             locked = await (await connection.execute(
-                "SELECT status FROM marketrift.source_runs WHERE tenant_id = %s AND id = %s AND source_id = %s FOR UPDATE",
+                "SELECT status,trigger_kind,github_monitor_generation FROM marketrift.source_runs "
+                "WHERE tenant_id = %s AND id = %s AND source_id = %s FOR UPDATE",
                 (job["tenant_id"], job["run_id"], job["source_id"]),
             )).fetchone()
-            if locked is None or locked[0] != "running":
+            if (locked_source is None or locked is None or locked[0] != "running" or
+                    (locked[1] == "scheduled" and
+                     (not locked_source[1] or locked_source[0] != locked[2]
+                      or locked[2] != job.get("monitor_generation")))):
                 raise CollectionError("run_state_changed")
             for issue in issues:
                 original_body = issue.body or ""
@@ -248,9 +324,11 @@ async def sync_github_issues(payload: object, client: httpx.AsyncClient | None =
                     updated_count += 1
             await connection.execute(
                 "UPDATE marketrift.source_runs SET status = 'succeeded', cursor_after = %s, "
+                "scan_complete = %s, "
                 "documents_seen = %s, documents_new = %s, documents_updated = %s, pages_fetched = %s, "
                 "pull_requests_skipped = %s, finished_at = now() WHERE id = %s",
-                (cursor_after, len(issues), new_count, updated_count, pages, skipped, job["run_id"]),
+                (cursor_after, not bool(cursor_after and cursor_after.startswith("issues-v2:")),
+                 len(issues), new_count, updated_count, pages, skipped, job["run_id"]),
             )
             await connection.execute(
                 "UPDATE marketrift.sources SET last_checked_at = now() WHERE tenant_id = %s AND id = %s",

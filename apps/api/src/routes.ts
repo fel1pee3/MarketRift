@@ -57,6 +57,8 @@ const b2bAnalysisInput = z.discriminatedUnion('provider', [
     budget_usd: z.number().min(0.0001).max(0.05) }).strict(),
 ]);
 const githubSyncInput = z.object({ max_pages: z.number().int().min(1).max(3), max_items: z.number().int().min(1).max(50) }).strict();
+const githubMonitorInput = z.object({ enabled: z.boolean(),
+  interval_minutes: z.union([z.literal(360), z.literal(1440), z.literal(10080)]) }).strict();
 const csvRow = z.object({ external_key: z.string().trim().min(1).max(200), source_url: httpUrl, published_at: z.iso.datetime({ offset: true }), body: z.string().trim().min(1).max(10000), synthetic: z.enum(['true', 'false', '']).optional() }).strict();
 const b2bCsvRow = z.object({ external_key: z.string().trim().min(1).max(200),
   source_url: httpUrl,
@@ -99,7 +101,7 @@ type SourceRow = QueryResultRow & { id: string; product_id: string; source_type:
   b2b_deletion_next_attempt_at?: Date | null; b2b_deletion_attempts?: number;
   b2b_deletion_completed_at?: Date | null; b2b_deleted_documents?: number;
   b2b_deleted_import_rows?: number };
-type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
+type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; trigger_kind: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
 type ImportRow = QueryResultRow & { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: Date; finished_at: Date | null };
 type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
 
@@ -462,8 +464,9 @@ export class ApiController {
       await client.query("UPDATE marketrift.source_runs SET status = 'failed', error_code = 'worker_timeout', finished_at = now() "
         + "WHERE source_id = $1 AND max_pages IS NOT NULL AND status = 'running' "
         + "AND started_at < now() - interval '10 minutes'", [sourceId]);
-      const active = await this.db.rows<{ id: string; status: string }>(client,
-        "SELECT id, status FROM marketrift.source_runs WHERE source_id = $1 AND max_pages IS NOT NULL AND status IN ('pending', 'running') ORDER BY started_at DESC LIMIT 1", [sourceId]);
+      const active = await this.db.rows<{ id: string; status: string; trigger_kind: string;
+        github_monitor_generation: number | null }>(client,
+        "SELECT id, status, trigger_kind, github_monitor_generation FROM marketrift.source_runs WHERE source_id = $1 AND max_pages IS NOT NULL AND status IN ('pending', 'running') ORDER BY started_at DESC LIMIT 1", [sourceId]);
       if (active[0]) {
         if (active[0].status === 'running') throw new ConflictException('Sync already running');
         return { run: active[0], sourceType: source[0].source_type };
@@ -475,26 +478,92 @@ export class ApiController {
         "SELECT cursor_after, scan_complete FROM marketrift.source_runs WHERE source_id = $1 AND status = 'succeeded' AND max_pages IS NOT NULL ORDER BY finished_at DESC LIMIT 1", [sourceId]);
       const cursor = source[0].source_type === 'github_discussions' && previous[0]?.scan_complete === false
         ? previous[0].cursor_after : source[0].source_type === 'github_discussions' ? null : previous[0]?.cursor_after ?? null;
-      const rows = await this.db.rows<{ id: string; status: string }>(client,
-        "INSERT INTO marketrift.source_runs (tenant_id, source_id, status, cursor_before, max_pages, max_items) VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id, status",
+      const rows = await this.db.rows<{ id: string; status: string; trigger_kind: string;
+        github_monitor_generation: number | null }>(client,
+        "INSERT INTO marketrift.source_runs (tenant_id, source_id, status, cursor_before, max_pages, max_items) VALUES ($1, $2, 'pending', $3, $4, $5) RETURNING id, status, trigger_kind, github_monitor_generation",
         [principal.tenantId, sourceId, cursor, limits.max_pages, limits.max_items]);
       return { run: rows[0]!, sourceType: source[0].source_type };
     });
     try {
       if (created.sourceType === 'steam_reviews') await this.jobs.publishSteam(makeSteamJob(principal.tenantId, sourceId, created.run.id));
       else if (created.sourceType === 'g2') await this.jobs.publishG2(makeG2Job(principal.tenantId, sourceId, created.run.id));
-      else if (created.sourceType === 'github_discussions') await this.jobs.publishDiscussions(makeGitHubDiscussionsJob(principal.tenantId, sourceId, created.run.id));
-      else await this.jobs.publishGitHub(makeGitHubJob(principal.tenantId, sourceId, created.run.id));
+      else if (created.sourceType === 'github_discussions') await this.jobs.publishDiscussions(makeGitHubDiscussionsJob(
+        principal.tenantId, sourceId, created.run.id, created.run.trigger_kind === 'scheduled'
+          ? created.run.github_monitor_generation ?? undefined : undefined));
+      else await this.jobs.publishGitHub(makeGitHubJob(principal.tenantId, sourceId, created.run.id,
+        created.run.trigger_kind === 'scheduled' ? created.run.github_monitor_generation ?? undefined : undefined));
     }
     catch { /* Pending run can be retried with the same endpoint and job ID. */ }
     return created.run;
+  }
+
+  @Get('github-monitor')
+  async githubMonitor(@Req() request: Request): Promise<QueryResultRow[]> {
+    const principal = await this.principal(request);
+    return this.db.tenant(principal.tenantId, client => this.db.rows(client, `
+      SELECT s.id AS source_id,s.monitoring_enabled,s.check_interval_minutes AS interval_minutes,
+        s.next_check_at,s.github_monitor_generation,r.started_at AS last_attempt_at,
+        success.finished_at AS last_success_at,r.status AS last_status,r.error_code AS last_error,
+        r.retry_after_at,r.scan_complete,
+        coalesce(active.active,false) AS running,
+        coalesce(success.scan_complete=false,false) AS cursor_pending
+      FROM marketrift.sources s
+      LEFT JOIN LATERAL (SELECT started_at,status,error_code,retry_after_at,scan_complete
+        FROM marketrift.source_runs WHERE tenant_id=s.tenant_id AND source_id=s.id
+          AND max_pages IS NOT NULL ORDER BY started_at DESC,id DESC LIMIT 1) r ON true
+      LEFT JOIN LATERAL (SELECT finished_at,scan_complete FROM marketrift.source_runs
+        WHERE tenant_id=s.tenant_id AND source_id=s.id AND max_pages IS NOT NULL
+          AND status='succeeded' ORDER BY finished_at DESC,id DESC LIMIT 1) success ON true
+      LEFT JOIN LATERAL (SELECT true AS active FROM marketrift.source_runs
+        WHERE tenant_id=s.tenant_id AND source_id=s.id AND max_pages IS NOT NULL
+          AND status IN ('pending','running') LIMIT 1) active ON true
+      WHERE s.source_type IN ('github_issues','github_discussions') ORDER BY s.id`));
+  }
+
+  @Post('github-monitor/:id')
+  @HttpCode(200)
+  async configureGitHubMonitor(@Req() request: Request, @Param('id') idValue: string,
+    @Body() body: unknown): Promise<{ source_id: string; monitoring_enabled: boolean;
+      interval_minutes: number; next_check_at: Date | null }> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, idValue);
+    const data = input(githubMonitorInput, body);
+    return this.db.tenant(principal.tenantId, async client => {
+      const rows = await this.db.rows<{ id: string; enabled: boolean; monitoring_enabled: boolean;
+        check_interval_minutes: number | null; access_environment: string | null }>(client,
+        `SELECT s.id,s.enabled,s.monitoring_enabled,s.check_interval_minutes,s.access_environment
+         FROM marketrift.sources s JOIN marketrift.products p
+           ON p.tenant_id=s.tenant_id AND p.id=s.product_id
+         WHERE s.id=$1 AND s.source_type IN ('github_issues','github_discussions') FOR UPDATE OF s`, [id]);
+      const source = rows[0];
+      if (!source) throw new NotFoundException('GitHub source not found');
+      if (data.enabled && (!source.enabled ||
+          (source.access_environment === 'sandbox' && process.env.MARKETRIFT_TEST_MODE !== '1')))
+        throw new ConflictException('Source is disabled or reserved for TESTE');
+      const changed = source.monitoring_enabled !== data.enabled
+        || source.check_interval_minutes !== data.interval_minutes;
+      if (changed) await client.query(`UPDATE marketrift.sources SET
+        monitoring_enabled=$2,check_interval_minutes=$3,
+        next_check_at=CASE WHEN $2::boolean=false THEN NULL WHEN monitoring_enabled=false THEN now()
+          ELSE now()+$3::integer*interval '1 minute' END WHERE id=$1`,
+      [id,data.enabled,data.interval_minutes]);
+      if (!data.enabled) await client.query(`UPDATE marketrift.source_runs SET status='failed',
+        error_code='monitoring_paused',finished_at=now() WHERE source_id=$1
+        AND trigger_kind='scheduled' AND run_kind='connector' AND status IN ('pending','running')`, [id]);
+      const updated = await this.db.rows<{ id: string; monitoring_enabled: boolean;
+        check_interval_minutes: number; next_check_at: Date | null }>(client,
+        'SELECT id,monitoring_enabled,check_interval_minutes,next_check_at FROM marketrift.sources WHERE id=$1', [id]);
+      return { source_id: id, monitoring_enabled: updated[0]!.monitoring_enabled,
+        interval_minutes: updated[0]!.check_interval_minutes,
+        next_check_at: updated[0]!.next_check_at };
+    });
   }
 
   @Get('source-runs')
   async sourceRuns(@Req() request: Request): Promise<SourceRunRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRunRow>(client,
-      "SELECT r.id, r.source_id, r.status, r.documents_seen, r.documents_new, r.documents_updated, r.documents_ignored, r.scan_complete, r.pages_fetched, r.pull_requests_skipped, r.error_code, r.retry_after_at, r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id WHERE s.source_type IN ('github_issues', 'github_discussions', 'steam_reviews', 'g2') ORDER BY r.started_at DESC LIMIT 50"));
+      "SELECT r.id, r.source_id, r.status, r.trigger_kind, r.documents_seen, r.documents_new, r.documents_updated, r.documents_ignored, r.scan_complete, r.pages_fetched, r.pull_requests_skipped, r.error_code, r.retry_after_at, r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id WHERE s.source_type IN ('github_issues', 'github_discussions', 'steam_reviews', 'g2') ORDER BY r.started_at DESC LIMIT 50"));
   }
 
   @Post('imports/b2b-reviews')

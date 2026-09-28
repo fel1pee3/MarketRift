@@ -8,6 +8,7 @@ export interface SyncGitHubIssuesJobV1 {
   tenant_id: string;
   source_id: string;
   run_id: string;
+  monitor_generation?: number;
   idempotency_key: string;
 }
 const ajv = new Ajv2020({ strict: false });
@@ -15,9 +16,11 @@ addFormats(ajv);
 const schema = JSON.parse(readFileSync(join(__dirname, '../../../packages/contracts/sync-github-issues-job.v1.schema.json'), 'utf8')) as object;
 const validate = ajv.compile<SyncGitHubIssuesJobV1>(schema);
 
-export function makeGitHubJob(tenantId: string, sourceId: string, runId: string): SyncGitHubIssuesJobV1 {
+export function makeGitHubJob(tenantId: string, sourceId: string, runId: string,
+  monitorGeneration?: number): SyncGitHubIssuesJobV1 {
   const job: SyncGitHubIssuesJobV1 = {
     version: 1, tenant_id: tenantId, source_id: sourceId, run_id: runId,
+    ...(monitorGeneration === undefined ? {} : { monitor_generation: monitorGeneration }),
     idempotency_key: `github-issues-${runId}-v1`,
   };
   if (!validate(job)) throw new Error(`Invalid GitHub job contract: ${ajv.errorsText(validate.errors)}`);

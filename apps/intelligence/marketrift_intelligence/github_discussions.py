@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import re
+from collections.abc import Awaitable, Callable
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -89,7 +90,8 @@ def graphql_error_code(messages: list[str]) -> str:
 
 
 async def fetch_discussions(repository_url: str, cursor: str | None, max_pages: int,
-                            max_items: int, client: httpx.AsyncClient, token: str
+                            max_items: int, client: httpx.AsyncClient, token: str,
+                            before_request: Callable[[], Awaitable[None]] | None = None
                             ) -> tuple[list[Discussion], int, str | None, bool]:
     owner, repo = repository_parts(repository_url)
     if not token:
@@ -103,6 +105,8 @@ async def fetch_discussions(repository_url: str, cursor: str | None, max_pages: 
     for _ in range(max_pages):
         variables = {"owner": owner, "repo": repo, "first": min(20, max_items - len(seen)), "after": after}
         for attempt in range(3):
+            if before_request:
+                await before_request()
             try:
                 response = await client.post(endpoint(), json={"query": QUERY, "variables": variables},
                                              headers={"Authorization": f"Bearer {token}",
@@ -196,21 +200,28 @@ async def _fail(job: dict, error: CollectionError) -> None:
 
 async def sync_github_discussions(payload: object, client: httpx.AsyncClient | None = None) -> dict:
     job = validate_job(payload)
+    from .github_monitor import ensure_scheduled_run
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
         source = await (await connection.execute(
-            "SELECT s.url FROM marketrift.sources s JOIN marketrift.products p "
+            "SELECT s.url,s.github_monitor_generation,s.monitoring_enabled FROM marketrift.sources s JOIN marketrift.products p "
             "ON p.tenant_id = s.tenant_id AND p.id = s.product_id "
             "WHERE s.tenant_id = %s AND s.id = %s AND s.source_type = 'github_discussions' AND s.enabled",
             (job["tenant_id"], job["source_id"]),
         )).fetchone()
         run = await (await connection.execute(
-            "SELECT status, cursor_before, max_pages, max_items FROM marketrift.source_runs "
+            "SELECT status, cursor_before, max_pages, max_items,trigger_kind,github_monitor_generation "
+            "FROM marketrift.source_runs "
             "WHERE tenant_id = %s AND id = %s AND source_id = %s FOR UPDATE",
             (job["tenant_id"], job["run_id"], job["source_id"]),
         )).fetchone()
         if source is None or run is None or run[2] is None:
             raise CollectionError("source_or_run_not_in_tenant")
+        if run[4] == "scheduled" and (not source[2] or run[5] != source[1]
+                                           or job.get("monitor_generation") != source[1]):
+            raise CollectionError("monitoring_changed")
+        if run[4] == "manual" and job.get("monitor_generation") is not None:
+            raise CollectionError("invalid_monitor_generation")
         if run[0] != "pending":
             return {"status": run[0], "replayed": True}
         await connection.execute("UPDATE marketrift.source_runs SET status = 'running', started_at = now() WHERE id = %s",
@@ -220,22 +231,33 @@ async def sync_github_discussions(payload: object, client: httpx.AsyncClient | N
         client = httpx.AsyncClient(timeout=10, follow_redirects=False)
     assert client is not None
     try:
+        guard = (lambda: ensure_scheduled_run(job, "github_discussions", source[0])) if run[4] == "scheduled" else None
         discussions, pages, cursor_after, complete = await fetch_discussions(
-            source[0], run[1], run[2], run[3], client, os.getenv("GITHUB_DISCUSSIONS_TOKEN", ""))
+            source[0], run[1], run[2], run[3], client, os.getenv("GITHUB_DISCUSSIONS_TOKEN", ""), guard)
         owner, repo = repository_parts(source[0])
         repository = f"{owner}/{repo}"
         new_count = updated_count = 0
         async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
             await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
+            locked_source = await (await connection.execute(
+                "SELECT s.github_monitor_generation,s.monitoring_enabled FROM marketrift.sources s "
+                "JOIN marketrift.products p ON p.tenant_id=s.tenant_id AND p.id=s.product_id "
+                "WHERE s.tenant_id=%s AND s.id=%s AND s.source_type='github_discussions' "
+                "AND s.enabled AND s.url=%s FOR UPDATE OF s",
+                (job["tenant_id"], job["source_id"], source[0]),
+            )).fetchone()
             locked = await (await connection.execute(
-                "SELECT r.status FROM marketrift.source_runs r JOIN marketrift.sources s "
+                "SELECT r.status,r.trigger_kind,r.github_monitor_generation FROM marketrift.source_runs r JOIN marketrift.sources s "
                 "ON s.tenant_id = r.tenant_id AND s.id = r.source_id "
                 "JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id "
                 "WHERE r.tenant_id = %s AND r.id = %s AND r.source_id = %s "
                 "AND s.source_type = 'github_discussions' AND s.enabled AND s.url = %s FOR UPDATE OF r",
                 (job["tenant_id"], job["run_id"], job["source_id"], source[0]),
             )).fetchone()
-            if locked is None or locked[0] != "running":
+            if (locked_source is None or locked is None or locked[0] != "running" or
+                    (locked[1] == "scheduled" and
+                     (not locked_source[1] or locked_source[0] != locked[2]
+                      or locked[2] != job.get("monitor_generation")))):
                 raise CollectionError("run_state_changed")
             for discussion in discussions:
                 title = discussion.title

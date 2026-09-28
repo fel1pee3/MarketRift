@@ -41,7 +41,42 @@ function storageExpiry(value: FormDataEntryValue | null): string {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(day)) throw new Error('Informe a validade do armazenamento para uma fonte real.');
   return new Date(`${day}T23:59:59`).toISOString();
 }
-type SourceRun = { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
+type SourceRun = { id: string; source_id: string; status: string; trigger_kind: 'manual' | 'scheduled'; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
+type GitHubMonitor = { source_id: string; monitoring_enabled: boolean; interval_minutes: number | null;
+  next_check_at: string | null; last_attempt_at: string | null; last_success_at: string | null;
+  last_status: string | null; last_error: string | null; retry_after_at: string | null;
+  scan_complete: boolean | null; running: boolean; cursor_pending: boolean;
+  github_monitor_generation: number };
+function GitHubMonitorControls({ monitor, role, busy, onUpdate }: { monitor?: GitHubMonitor;
+  role: Role; busy: boolean; onUpdate: (enabled: boolean, interval: number) => Promise<void> }) {
+  const canManage = role === 'owner' || role === 'admin';
+  const interval = monitor?.interval_minutes ?? 1440;
+  const next = monitor?.next_check_at ? new Date(monitor.next_check_at) : null;
+  const late = !!monitor?.monitoring_enabled && !!next && next.getTime() < Date.now()
+    && !monitor.running;
+  return <div className="monitor-controls">
+    <p>Monitoramento periódico: <strong>{monitor?.monitoring_enabled ? 'ativo' : 'pausado'}</strong>.
+      {monitor?.monitoring_enabled && ' Faz requisições limitadas à API oficial do GitHub.'}
+      {' '}Última tentativa: {monitor?.last_attempt_at ? new Date(monitor.last_attempt_at).toLocaleString('pt-BR') : 'nenhuma'};
+      {' '}último sucesso: {monitor?.last_success_at ? new Date(monitor.last_success_at).toLocaleString('pt-BR') : 'nenhum'};
+      {' '}próxima execução: {next && monitor?.monitoring_enabled ? next.toLocaleString('pt-BR') : 'não agendada'}.
+      {monitor?.running && ' Execução em andamento.'}{late && ' Execução atrasada; confira scheduler e worker.'}
+      {monitor?.cursor_pending && ' Cobertura parcial: há cursor pendente.'}
+      {monitor?.last_error && ` Última falha: ${monitor.last_error}.`}
+      {monitor?.retry_after_at && ` Limite da origem: tente após ${new Date(monitor.retry_after_at).toLocaleString('pt-BR')}.`}
+    </p>
+    {canManage && <form key={`${monitor?.source_id}-${interval}`} onSubmit={event => {
+      event.preventDefault(); const data = new FormData(event.currentTarget);
+      void onUpdate(true, Number(data.get('interval_minutes')));
+    }}><label>Periodicidade GitHub<select name="interval_minutes" defaultValue={interval}>
+        <option value="360">A cada 6 horas</option><option value="1440">Diária</option>
+        <option value="10080">Semanal</option></select></label>
+      <button className="small" disabled={busy}>{monitor?.monitoring_enabled ? 'Salvar periodicidade' : 'Ativar monitoramento'}</button>
+      {monitor?.monitoring_enabled && <button className="small ghost" type="button" disabled={busy}
+        onClick={() => void onUpdate(false, interval)}>Pausar monitoramento</button>}
+    </form>}
+  </div>;
+}
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: string };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
 type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: Issue[] };
@@ -185,6 +220,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
   const [products, setProducts] = useState<Product[]>([]);
   const [sources, setSources] = useState<Source[]>([]);
   const [sourceRuns, setSourceRuns] = useState<SourceRun[]>([]);
+  const [githubMonitors, setGithubMonitors] = useState<GitHubMonitor[]>([]);
   const [imports, setImports] = useState<Import[]>([]);
   const [lastB2BImportId, setLastB2BImportId] = useState<string | null>(null);
   const [b2bRightsEvents, setB2BRightsEvents] = useState<Record<string,B2BRightsEvent[]>>({});
@@ -197,7 +233,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
   const [dataLoaded, setDataLoaded] = useState(false);
 
   const refresh = useCallback(async (current: Session) => {
-    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages, nextSignals, nextDiscovery] = await Promise.all([
+    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages, nextSignals, nextDiscovery, nextMonitors] = await Promise.all([
       api<Product[]>('products', current), api<Source[]>('sources', current),
       api<SourceRun[]>('source-runs', current),
       api<Import[]>('imports', current), api<Document[]>('documents', current),
@@ -205,11 +241,13 @@ export default function WorkspaceApp({ view }: { view: View }) {
       api<PageData>('page-sources', current),
       view === 'overview' ? api<SignalResult>('reviewable-signals', current) : Promise.resolve(null),
       view === 'overview' || view === 'sources' ? api<DiscoveryData>('source-discovery', current) : Promise.resolve(emptyDiscoveryData),
+      view === 'sources' ? api<GitHubMonitor[]>('github-monitor', current) : Promise.resolve([]),
     ]);
     if (sessionKey.current !== sessionIdentity(current)) return;
     setProducts(nextProducts); setSources(nextSources); setSourceRuns(nextRuns); setImports(nextImports);
     setDocuments(nextDocuments); setMembers(nextMembers); setPageData(nextPages);
     setSignalResult(nextSignals); setDiscoveryData(nextDiscovery); setDataLoaded(true);
+    setGithubMonitors(nextMonitors);
   }, [view]);
 
   useEffect(() => {
@@ -248,7 +286,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
     finally { setBusy(false); }
   }
   function clearTenantData(): void {
-    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setLastB2BImportId(null);
+    setProducts([]); setSources([]); setSourceRuns([]); setGithubMonitors([]); setImports([]); setLastB2BImportId(null);
     setB2BRightsEvents({}); setDocuments([]); setMembers([]);
     setPageData(emptyPageData); setSignalResult(null); setDiscoveryData(emptyDiscoveryData);
     setDataLoaded(false); setIssuedInvite('');
@@ -544,11 +582,18 @@ export default function WorkspaceApp({ view }: { view: View }) {
             <button disabled={busy || !canManage || !products.length}>Adicionar fonte GitHub Issues</button></form>
           <ul>{sources.filter(source => source.source_type === 'github_issues').map(source => {
             const latest = sourceRuns.find(item => item.source_id === source.id);
+            const monitor = githubMonitors.find(item => item.source_id === source.id);
             return <li key={source.id}><a href={source.url} target="_blank" rel="noreferrer">{source.url}</a>
               <p>Última coleta: {source.last_checked_at ? new Date(source.last_checked_at).toLocaleString('pt-BR') : 'nenhuma'}</p>
               {latest && <p>Estado: {latest.status}; Issues consultadas: {latest.documents_seen}; novas: {latest.documents_new}; atualizadas: {latest.documents_updated}; páginas: {latest.pages_fetched}; Pull Requests ignorados: {latest.pull_requests_skipped}.
+                {latest.scan_complete === false && <> Cobertura parcial; a próxima coleta continuará pelo cursor.</>}
                 {latest.error_code && <> Falha: {latest.error_code}.</>}
                 {latest.retry_after_at && <> Tente após {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+              <GitHubMonitorControls monitor={monitor} role={session.role} busy={busy}
+                onUpdate={(enabled, interval_minutes) => run(async () => {
+                  await api(`github-monitor/${source.id}`, session, { method: 'POST',
+                    body: JSON.stringify({ enabled, interval_minutes }) }); await refresh(session);
+                })} />
               {session.role !== 'viewer' && <form onSubmit={event => void run(async () => {
                 const data = formValues(event);
                 await api(`sources/${source.id}/sync`, session, { method: 'POST', body: JSON.stringify({
@@ -574,6 +619,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
             <button disabled={busy || !canManage || !products.length}>Adicionar fonte Discussions</button></form>
           <ul>{sources.filter(source => source.source_type === 'github_discussions').map(source => {
             const latest = sourceRuns.find(item => item.source_id === source.id);
+            const monitor = githubMonitors.find(item => item.source_id === source.id);
             const reason: Record<string, string> = {
               configuration_pending: 'Configure GITHUB_DISCUSSIONS_TOKEN no ambiente do worker e reinicie-o.',
               repository_unavailable_or_private: 'Repositório indisponível, privado ou sem acesso público.',
@@ -593,6 +639,11 @@ export default function WorkspaceApp({ view }: { view: View }) {
                 {latest.scan_complete === false && <> Coleta parcial; outra execução continuará pelo cursor.</>}
                 {latest.error_code && <> {reason[latest.error_code] ?? `Falha: ${latest.error_code}.`}</>}
                 {latest.retry_after_at && <> Tente após {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
+              <GitHubMonitorControls monitor={monitor} role={session.role} busy={busy}
+                onUpdate={(enabled, interval_minutes) => run(async () => {
+                  await api(`github-monitor/${source.id}`, session, { method: 'POST',
+                    body: JSON.stringify({ enabled, interval_minutes }) }); await refresh(session);
+                })} />
               {session.role !== 'viewer' && <form onSubmit={event => void run(async () => {
                 const data = formValues(event);
                 await api(`sources/${source.id}/sync`, session, { method: 'POST', body: JSON.stringify({

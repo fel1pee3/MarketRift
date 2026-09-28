@@ -64,7 +64,7 @@ const steamMock = createServer((request, response) => {
       const item = { id: `D_${number}`, number, title: number === 1 ? 'Integration feedback' : 'Community announcement',
         body: number === 1 ? discussionBody : '', createdAt: '2026-09-01T10:00:00Z',
         updatedAt: number === 1 ? discussionUpdated : '2026-09-02T10:00:00Z',
-        url: `https://github.com/example/repo/discussions/${number}`, closed: false,
+        url: `https://github.com/example/${variables.repo}/discussions/${number}`, closed: false,
         category: { name: number === 1 ? 'Ideas' : 'Announcements' }, author: { login: 'public-user' } };
       response.setHeader('Content-Type', 'application/json');
       response.end(JSON.stringify({ data: { repository: { isPrivate: false, hasDiscussionsEnabled: true,
@@ -72,6 +72,17 @@ const steamMock = createServer((request, response) => {
           hasNextPage: number === 1 } } } } }));
     });
     return;
+  }
+  if (url.pathname === '/repos/example/issues/issues') {
+    const page = Number(url.searchParams.get('page'));
+    const issue = { id: page, number: page,
+      html_url: `https://github.com/example/issues/issues/${page}`,
+      title: `Controlled public issue ${page}`, body: 'Synthetic issue fixture',
+      created_at: '2026-09-01T10:00:00Z', updated_at: '2026-09-02T10:00:00Z', state: 'open' };
+    response.setHeader('Content-Type', 'application/json');
+    if (page === 1) response.setHeader('Link',
+      '<https://api.github.com/repos/example/issues/issues?page=2>; rel="next"');
+    response.end(JSON.stringify([issue])); return;
   }
   if (url.pathname.startsWith('/discovery/')) {
     if (url.pathname === '/discovery/robots.txt') {
@@ -194,6 +205,7 @@ const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
     WEB_PAGE_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     DISCOVERY_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    GITHUB_ISSUES_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TOKEN: 'e2e-read-only-placeholder',
     G2_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     G2_SYNDICATION_TOKEN: 'e2e-g2-placeholder' },
@@ -2159,6 +2171,100 @@ try {
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).body.citations.length, 0);
 
+  // Opt-in GitHub monitoring uses only the controlled GraphQL endpoint and a TESTE tenant.
+  const monitored = await a.call('sources/github-discussions', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, repository: 'example/monitor' }) });
+  assert.equal(monitored.status, 201, JSON.stringify(monitored.body));
+  await markControlledPublicSource(monitored.body.id);
+  const monitorState = async () => (await a.call('github-monitor')).body.find(
+    item => item.source_id === monitored.body.id);
+  assert.equal((await monitorState()).monitoring_enabled, false);
+  assert.equal((await b.call('github-monitor')).body.some(item => item.source_id === monitored.body.id), false);
+  const monitorInput = { enabled: true, interval_minutes: 360 };
+  for (const browser of [viewer, analyst, b]) {
+    assert.equal((await browser.call(`github-monitor/${monitored.body.id}`, { method: 'POST',
+      body: JSON.stringify(monitorInput) })).status, browser === b ? 404 : 403);
+  }
+  const activated = await admin.call(`github-monitor/${monitored.body.id}`, { method: 'POST',
+    body: JSON.stringify(monitorInput) });
+  assert.equal(activated.status, 200, JSON.stringify(activated.body));
+  let firstMonitorRun;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const runs = (await a.call('source-runs')).body.filter(item =>
+      item.source_id === monitored.body.id && item.trigger_kind === 'scheduled');
+    firstMonitorRun = runs.find(item => item.status === 'succeeded');
+    if (firstMonitorRun) break;
+    if (runs.some(item => item.status === 'failed')) throw new Error(JSON.stringify(runs));
+    await delay(200);
+  }
+  assert(firstMonitorRun, 'Scheduled GitHub run did not finish');
+  assert.equal(firstMonitorRun.documents_new, 1);
+  assert.equal(firstMonitorRun.scan_complete, false);
+  assert.equal((await monitorState()).cursor_pending, true);
+  assert.equal((await b.call('documents')).body.some(item => item.source_id === monitored.body.id), false);
+  const monitorDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await monitorDb.connect();
+    await monitorDb.query(`UPDATE marketrift.source_runs SET started_at=now()-interval '6 minutes',
+      finished_at=now()-interval '6 minutes' WHERE id=$1`, [firstMonitorRun.id]);
+    await monitorDb.query(`UPDATE marketrift.sources SET next_check_at=now() WHERE id=$1`, [monitored.body.id]);
+  } finally { await monitorDb.end(); }
+  let secondMonitorRun;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const runs = (await a.call('source-runs')).body.filter(item =>
+      item.source_id === monitored.body.id && item.trigger_kind === 'scheduled');
+    secondMonitorRun = runs.find(item => item.id !== firstMonitorRun.id && item.status === 'succeeded');
+    if (secondMonitorRun) break;
+    if (runs.some(item => item.id !== firstMonitorRun.id && item.status === 'failed'))
+      throw new Error(JSON.stringify(runs));
+    await delay(200);
+  }
+  assert(secondMonitorRun, 'Partial GitHub cursor did not resume');
+  assert.equal(secondMonitorRun.documents_new, 1);
+  assert.equal(secondMonitorRun.scan_complete, true);
+  assert.equal((await monitorState()).cursor_pending, false);
+  const pauseMonitor = await a.call(`github-monitor/${monitored.body.id}`, { method: 'POST',
+    body: JSON.stringify({ enabled: false, interval_minutes: 360 }) });
+  assert.equal(pauseMonitor.status, 200, JSON.stringify(pauseMonitor.body));
+  assert.equal((await monitorState()).monitoring_enabled, false);
+  assert.equal((await a.call('source-runs')).body.filter(item =>
+    item.source_id === monitored.body.id && item.trigger_kind === 'scheduled').length, 2);
+  assert.equal((await a.call('documents')).body.filter(item => item.source_id === monitored.body.id).length, 2);
+  const manualAfterPause = await analyst.call(`sources/${monitored.body.id}/sync`, {
+    method: 'POST', body: JSON.stringify({ max_pages: 1, max_items: 5 }) });
+  assert.equal(manualAfterPause.status, 200, JSON.stringify(manualAfterPause.body));
+  const repeated = await waitForSourceRun(analyst, manualAfterPause.body.id);
+  assert.equal(repeated.documents_new, 0);
+  assert.equal((await a.call('documents')).body.filter(item => item.source_id === monitored.body.id).length, 2);
+  const monitoredIssues = await a.call('sources/github-issues', { method: 'POST',
+    body: JSON.stringify({ product_id: competitor.body.id, repository: 'example/issues' }) });
+  assert.equal(monitoredIssues.status, 201, JSON.stringify(monitoredIssues.body));
+  await markControlledPublicSource(monitoredIssues.body.id);
+  const issueClock = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  try {
+    await issueClock.connect();
+    await issueClock.query(`UPDATE marketrift.source_runs SET started_at=now()-interval '6 minutes',
+      finished_at=now()-interval '6 minutes' WHERE source_id=$1 AND trigger_kind='scheduled'`,
+    [monitored.body.id]);
+  } finally { await issueClock.end(); }
+  assert.equal((await a.call(`github-monitor/${monitoredIssues.body.id}`, { method: 'POST',
+    body: JSON.stringify({ enabled: true, interval_minutes: 1440 }) })).status, 200);
+  let issueRun;
+  for (let attempt = 0; attempt < 100; attempt++) {
+    const runs = (await a.call('source-runs')).body.filter(item =>
+      item.source_id === monitoredIssues.body.id && item.trigger_kind === 'scheduled');
+    issueRun = runs.find(item => item.status === 'succeeded');
+    if (issueRun) break;
+    if (runs.some(item => item.status === 'failed')) throw new Error(JSON.stringify(runs));
+    await delay(200);
+  }
+  assert(issueRun, 'Scheduled Issues run did not finish');
+  assert.equal(issueRun.documents_new, 1);
+  assert.equal(issueRun.scan_complete, false);
+  assert.equal((await a.call('documents')).body.filter(item => item.source_id === monitoredIssues.body.id).length, 1);
+  assert.equal((await a.call(`github-monitor/${monitoredIssues.body.id}`, { method: 'POST',
+    body: JSON.stringify({ enabled: false, interval_minutes: 1440 }) })).status, 200);
+
   assert.equal((await viewer.call('auth/logout', { method: 'POST', withoutCsrf: true })).status, 403);
   assert.equal((await viewer.call('auth/logout', { method: 'POST' })).status, 204);
   assert.equal((await viewer.call('auth/session')).status, 401);
@@ -2180,7 +2286,7 @@ try {
   assert.equal(afterRemoval.body.reports[0].stale, true);
   assert.equal((await a.call(`retrieval-review/sets/${reviewSet.body.id}/evaluate`, {
     method: 'POST', body: JSON.stringify({}) })).status, 400);
-  console.log('E2E passed: sessions, RBAC, controlled source discovery, CSV, B2B quality fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, controlled source discovery, CSV, B2B quality fixture, G2 controlled API, Steam, GitHub Issues REST and Discussions GraphQL monitoring, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;

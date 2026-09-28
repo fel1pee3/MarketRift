@@ -8,6 +8,7 @@ import pytest
 
 from marketrift_intelligence.github_issues import (
     CollectionError,
+    api_base,
     fetch_issues,
     rate_retry_at,
     repository_parts,
@@ -50,6 +51,50 @@ def test_pagination_skips_pull_requests_and_bounds_items():
     assert cursor is not None
     assert len(requests) == 2
     assert all(request.url.params["per_page"] == "2" for request in requests)
+
+
+def test_partial_issues_run_resumes_at_next_page_without_restarting():
+    pages = []
+
+    def respond(request):
+        page = int(request.url.params["page"])
+        pages.append(page)
+        if page == 1:
+            return httpx.Response(200, json=[issue(3), issue(2)], headers={"Link":
+                '<https://api.github.com/repos/example/repo/issues?page=2>; rel="next"'})
+        return httpx.Response(200, json=[issue(1)])
+
+    async def collect():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            first = await fetch_issues("https://github.com/example/repo", None, 1, 2, client)
+            second = await fetch_issues("https://github.com/example/repo", first[3], 1, 2, client)
+            return first, second
+
+    first, second = run(collect())
+    assert [row.id for row in first[0]] == [3, 2]
+    assert first[3].startswith("issues-v2:")
+    assert [row.id for row in second[0]] == [1]
+    assert not second[3].startswith("issues-v2:")
+    assert pages == [1, 2]
+
+
+def test_scheduled_guard_blocks_http_when_monitor_was_paused():
+    calls = []
+
+    def respond(request):
+        calls.append(request)
+        return httpx.Response(200, json=[issue(1)])
+
+    async def blocked():
+        raise CollectionError("monitoring_changed")
+
+    async def collect():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+            return await fetch_issues("https://github.com/example/repo", None, 1, 1, client, blocked)
+
+    with pytest.raises(CollectionError, match="monitoring_changed"):
+        run(collect())
+    assert not calls
 
 
 def test_incremental_since_and_untrusted_link_rejected():
@@ -117,3 +162,13 @@ def test_invalid_issue_origin_does_not_become_document():
 
     with pytest.raises(CollectionError, match="invalid_issue_payload"):
         run(collect())
+
+
+def test_issues_endpoint_uses_loopback_only_in_explicit_test_mode(monkeypatch):
+    monkeypatch.setenv("GITHUB_ISSUES_TEST_BASE_URL", "http://127.0.0.1:3456")
+    monkeypatch.delenv("MARKETRIFT_TEST_MODE", raising=False)
+    assert api_base() == "https://api.github.com"
+    monkeypatch.setenv("MARKETRIFT_TEST_MODE", "1")
+    assert api_base() == "http://127.0.0.1:3456"
+    monkeypatch.setenv("GITHUB_ISSUES_TEST_BASE_URL", "http://internal.example:3456")
+    assert api_base() == "https://api.github.com"

@@ -8,6 +8,7 @@ export interface SyncGitHubDiscussionsJobV1 {
   tenant_id: string;
   source_id: string;
   run_id: string;
+  monitor_generation?: number;
   idempotency_key: string;
 }
 const ajv = new Ajv2020({ strict: false });
@@ -15,9 +16,11 @@ addFormats(ajv);
 const schema = JSON.parse(readFileSync(join(__dirname, '../../../packages/contracts/sync-github-discussions-job.v1.schema.json'), 'utf8')) as object;
 const validate = ajv.compile<SyncGitHubDiscussionsJobV1>(schema);
 
-export function makeGitHubDiscussionsJob(tenantId: string, sourceId: string, runId: string): SyncGitHubDiscussionsJobV1 {
+export function makeGitHubDiscussionsJob(tenantId: string, sourceId: string, runId: string,
+  monitorGeneration?: number): SyncGitHubDiscussionsJobV1 {
   const job: SyncGitHubDiscussionsJobV1 = {
     version: 1, tenant_id: tenantId, source_id: sourceId, run_id: runId,
+    ...(monitorGeneration === undefined ? {} : { monitor_generation: monitorGeneration }),
     idempotency_key: `github-discussions-${runId}-v1`,
   };
   if (!validate(job)) throw new Error(`Invalid GitHub Discussions job: ${ajv.errorsText(validate.errors)}`);

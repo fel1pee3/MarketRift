@@ -48,7 +48,8 @@
     "db:migrate:action-hypotheses": "node --env-file=.env scripts/migrate-action-hypotheses.mjs",
     "db:migrate:b2b-quality": "node --env-file=.env scripts/migrate-b2b-quality.mjs",
     "db:migrate:b2b-rights-lifecycle": "node --env-file=.env scripts/migrate-b2b-rights-lifecycle.mjs",
-    "db:migrate:b2b-rights-scheduler-grant": "node --env-file=.env scripts/migrate-b2b-rights-scheduler-grant.mjs"
+    "db:migrate:b2b-rights-scheduler-grant": "node --env-file=.env scripts/migrate-b2b-rights-scheduler-grant.mjs",
+    "db:migrate:github-monitoring": "node --env-file=.env scripts/migrate-github-monitoring.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }

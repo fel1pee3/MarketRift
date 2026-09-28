@@ -10,6 +10,7 @@
     "tenant_id": { "type": "string", "format": "uuid" },
     "source_id": { "type": "string", "format": "uuid" },
     "run_id": { "type": "string", "format": "uuid" },
+    "monitor_generation": { "type": "integer", "minimum": 1 },
     "idempotency_key": { "type": "string", "pattern": "^github-discussions-[0-9a-f-]{36}-v1$" }
   }
 }

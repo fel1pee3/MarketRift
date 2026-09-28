@@ -52,6 +52,22 @@ def test_pagination_and_bounds():
     assert invoke(handler, pages=1, items=1)[3] is False
 
 
+def test_paused_monitor_prevents_graphql_request():
+    calls = []
+
+    async def blocked():
+        raise CollectionError("monitoring_changed")
+
+    async def work():
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request: calls.append(request))) as client:
+            await fetch_discussions("https://github.com/example/repo", None, 1, 5, client,
+                                    "test-only", blocked)
+
+    with pytest.raises(CollectionError, match="monitoring_changed"):
+        run(work())
+    assert not calls
+
+
 def test_missing_token_private_disabled_and_invalid_provenance():
     no_request = lambda _request: pytest.fail("Unexpected network call")
     with pytest.raises(CollectionError, match="configuration_pending"):
