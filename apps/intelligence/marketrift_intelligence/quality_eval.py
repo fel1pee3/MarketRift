@@ -102,8 +102,9 @@ class EvalExample(BaseModel):
         if not self.text.strip():
             raise ValueError("review text must not be blank")
         if self.synthetic:
-            if self.labeler != "synthetic-fixture":
-                raise ValueError("synthetic examples require synthetic-fixture labeler")
+            if self.labeler != "synthetic-fixture" and not re.fullmatch(
+                    r"human:[a-z0-9][a-z0-9-]{0,59}", self.labeler):
+                raise ValueError("synthetic examples require a fixture or human labeler")
         elif (not re.fullmatch(r"human:[a-z0-9][a-z0-9-]{0,59}", self.labeler)
               or not self.rights_basis or not self.rights_basis.strip()):
             raise ValueError("real examples require a human labeler and rights_basis")

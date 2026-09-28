@@ -8,7 +8,7 @@ type Props = Parameters<typeof Overview>[0];
 
 test('navigation has distinct direct URLs for every existing workflow', () => {
   assert.deepEqual(views.map(item => item.href), [
-    '/', '/fontes', '/evidencias', '/perguntas', '/revisao', '/avaliacao-busca', '/conta',
+    '/', '/fontes', '/evidencias', '/perguntas', '/revisao', '/avaliacao-busca', '/avaliacao-b2b', '/conta',
   ]);
   assert.equal(new Set(views.map(item => item.id)).size, views.length);
   const html = renderToStaticMarkup(createElement(WorkspaceNavigation, { view: 'questions' }));

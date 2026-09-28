@@ -334,6 +334,7 @@ try {
   for (const [path, title] of [
     ['/fontes', 'Produtos e fontes'], ['/evidencias', 'Evidências'], ['/perguntas', 'Perguntas'],
     ['/revisao', 'Revisão de sinais'], ['/avaliacao-busca', 'Avaliação da busca'],
+    ['/avaliacao-b2b', 'Qualidade B2B'],
     ['/conta', 'Conta e equipe'],
   ]) {
     const response = await fetch(`${webOrigin}${path}`);
@@ -977,6 +978,89 @@ try {
   assert.equal(b2bDocuments[0].review_rating, null);
   assert.equal(b2bDocuments[0].analysis_status, null);
   assert.equal(b2bDocuments[0].analysis_eligibility, 'controlled_test');
+  assert.equal((await viewer.call('b2b-quality/summary')).body.real_reviews, 0);
+  const qualityInput = { title: 'E2E B2B synthetic human workspace', origin: 'synthetic_test',
+    product_id: competitor.body.id, source_id: b2bSource.body.id, limit: 1 };
+  assert.equal((await analyst.call('b2b-quality/sets', { method: 'POST',
+    body: JSON.stringify(qualityInput) })).status, 403);
+  assert.equal((await viewer.call('b2b-quality/sets', { method: 'POST',
+    body: JSON.stringify(qualityInput) })).status, 403);
+  const qualityCreated = await a.call('b2b-quality/sets', { method: 'POST',
+    body: JSON.stringify(qualityInput) });
+  assert.equal(qualityCreated.status, 201, JSON.stringify(qualityCreated.body));
+  const qualitySetId = qualityCreated.body.id;
+  assert.equal((await b.call(`b2b-quality/sets/${qualitySetId}`)).status, 404);
+  const qualityRls = new pg.Client({ connectionString: process.env.RUNTIME_DATABASE_URL });
+  await qualityRls.connect();
+  try {
+    await qualityRls.query('BEGIN');
+    await qualityRls.query("SELECT set_config('app.tenant_id',$1,true)", [registeredB.body.tenant_id]);
+    assert.equal((await qualityRls.query('SELECT count(*)::int AS n FROM marketrift.b2b_quality_sets WHERE id=$1',
+      [qualitySetId])).rows[0].n, 0);
+    assert.equal((await qualityRls.query('SELECT count(*)::int AS n FROM marketrift.b2b_quality_items WHERE set_id=$1',
+      [qualitySetId])).rows[0].n, 0);
+    await qualityRls.query('ROLLBACK');
+  } finally { await qualityRls.end(); }
+  const qualityDraft = (await viewer.call(`b2b-quality/sets/${qualitySetId}`)).body;
+  assert.equal(qualityDraft.items.length, 1);
+  assert.equal(qualityDraft.reports.length, 0);
+  assert.equal(qualityDraft.items[0].body, b2bDocuments[0].body);
+  assert.equal((await a.call(`b2b-quality/sets/${qualitySetId}/freeze`, { method: 'POST',
+    body: '{}' })).status, 409);
+  const qualityItem = qualityDraft.items[0];
+  const quote = 'faturas falhou duas vezes';
+  const start = qualityItem.body.indexOf(quote);
+  assert(start >= 0);
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}/labels`, { method: 'POST',
+    body: JSON.stringify({ item_id: qualityItem.id, decision: 'problem', issues: [{ category: 'features',
+      severity: 'medium', start: qualityItem.body.length + 1, end: qualityItem.body.length + 10 }] }) })).status, 400);
+  assert.equal((await viewer.call(`b2b-quality/sets/${qualitySetId}/labels`, { method: 'POST',
+    body: JSON.stringify({ item_id: qualityItem.id, decision: 'no_problem', issues: [] }) })).status, 403);
+  const qualityLabel = await analyst.call(`b2b-quality/sets/${qualitySetId}/labels`, { method: 'POST',
+    body: JSON.stringify({ item_id: qualityItem.id, decision: 'problem', issues: [{ category: 'features',
+      severity: 'medium', start, end: start + quote.length }] }) });
+  assert.equal(qualityLabel.status, 201, JSON.stringify(qualityLabel.body));
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}`)).body.labels.length, 1);
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}/freeze`, { method: 'POST',
+    body: '{}' })).status, 403);
+  assert.equal((await a.call(`b2b-quality/sets/${qualitySetId}/freeze`, { method: 'POST',
+    body: '{}' })).status, 201);
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}/evaluate-test`, { method: 'POST',
+    body: '{}' })).status, 403);
+  // A past controlled attempt failed. Retrying the frozen version must reuse its report row.
+  const qualityRetryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await qualityRetryDb.connect();
+  let failedQualityReportId;
+  try {
+    const inserted = await qualityRetryDb.query(`INSERT INTO marketrift.b2b_quality_reports
+      (tenant_id,set_id,provider,model,status,created_by,error_code,finished_at)
+      SELECT tenant_id,id,'test','controlled-test-fixture-v1','failed',created_by,
+        'evaluator_unreachable',now() FROM marketrift.b2b_quality_sets WHERE id=$1 RETURNING id`,
+    [qualitySetId]);
+    failedQualityReportId = inserted.rows[0].id;
+  } finally { await qualityRetryDb.end(); }
+  const qualityEvaluation = await a.call(`b2b-quality/sets/${qualitySetId}/evaluate-test`, {
+    method: 'POST', body: '{}' });
+  assert.equal(qualityEvaluation.status, 201, JSON.stringify(qualityEvaluation.body));
+  assert.equal(qualityEvaluation.body.id, failedQualityReportId);
+  assert.equal(qualityEvaluation.body.result.metrics.scored_real_examples, 0);
+  assert.equal(qualityEvaluation.body.result.metrics.scored_synthetic_examples, 1);
+  assert.equal(qualityEvaluation.body.result.run.api_calls_attempted, 0);
+  assert.equal(qualityEvaluation.body.result.metrics.categories.features.tp, 1);
+  const retriedQuality = (await a.call(`b2b-quality/sets/${qualitySetId}`)).body.reports;
+  assert.equal(retriedQuality.length, 1);
+  assert.equal(retriedQuality[0].status, 'completed');
+  assert.equal(retriedQuality[0].error_code, null);
+  assert.equal((await a.call(`b2b-quality/sets/${qualitySetId}/evaluate-test`, { method: 'POST',
+    body: '{}' })).status, 409);
+  assert.equal((await a.call(`b2b-quality/sets/${qualitySetId}/evaluate-paid`, { method: 'POST',
+    body: JSON.stringify({ provider: 'openai', model: 'gpt-5-nano', max_examples: 1,
+      max_output_tokens: 256, budget_usd: 0.05, input_usd_per_million: 1,
+      output_usd_per_million: 4, confirmation: 'AUTORIZO AVALIACAO PAGA' }) })).status, 409,
+  'a synthetic set cannot be sent to an external AI provider');
+  const copiedQuality = await a.call(`b2b-quality/sets/${qualitySetId}/copy`, { method: 'POST', body: '{}' });
+  assert.equal(copiedQuality.status, 201);
+  assert.equal((await a.call(`b2b-quality/sets/${copiedQuality.body.id}`)).body.labels.length, 1);
   assert.equal((await viewer.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, { method: 'POST',
     body: JSON.stringify({ provider: 'test' }) })).status, 403);
   assert.equal((await b.call(`documents/${b2bDocuments[0].id}/analyze-b2b`, { method: 'POST',
@@ -1055,6 +1139,16 @@ try {
     await waitForImport(a, editedImport.body.id);
     const editedReview = (await a.call('documents')).body.find(item => item.id === b2bDocuments[0].id);
     assert.ok(editedReview.body.includes('integração falhou'));
+    const qualityAfterEdit = (await a.call(`b2b-quality/sets/${qualitySetId}`)).body;
+    assert.equal(qualityAfterEdit.items[0].eligible, false);
+    assert.equal(qualityAfterEdit.items[0].body, null);
+    assert.equal(qualityAfterEdit.items[0].source_url, null);
+    assert.equal(qualityAfterEdit.labels[0].issues.length, 0);
+    assert.equal(qualityAfterEdit.reports[0].stale, true);
+    const qualityNext = (await a.call(`b2b-quality/sets/${copiedQuality.body.id}`)).body;
+    assert.equal(qualityNext.items[0].eligible, false);
+    assert.equal((await a.call(`b2b-quality/sets/${qualitySetId}/evaluate-test`, { method: 'POST',
+      body: '{}' })).status, 409);
     assert.equal(editedReview.analysis_status, null);
     assert.equal(editedReview.issues.length, 0);
     const stale = await indexDb.query(
@@ -1148,6 +1242,9 @@ try {
   assert.equal((await viewer.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 403);
   assert.equal((await b.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
   assert.equal((await a.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).body.documents_removed, 1);
+  const qualityAfterRevocation = (await viewer.call(`b2b-quality/sets/${qualitySetId}`)).body;
+  assert.equal(qualityAfterRevocation.items[0].body, null);
+  assert.equal(qualityAfterRevocation.labels[0].issues.length, 0);
   const purgeDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
   await purgeDb.connect();
   try {
@@ -1980,6 +2077,8 @@ try {
   assert.equal((await oldSession.call('auth/session')).status, 401);
   assert.equal((await analyst.call(`imports/${first.body.id}`)).status, 404);
   assert.equal((await analyst.call('retrieval-review/sets')).body.length, 0);
+  assert.equal((await analyst.call('b2b-quality/sets')).body.length, 0);
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}`)).status, 404);
   assert.equal((await analyst.call(`retrieval-review/sets/${reviewSet.body.id}`)).status, 400);
   assert.equal((await analyst.call('reviewable-signals')).body.signals.length, 0);
   assert.equal((await upload(analyst, source.body.id)).status, 403);
@@ -1991,6 +2090,8 @@ try {
   assert.equal(switched.body.role, 'analyst');
   assert((await analyst.call('reviewable-signals')).body.signals.some(item => item.signal_type === 'release_entry'));
   assert.ok((await analyst.call('retrieval-review/sets')).body.some(item => item.id === reviewSet.body.id));
+  assert.ok((await analyst.call('b2b-quality/sets')).body.some(item => item.id === qualitySetId));
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}`)).body.items[0].body, null);
   assert.equal((await analyst.call('documents')).body.filter(document => document.external_key === externalKey).length, 1);
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).body.citations.length, 0);
@@ -2016,7 +2117,7 @@ try {
   assert.equal(afterRemoval.body.reports[0].stale, true);
   assert.equal((await a.call(`retrieval-review/sets/${reviewSet.body.id}/evaluate`, {
     method: 'POST', body: JSON.stringify({}) })).status, 400);
-  console.log('E2E passed: sessions, RBAC, controlled source discovery, CSV, B2B fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, controlled source discovery, CSV, B2B quality fixture, G2 controlled API, Steam, GitHub Discussions GraphQL, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
@@ -2031,7 +2132,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['b2b_quality_sets', 'action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

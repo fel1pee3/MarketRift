@@ -7,6 +7,7 @@ import EvidenceTimeline from './EvidenceTimeline';
 import SignalsPanel from './SignalsPanel';
 import QuestionsPanel from './QuestionsPanel';
 import RetrievalReviewPanel from './RetrievalReviewPanel';
+import B2BQualityPanel from './B2BQualityPanel';
 
 type Role = 'owner' | 'admin' | 'analyst' | 'viewer';
 type Tenant = { tenant_id: string; name: string; role: Role };
@@ -68,7 +69,7 @@ type DiscoveryCandidate = { id: string; product_id: string; canonical_url: strin
   first_discovery_method: string; first_seen_at: string; last_examined_at: string };
 type DiscoveryData = { profiles: DiscoveryProfile[]; runs: DiscoveryRun[];
   candidates: DiscoveryCandidate[]; search_provider: 'brave_optional' };
-type View = 'overview' | 'sources' | 'evidence' | 'questions' | 'signals' | 'retrieval-review' | 'account';
+type View = 'overview' | 'sources' | 'evidence' | 'questions' | 'signals' | 'retrieval-review' | 'b2b-quality' | 'account';
 type SignalSummary = { id: string; state: string; summary: string; source_type: string; test_data: boolean; read_at: string | null };
 type SignalResult = { signals: SignalSummary[]; alerts: SignalSummary[];
   reconciliation: { last_at: string | null; pending: number; failed: number; reasons: string[] } };
@@ -79,6 +80,7 @@ export const views: { id: View; href: string; title: string; description: string
   { id: 'questions', href: '/perguntas', title: 'Perguntas', description: 'Indexação local e respostas extrativas com citações.' },
   { id: 'signals', href: '/revisao', title: 'Revisão de sinais', description: 'Candidatos, decisões e alertas internos.' },
   { id: 'retrieval-review', href: '/avaliacao-busca', title: 'Avaliação da busca', description: 'Julgamento humano e relatórios de recuperação.' },
+  { id: 'b2b-quality', href: '/avaliacao-b2b', title: 'Qualidade B2B', description: 'Rótulos humanos e avaliação da extração, separados dos indicadores.' },
   { id: 'account', href: '/conta', title: 'Conta e equipe', description: 'Empresa ativa, membros, convites e sessão.' },
 ];
 export function WorkspaceNavigation({ view }: { view: View }) {
@@ -315,6 +317,8 @@ export default function WorkspaceApp({ view }: { view: View }) {
           csrfToken={session.csrf_token} role={session.role} />}
         {view === 'retrieval-review' && <RetrievalReviewPanel key={`retrieval-review-${session.tenant_id}`} products={products}
           csrfToken={session.csrf_token} role={session.role} />}
+        {view === 'b2b-quality' && <B2BQualityPanel key={`b2b-quality-${session.tenant_id}`}
+          products={products} sources={sources} csrfToken={session.csrf_token} role={session.role} />}
         {view === 'sources' && <><section className="card wide source-jump" aria-label="Ir para uma fonte">
           <h2>Encontre uma fonte</h2><div className="jump-links">
             <a href="#produtos">Produtos</a><a href="#descoberta">Descoberta</a><a href="#csv-legado">CSV legado</a><a href="#b2b">Reviews B2B</a>

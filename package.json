@@ -45,7 +45,8 @@
     "db:migrate:discovery-search": "node --env-file=.env scripts/migrate-discovery-search.mjs",
     "db:migrate:discovery-classification": "node --env-file=.env scripts/migrate-discovery-classification.mjs",
     "db:migrate:page-scheduler-grant": "node --env-file=.env scripts/migrate-page-scheduler-grant.mjs",
-    "db:migrate:action-hypotheses": "node --env-file=.env scripts/migrate-action-hypotheses.mjs"
+    "db:migrate:action-hypotheses": "node --env-file=.env scripts/migrate-action-hypotheses.mjs",
+    "db:migrate:b2b-quality": "node --env-file=.env scripts/migrate-b2b-quality.mjs"
   },
   "dependencies": { "pg": "^8.16.3" }
 }
