@@ -14,6 +14,7 @@ from .github_discussions import sync_github_discussions
 from .github_issues import sync_github_issues
 from .ingest import ingest, mark_failed
 from .page_reinterpret import reinterpret_snapshot
+from .restore_gate import require_released
 from .source_discovery import discover
 from .steam_reviews import sync_steam_reviews
 from .web_pages import check_web_page, e2e_fetch_public_page
@@ -93,6 +94,7 @@ async def process_discovery(job, _token):
 
 
 async def main() -> None:
+    await require_released()  # Before subscribing to Redis or loading a model.
     if os.getenv("EMBEDDING_PROVIDER") == "local":
         embed("MarketRift local model warmup")
     stop = asyncio.Event()
@@ -102,17 +104,23 @@ async def main() -> None:
             loop.add_signal_handler(event, stop.set)
         except NotImplementedError:  # Windows event loop
             signal.signal(event, lambda *_: loop.call_soon_threadsafe(stop.set))
-    worker = Worker("review-ingest", process, {"connection": os.environ["REDIS_URL"]})
-    analysis_worker = Worker("review-analysis", process_analysis, {"connection": os.environ["REDIS_URL"]})
-    github_worker = Worker("github-issues", process_github, {"connection": os.environ["REDIS_URL"]})
-    discussions_worker = Worker("github-discussions", process_discussions, {"connection": os.environ["REDIS_URL"]})
-    steam_worker = Worker("steam-reviews", process_steam, {"connection": os.environ["REDIS_URL"]})
-    g2_worker = Worker("g2-reviews", process_g2, {"connection": os.environ["REDIS_URL"]})
-    web_page_worker = Worker("web-pages", process_web_page, {"connection": os.environ["REDIS_URL"]})
-    reinterpret_worker = Worker("page-reinterpret", process_page_reinterpret,
+    def guarded(processor):
+        async def handle(job, token):
+            await require_released()  # Also checks old jobs after a later quarantine.
+            return await processor(job, token)
+        return handle
+
+    worker = Worker("review-ingest", guarded(process), {"connection": os.environ["REDIS_URL"]})
+    analysis_worker = Worker("review-analysis", guarded(process_analysis), {"connection": os.environ["REDIS_URL"]})
+    github_worker = Worker("github-issues", guarded(process_github), {"connection": os.environ["REDIS_URL"]})
+    discussions_worker = Worker("github-discussions", guarded(process_discussions), {"connection": os.environ["REDIS_URL"]})
+    steam_worker = Worker("steam-reviews", guarded(process_steam), {"connection": os.environ["REDIS_URL"]})
+    g2_worker = Worker("g2-reviews", guarded(process_g2), {"connection": os.environ["REDIS_URL"]})
+    web_page_worker = Worker("web-pages", guarded(process_web_page), {"connection": os.environ["REDIS_URL"]})
+    reinterpret_worker = Worker("page-reinterpret", guarded(process_page_reinterpret),
                                 {"connection": os.environ["REDIS_URL"]})
-    index_worker = Worker("evidence-index", process_index, {"connection": os.environ["REDIS_URL"]})
-    discovery_worker = Worker("source-discovery", process_discovery, {"connection": os.environ["REDIS_URL"]})
+    index_worker = Worker("evidence-index", guarded(process_index), {"connection": os.environ["REDIS_URL"]})
+    discovery_worker = Worker("source-discovery", guarded(process_discovery), {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:

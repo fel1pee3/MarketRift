@@ -5,6 +5,7 @@ import { Db } from './db';
 import { Jobs, redisConnection } from './queue';
 import { reconcileSignals } from './reviewable-signals';
 import { makeSignalJob, parseSignalJob } from './signal-job';
+import { requireRestoreReleased } from './restore-gate';
 
 type Due = QueryResultRow & { tenant_id: string; source_id: string; requested_revision: string };
 
@@ -41,6 +42,7 @@ export class SignalScheduler {
   startWorker(): void {
     if (this.worker) return;
     this.worker = new Worker('signal-reconcile', async bullJob => {
+      await requireRestoreReleased(process.env.PROVISION_DATABASE_URL);
       const job = parseSignalJob(bullJob.data);
       const testTenant = process.env.MARKETRIFT_TEST_MODE === '1'
         ? process.env.PAGE_SCHEDULER_TEST_TENANT_ID : undefined;

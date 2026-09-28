@@ -5,12 +5,14 @@ from contextlib import asynccontextmanager
 from decimal import Decimal
 
 from fastapi import FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from .b2b_eval import extract_with_current_rights
 from .embeddings import DIMENSIONS, embed, identity, verify_local_model
 from .extract import extract_review
 from .quality_eval import EvalDataset, EvalSettings, evaluate_quality
+from .restore_gate import status as restore_gate_status
 from .retrieval_eval import FROZEN_CONTRACT_VERSION, FROZEN_EVALUATOR_VERSION, evaluate_frozen
 
 
@@ -23,6 +25,16 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="MarketRift Intelligence Internal", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def restoration_guard(request, call_next):
+    if not os.getenv("RUNTIME_DATABASE_URL") and os.getenv("RESTORE_GATE_REQUIRED") != "1":
+        return await call_next(request)  # Embeddings-only development service.
+    gate = await restore_gate_status()
+    if gate != "released":
+        return JSONResponse(status_code=503, content={"status": "restoration_quarantine"})
+    return await call_next(request)
 
 
 @app.get("/health")

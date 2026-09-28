@@ -1,6 +1,7 @@
 import 'reflect-metadata';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './module';
+import { restoreGateStatus } from './restore-gate';
 
 async function main(): Promise<void> {
   for (const key of ['RUNTIME_DATABASE_URL', 'PROVISION_DATABASE_URL', 'REDIS_URL']) {
@@ -16,6 +17,23 @@ async function main(): Promise<void> {
     throw new Error('WEB_ORIGIN must be an exact origin, using HTTPS in production');
   }
   const app = await NestFactory.create(AppModule);
+  app.use((request: { method: string; originalUrl: string }, response: {
+    setHeader: (name: string, value: string) => void;
+    status: (status: number) => { json: (body: object) => void };
+  }, next: () => void) => {
+    void (async () => {
+      const status = await restoreGateStatus(process.env.RUNTIME_DATABASE_URL);
+      response.setHeader('Cache-Control', 'no-store');
+      if (request.method === 'GET' && request.originalUrl === '/health') {
+        response.status(status === 'released' ? 200 : 503).json({ status: status === 'released'
+          ? 'ok' : 'restoration_quarantine' });
+      } else if (status !== 'released') {
+        response.status(503).json({ statusCode: 503, message: 'Restauração em quarentena',
+          code: status === 'quarantined' ? 'restoration_quarantine' : 'restoration_gate_unavailable' });
+      } else next();
+    })().catch(() => response.status(503).json({ statusCode: 503,
+      message: 'Restauração em quarentena', code: 'restoration_gate_unavailable' }));
+  });
   app.enableCors({ origin: webOrigin, credentials: true });
   app.use((request: { method: string; headers: { origin?: string } }, response: { setHeader: (name: string, value: string) => void; status: (status: number) => { json: (body: object) => void } }, next: () => void) => {
     response.setHeader('Cache-Control', 'no-store');

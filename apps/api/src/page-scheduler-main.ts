@@ -6,11 +6,13 @@ import { SignalScheduler } from './signal-scheduler';
 import { GitHubScheduler } from './github-scheduler';
 import { B2BRightsLifecycle } from './b2b-rights-lifecycle';
 import { schedulerErrorLabel } from './scheduler-error';
+import { requireRestoreReleased } from './restore-gate';
 
 if (!process.env.PROVISION_DATABASE_URL || !process.env.REDIS_URL) {
   throw new Error('PROVISION_DATABASE_URL and REDIS_URL are required');
 }
 async function main(): Promise<void> {
+  await requireRestoreReleased(process.env.PROVISION_DATABASE_URL);
   const db = new Db();
   const jobs = new Jobs();
   const scheduler = new PageScheduler(db, jobs);
@@ -28,6 +30,7 @@ async function main(): Promise<void> {
   process.once('SIGTERM', stop);
   try {
     while (!stopping) {
+      await requireRestoreReleased(process.env.PROVISION_DATABASE_URL);
       try { await b2bRights.tick(); }
       catch (error) { console.warn('B2B rights lifecycle tick failed:', schedulerErrorLabel(error)); }
       try { await scheduler.tick(); }

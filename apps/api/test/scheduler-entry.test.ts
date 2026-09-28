@@ -13,7 +13,7 @@ test('scheduler diagnostics expose SQLSTATE without leaking connection details',
   assert.doesNotMatch(schedulerErrorLabel(failure), /secret|postgres:\/\//);
 });
 
-test('development scheduler entry loads Nest parameter decorators from the API workspace', async () => {
+test('development scheduler loads Nest decorators and fails closed when its database is unavailable', async () => {
   const apiDirectory = resolve(__dirname, '..');
   const child = spawn(process.execPath, ['--import', 'tsx', 'src/page-scheduler-main.ts'], {
     cwd: apiDirectory,
@@ -28,21 +28,15 @@ test('development scheduler entry loads Nest parameter decorators from the API w
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let stderr = '';
-  let stdout = '';
   child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString(); });
   try {
     await new Promise<void>((resolveWait, reject) => {
-      const timeout = setTimeout(() => reject(new Error(`scheduler did not start: ${stderr}`)), 12000);
-      child.stdout.on('data', (chunk: Buffer) => {
-        stdout += chunk.toString();
-        if (stdout.includes('MarketRift scheduler started')) {
-          clearTimeout(timeout); resolveWait();
-        }
-      });
-      child.once('exit', () => { clearTimeout(timeout); reject(new Error(`scheduler exited: ${stderr}`)); });
+      const timeout = setTimeout(() => reject(new Error('scheduler did not stop')), 12000);
+      child.stdout.resume();
+      child.once('exit', () => { clearTimeout(timeout); resolveWait(); });
     });
-    assert.equal(child.exitCode, null, stderr);
-    assert.equal(child.signalCode, null, stderr);
+    assert.notEqual(child.exitCode, 0);
+    assert.match(stderr, /restore_unavailable/);
     assert.equal(stderr.includes('Parameter decorators only work'), false, stderr);
   } finally {
     child.kill();

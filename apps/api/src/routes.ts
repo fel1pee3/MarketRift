@@ -18,6 +18,7 @@ import { steamAppId, steamSourceUrl } from './steam-source';
 import { makeSteamJob } from './steam-job';
 import { makeG2Job } from './g2-job';
 import { B2BRightsLifecycle } from './b2b-rights-lifecycle';
+import { recordDeletion } from './deletion-journal';
 
 const uuid = z.uuid();
 const httpUrl = z.url().refine(value => /^https?:\/\//i.test(value), 'HTTP(S) URL required');
@@ -340,6 +341,7 @@ export class ApiController {
         + "WHERE id = $1 AND source_type IN ('g2', 'b2b_csv_review') FOR UPDATE", [id]);
       if (!source[0]) throw new NotFoundException('Review source not found');
       if (source[0].source_type === 'b2b_csv_review') {
+        recordDeletion('b2b_source', principal.tenantId, id);
         if (source[0].b2b_deletion_status === 'not_required') {
           await client.query(`UPDATE marketrift.sources SET enabled=false,storage_permitted=false,
             external_ai_permitted=false,access_status='denied',rights_expires_at=now(),
@@ -385,6 +387,7 @@ export class ApiController {
         + "AND s.source_type = 'b2b_csv_review' FOR UPDATE OF s, d", [id]);
       if (!document[0]) throw new NotFoundException('B2B review not found');
       const review = document[0];
+      recordDeletion('b2b_review', principal.tenantId, review.source_id, id, review.external_key);
       await client.query('DELETE FROM marketrift.signal_evidence WHERE document_id = $1', [id]);
       await client.query('DELETE FROM marketrift.chat_citations WHERE document_id = $1', [id]);
       await client.query('DELETE FROM marketrift.insights WHERE document_id = $1', [id]);
