@@ -67,10 +67,10 @@ def test_b2b_rights_rechecked_at_worker_and_replay_is_idempotent(request, monkey
                 active = scenario in ("active", "revoked", "expired", "storage_expired")
                 admin.execute(
                     "INSERT INTO marketrift.sources (id, tenant_id, product_id, source_type, url, "
-                    "access_environment, rights_reference, rights_expires_at, storage_permitted, external_ai_permitted, "
+                    "access_environment, rights_reference, rights_attested_at, rights_expires_at, storage_permitted, external_ai_permitted, "
                     "ai_provider, ai_rights_reference, ai_rights_attested_at, ai_rights_expires_at) "
                     "VALUES (%s, %s, %s, 'b2b_csv_review', %s, "
-                    "'production', 'disposable-test-storage-basis', now() + interval '1 day', true, %s, %s, %s, now(), "
+                    "'production', 'disposable-test-storage-basis', now(), now() + interval '1 day', true, %s, %s, %s, now(), "
                     "now() + interval '1 day')",
                     (source, tenant, product, f"https://authorized-vendor.io/reviews/{scenario}",
                      active, "openai" if active else None,
@@ -191,9 +191,9 @@ def test_synthetic_b2b_forces_controlled_fixture_even_with_openai_configured(req
                       "VALUES (%s, %s, 'Disposable fixture', 'competitor')", (product, tenant))
         admin.execute("INSERT INTO marketrift.sources "
                       "(id, tenant_id, product_id, source_type, url, access_environment, "
-                      "access_status, rights_reference, storage_permitted) "
+                      "access_status, rights_reference, rights_attested_at, storage_permitted) "
                       "VALUES (%s, %s, %s, 'b2b_csv_review', 'https://example.invalid/b2b-reviews', "
-                      "'sandbox', 'sandbox_only', 'disposable-test-storage-basis', true)",
+                      "'sandbox', 'sandbox_only', 'disposable-test-storage-basis', now(), true)",
                       (source, tenant, product))
         admin.execute("INSERT INTO marketrift.documents "
                       "(id, tenant_id, source_id, document_type, external_key, source_url, body, "

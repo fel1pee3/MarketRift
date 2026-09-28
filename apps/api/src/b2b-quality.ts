@@ -29,7 +29,7 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 function sha(value: string): string { return createHash('sha256').update(value).digest('hex'); }
 function stable(value: unknown): string { return JSON.stringify(value); }
 type SetRow = QueryResultRow & { id: string; tenant_id: string; title: string; origin: 'real' | 'synthetic_test';
-  version: number; status: 'draft' | 'frozen'; corpus_hash: string | null; judgment_hash: string | null };
+  version: number; status: 'draft' | 'frozen' | 'purged'; corpus_hash: string | null; judgment_hash: string | null };
 type ItemRow = QueryResultRow & { id: string; document_id: string; source_id: string; content_hash: string;
   metadata_hash: string; body: string | null; external_key: string | null; source_url: string | null;
   published_at: Date | null; review_language: string | null; synthetic: boolean | null;

@@ -3,6 +3,7 @@ import { Db } from './db';
 import { Jobs } from './queue';
 import { PageScheduler } from './page-scheduler';
 import { SignalScheduler } from './signal-scheduler';
+import { B2BRightsLifecycle } from './b2b-rights-lifecycle';
 import { schedulerErrorLabel } from './scheduler-error';
 
 if (!process.env.PROVISION_DATABASE_URL || !process.env.REDIS_URL) {
@@ -13,6 +14,7 @@ async function main(): Promise<void> {
   const jobs = new Jobs();
   const scheduler = new PageScheduler(db, jobs);
   const signals = new SignalScheduler(db, jobs);
+  const b2bRights = new B2BRightsLifecycle(db);
   signals.startWorker();
   console.info('MarketRift scheduler started');
   const testPoll = process.env.MARKETRIFT_TEST_MODE === '1' ? Number(process.env.PAGE_SCHEDULER_TEST_POLL_MS) : NaN;
@@ -24,6 +26,8 @@ async function main(): Promise<void> {
   process.once('SIGTERM', stop);
   try {
     while (!stopping) {
+      try { await b2bRights.tick(); }
+      catch (error) { console.warn('B2B rights lifecycle tick failed:', schedulerErrorLabel(error)); }
       try { await scheduler.tick(); }
       catch (error) { console.warn('Page scheduler tick failed:', schedulerErrorLabel(error)); }
       try { await signals.tick(); }

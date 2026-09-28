@@ -39,7 +39,7 @@ def test_two_tenants_replay_dedup_and_update(request):
 
     def cleanup():
         with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
-            for table in ("source_runs", "documents", "sources", "products"):
+            for table in ("reviewable_signals", "source_runs", "documents", "sources", "products"):
                 admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id IN (%s, %s)", (a, b))
             admin.execute("DELETE FROM marketrift.tenants WHERE id IN (%s, %s)", (a, b))
 

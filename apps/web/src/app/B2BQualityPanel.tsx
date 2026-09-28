@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 
 type Product = { id: string; name: string };
 type Source = { id: string; product_id: string; url: string; source_type: string; access_environment: string | null };
-type SetInfo = { id: string; title: string; origin: 'real' | 'synthetic_test'; status: 'draft' | 'frozen';
+type SetInfo = { id: string; title: string; origin: 'real' | 'synthetic_test'; status: 'draft' | 'frozen' | 'purged';
   version: number; corpus_hash: string | null; created_at: string };
 type Issue = { category: string; severity: 'low' | 'medium' | 'high' | null;
   start: number; end: number; outside_topic?: string };
@@ -162,6 +162,8 @@ export default function B2BQualityPanel({ products, sources, role, csrfToken }:
     {error && <p role="alert" className="error">{error}</p>}
     {message && <p role="status">{message}</p>}
     {detail && <>
+      {detail.set.status === 'purged' && <p className="evidence-warning">Os textos e relatórios deste conjunto foram
+        apagados pela política de direitos da fonte. O registro mínimo da versão permanece para auditoria.</p>}
       <p><strong>{detail.set.origin === 'real' ? 'REAL com direitos declarados' : 'TESTE / SINTÉTICO'}</strong> ·
         versão {detail.set.version} · {detail.set.status} · {judged}/{detail.items.length} julgadas ·
         {detail.items.filter(i => !i.eligible).length} inelegíveis.

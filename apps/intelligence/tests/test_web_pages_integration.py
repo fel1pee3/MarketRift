@@ -49,7 +49,7 @@ def test_two_tenants_snapshots_changes_replay_and_unextractable(request):
 
     def cleanup():
         with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
-            for table in ("page_changes", "snapshot_interpretations", "source_snapshots", "source_runs", "sources", "products"):
+            for table in ("reviewable_signals", "page_changes", "snapshot_interpretations", "source_snapshots", "source_runs", "sources", "products"):
                 admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id = ANY(%s::uuid[])", (tenants,))
             admin.execute("DELETE FROM marketrift.tenants WHERE id = ANY(%s::uuid[])", (tenants,))
 
@@ -160,7 +160,7 @@ def test_reinterpretation_preserves_snapshot_history_and_tenant_boundary(request
 
     def cleanup():
         with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
-            for table in ("page_changes", "snapshot_interpretations", "source_snapshots", "source_runs", "sources", "products"):
+            for table in ("reviewable_signals", "page_changes", "snapshot_interpretations", "source_snapshots", "source_runs", "sources", "products"):
                 admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id = ANY(%s::uuid[])", (tenants,))
             admin.execute("DELETE FROM marketrift.tenants WHERE id = ANY(%s::uuid[])", (tenants,))
 

@@ -31,7 +31,7 @@ def test_replay_update_isolation_and_missing_token(request, monkeypatch):
 
     def cleanup():
         with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as db:
-            for table in ("source_runs", "documents", "sources", "products"):
+            for table in ("reviewable_signals", "source_runs", "documents", "sources", "products"):
                 db.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id IN (%s, %s)", (tenant_a, tenant_b))
             db.execute("DELETE FROM marketrift.tenants WHERE id IN (%s, %s)", (tenant_a, tenant_b))
     request.addfinalizer(cleanup)

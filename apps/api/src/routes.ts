@@ -1,6 +1,6 @@
 import { BadRequestException, ConflictException, Controller, Delete, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
 import { Request } from 'express';
 import { QueryResultRow } from 'pg';
@@ -17,6 +17,7 @@ import { makeGitHubDiscussionsJob } from './github-discussions-job';
 import { steamAppId, steamSourceUrl } from './steam-source';
 import { makeSteamJob } from './steam-job';
 import { makeG2Job } from './g2-job';
+import { B2BRightsLifecycle } from './b2b-rights-lifecycle';
 
 const uuid = z.uuid();
 const httpUrl = z.url().refine(value => /^https?:\/\//i.test(value), 'HTTP(S) URL required');
@@ -27,11 +28,14 @@ const steamSourceInput = z.object({ product_id: uuid, app: z.string().trim().min
 const b2bSourceInput = z.object({ product_id: uuid, url: httpUrl,
   rights_reference: z.string().trim().min(8).max(300), storage_permitted: z.literal(true),
   external_ai_permitted: z.literal(false).default(false), synthetic_only: z.boolean().default(false),
-  rights_expires_at: z.iso.datetime({ offset: true }).optional() }).strict().refine(data =>
-    data.synthetic_only || (!!data.rights_expires_at && new Date(data.rights_expires_at).getTime() > Date.now()),
-    'Production B2B sources require a future storage rights expiry');
+  rights_expires_at: z.iso.datetime({ offset: true }).optional(),
+  retention_policy: z.enum(['retain_after_expiry', 'delete_on_expiry']).optional() }).strict().refine(data =>
+    data.synthetic_only || (!!data.retention_policy && !!data.rights_expires_at &&
+      new Date(data.rights_expires_at).getTime() > Date.now()),
+    'Production B2B sources require a future expiry and explicit retention policy');
 const b2bStorageRightsInput = z.object({ rights_reference: z.string().trim().min(8).max(300),
-  storage_permitted: z.literal(true), rights_expires_at: z.iso.datetime({ offset: true }) }).strict()
+  storage_permitted: z.literal(true), rights_expires_at: z.iso.datetime({ offset: true }),
+  retention_policy: z.enum(['retain_after_expiry', 'delete_on_expiry']) }).strict()
   .refine(data => new Date(data.rights_expires_at).getTime() > Date.now(),
     'Storage rights expiry must be in the future');
 const g2SourceInput = z.object({ product_id: uuid, g2_product_id: z.string().trim().regex(/^[A-Za-z0-9-]{1,80}$/),
@@ -89,7 +93,12 @@ type SourceRow = QueryResultRow & { id: string; product_id: string; source_type:
   external_product_id?: string | null; access_environment?: string | null; access_status?: string;
   rights_recorded?: boolean; rights_expires_at?: Date | null; storage_permitted?: boolean; external_ai_permitted?: boolean;
   ai_rights_recorded?: boolean; ai_provider?: string | null; ai_rights_expires_at?: Date | null;
-  ai_rights_revoked_at?: Date | null };
+  ai_rights_revoked_at?: Date | null; b2b_retention_policy?: string;
+  b2b_deletion_status?: string; b2b_deletion_reason?: string | null;
+  b2b_deletion_error?: string | null; b2b_deletion_requested_at?: Date | null;
+  b2b_deletion_next_attempt_at?: Date | null; b2b_deletion_attempts?: number;
+  b2b_deletion_completed_at?: Date | null; b2b_deleted_documents?: number;
+  b2b_deleted_import_rows?: number };
 type SourceRunRow = QueryResultRow & { id: string; source_id: string; status: string; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: Date | null; started_at: Date; finished_at: Date | null };
 type ImportRow = QueryResultRow & { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: Date; finished_at: Date | null };
 type DocumentRow = QueryResultRow & { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: Date | null; source_updated_at: Date | null; published_at: Date | null; collected_at: Date; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: { category: string; sentiment: string; severity: string; description: string; evidence_quote: string }[] };
@@ -152,7 +161,7 @@ export class ApiController {
   async sources(@Req() request: Request): Promise<SourceRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRow>(client,
-      'SELECT id, product_id, source_type, url, enabled, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at FROM marketrift.sources ORDER BY id'));
+      'SELECT id, product_id, source_type, url, enabled, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at, b2b_retention_policy, b2b_deletion_status, b2b_deletion_reason, b2b_deletion_error, b2b_deletion_requested_at, b2b_deletion_next_attempt_at, b2b_deletion_attempts, b2b_deletion_completed_at, b2b_deleted_documents, b2b_deleted_import_rows FROM marketrift.sources ORDER BY id'));
   }
 
   @Post('sources/b2b-csv/:id/ai-rights')
@@ -202,13 +211,19 @@ export class ApiController {
       throw new BadRequestException('Test URLs cannot be declared real');
     try { return await this.db.tenant(principal.tenantId, async client => {
       const rows = await this.db.rows<SourceRow>(client,
-        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, access_environment, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_attested_at, rights_expires_at) "
-        + "SELECT $1, id, 'b2b_csv_review', $3, $6, $7, $4, true, $5, now(), $8 FROM marketrift.products WHERE id = $2 "
+        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, access_environment, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_attested_at, rights_expires_at, b2b_retention_policy) "
+        + "SELECT $1, id, 'b2b_csv_review', $3, $6, $7, $4, true, $5, now(), $8, $9 FROM marketrift.products WHERE id = $2 "
         + 'RETURNING id, product_id, source_type, url, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_expires_at',
         [principal.tenantId, data.product_id, data.url, data.rights_reference, data.external_ai_permitted,
           data.synthetic_only ? 'sandbox' : 'production', data.synthetic_only ? 'sandbox_only' : 'not_assessed',
-          data.synthetic_only ? null : data.rights_expires_at]);
+          data.synthetic_only ? null : data.rights_expires_at, data.retention_policy ?? 'unspecified']);
       if (!rows[0]) throw new NotFoundException('Product not found');
+      await client.query(`INSERT INTO marketrift.b2b_rights_events
+        (tenant_id,source_id,event_kind,actor_user_id,reference_sha256,retention_policy,rights_expires_at)
+        VALUES ($1,$2,'declared',$3,$4,$5,$6)`,
+      [principal.tenantId,rows[0].id,principal.userId,
+        createHash('sha256').update(data.rights_reference).digest('hex'),
+        data.retention_policy ?? 'unspecified',data.synthetic_only ? null : data.rights_expires_at]);
       return rows[0];
     }); } catch (error) { return conflict(error); }
   }
@@ -220,13 +235,65 @@ export class ApiController {
     const principal = await this.principal(request, ['owner', 'admin']);
     const id = input(uuid, idValue);
     const data = input(b2bStorageRightsInput, body);
-    const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<{ id: string }>(client,
-      "UPDATE marketrift.sources SET rights_reference = $2, storage_permitted = true, "
-      + "rights_attested_at = now(), rights_expires_at = $3 WHERE id = $1 "
-      + "AND source_type = 'b2b_csv_review' AND access_environment = 'production' AND enabled "
-      + 'RETURNING id', [id, data.rights_reference, data.rights_expires_at]));
-    if (!rows[0]) throw new NotFoundException('B2B production source not found');
+    await this.db.tenant(principal.tenantId, async client => {
+      const [source] = await this.db.rows<{ id: string; enabled: boolean; rights_expires_at: Date | null;
+        b2b_retention_policy: string; b2b_deletion_status: string }>(client,
+      "SELECT id,enabled,rights_expires_at,b2b_retention_policy,b2b_deletion_status FROM marketrift.sources "
+        + "WHERE id=$1 AND source_type='b2b_csv_review' AND access_environment='production' FOR UPDATE", [id]);
+      if (!source || !source.enabled) throw new NotFoundException('B2B production source not found');
+      if (source.b2b_retention_policy === 'delete_on_expiry' && source.rights_expires_at &&
+          source.rights_expires_at <= new Date() && source.b2b_deletion_status !== 'completed')
+        throw new ConflictException('A política anterior exige exclusão antes da renovação');
+      await client.query(`UPDATE marketrift.sources SET rights_reference=$2,storage_permitted=true,
+        rights_attested_at=now(),rights_expires_at=$3,b2b_retention_policy=$4,
+        external_ai_permitted=false,ai_rights_revoked_at=now(),
+        b2b_rights_generation=b2b_rights_generation+1,b2b_deletion_status='not_required',
+        b2b_deletion_reason=NULL,b2b_deletion_error=NULL,b2b_deletion_requested_at=NULL,
+        b2b_deletion_next_attempt_at=NULL WHERE id=$1`,
+      [id,data.rights_reference,data.rights_expires_at,data.retention_policy]);
+      await client.query(`INSERT INTO marketrift.b2b_rights_events
+        (tenant_id,source_id,event_kind,actor_user_id,reference_sha256,retention_policy,rights_expires_at)
+        VALUES ($1,$2,'renewed',$3,$4,$5,$6)`,
+      [principal.tenantId,id,principal.userId,
+        createHash('sha256').update(data.rights_reference).digest('hex'),
+        data.retention_policy,data.rights_expires_at]);
+    });
     return { status: 'declared' };
+  }
+
+  @Get('sources/b2b-csv/:id/rights-events')
+  async b2bRightsEvents(@Req() request: Request, @Param('id') idValue: string) {
+    const principal = await this.principal(request);
+    const id = input(uuid,idValue);
+    return this.db.tenant(principal.tenantId, async client => {
+      const source = await this.db.rows(client,
+        "SELECT id FROM marketrift.sources WHERE id=$1 AND source_type='b2b_csv_review'", [id]);
+      if (!source.length) throw new NotFoundException('B2B source not found');
+      return this.db.rows(client, `SELECT id,event_kind,actor_user_id,reference_sha256,
+        retention_policy,rights_expires_at,documents_removed,import_rows_removed,
+        error_code,created_at FROM marketrift.b2b_rights_events
+        WHERE source_id=$1 ORDER BY created_at DESC LIMIT 30`, [id]);
+    });
+  }
+
+  @Post('sources/b2b-csv/:id/retry-deletion')
+  @HttpCode(200)
+  async retryB2BDeletion(@Req() request: Request, @Param('id') idValue: string) {
+    const principal = await this.principal(request, ['owner','admin']);
+    const id = input(uuid,idValue);
+    const source = await this.db.tenant(principal.tenantId, client => this.db.rows<{
+      b2b_deletion_status: string; b2b_retention_policy: string; rights_expires_at: Date | null;
+      b2b_deletion_reason: string | null }>(client,
+    "SELECT b2b_deletion_status,b2b_retention_policy,rights_expires_at,b2b_deletion_reason "
+      + "FROM marketrift.sources WHERE id=$1 AND source_type='b2b_csv_review'", [id]));
+    if (!source[0]) throw new NotFoundException('B2B source not found');
+    if (source[0].b2b_deletion_status === 'completed')
+      return { status: 'completed', documents_removed: 0, import_rows_removed: 0, error_code: null };
+    if (source[0].b2b_deletion_reason !== 'revocation' &&
+        !(source[0].b2b_retention_policy === 'delete_on_expiry' && source[0].rights_expires_at &&
+          source[0].rights_expires_at <= new Date()))
+      throw new ConflictException('Exclusão não exigida pela política vigente');
+    return new B2BRightsLifecycle(this.db).process(principal.tenantId,id);
   }
 
   @Post('sources/g2')
@@ -261,13 +328,29 @@ export class ApiController {
 
   @Post('sources/:id/revoke-review-rights')
   @HttpCode(200)
-  async revokeReviewRights(@Req() request: Request, @Param('id') idValue: string): Promise<{ status: 'purged'; documents_removed: number }> {
+  async revokeReviewRights(@Req() request: Request, @Param('id') idValue: string): Promise<{
+    status: 'purged' | 'failed'; documents_removed: number; error_code?: string | null }> {
     const principal = await this.principal(request, ['owner']);
     const id = input(uuid, idValue);
-    return this.db.tenant(principal.tenantId, async client => {
-      const source = await this.db.rows<{ id: string }>(client,
-        "SELECT id FROM marketrift.sources WHERE id = $1 AND source_type IN ('g2', 'b2b_csv_review') FOR UPDATE", [id]);
+    const result = await this.db.tenant(principal.tenantId, async client => {
+      const source = await this.db.rows<{ id: string; source_type: string; b2b_deletion_status: string }>(client,
+        "SELECT id,source_type,b2b_deletion_status FROM marketrift.sources "
+        + "WHERE id = $1 AND source_type IN ('g2', 'b2b_csv_review') FOR UPDATE", [id]);
       if (!source[0]) throw new NotFoundException('Review source not found');
+      if (source[0].source_type === 'b2b_csv_review') {
+        if (source[0].b2b_deletion_status === 'not_required') {
+          await client.query(`UPDATE marketrift.sources SET enabled=false,storage_permitted=false,
+            external_ai_permitted=false,access_status='denied',rights_expires_at=now(),
+            ai_rights_revoked_at=now(),b2b_rights_generation=b2b_rights_generation+1,
+            b2b_deletion_status='pending',b2b_deletion_reason='revocation',
+            b2b_deletion_requested_at=now(),b2b_deletion_next_attempt_at=now() WHERE id=$1`, [id]);
+          await client.query(`INSERT INTO marketrift.b2b_rights_events
+            (tenant_id,source_id,event_kind,actor_user_id,retention_policy,rights_expires_at)
+            SELECT tenant_id,id,'revoked',$2,b2b_retention_policy,rights_expires_at
+            FROM marketrift.sources WHERE id=$1`, [id,principal.userId]);
+        }
+        return { b2b: true, documents_removed: 0 };
+      }
       await client.query('DELETE FROM marketrift.signal_evidence WHERE document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)', [id]);
       await client.query('DELETE FROM marketrift.chat_citations WHERE document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)', [id]);
       await client.query('DELETE FROM marketrift.insights WHERE document_id IN (SELECT id FROM marketrift.documents WHERE source_id = $1)', [id]);
@@ -280,8 +363,12 @@ export class ApiController {
         + "external_ai_permitted = false, access_status = 'denied', rights_expires_at = now(), "
         + "ai_rights_revoked_at = CASE WHEN source_type = 'b2b_csv_review' THEN now() ELSE ai_rights_revoked_at END "
         + "WHERE id = $1", [id]);
-      return { status: 'purged', documents_removed: deleted.rowCount ?? 0 };
+      return { b2b: false, documents_removed: deleted.rowCount ?? 0 };
     });
+    if (!result.b2b) return { status: 'purged', documents_removed: result.documents_removed };
+    const purge = await new B2BRightsLifecycle(this.db).process(principal.tenantId,id);
+    return { status: purge.status === 'failed' ? 'failed' : 'purged',
+      documents_removed: purge.documents_removed, error_code: purge.error_code };
   }
 
   @Delete('documents/:id/b2b-review')
@@ -434,8 +521,10 @@ export class ApiController {
       if (rows.some(row => new URL(row.source_url).hostname !== new URL(sources[0]!.url).hostname))
         throw new BadRequestException('Review URL must use the registered source host');
       const importId = randomUUID();
-      await client.query('INSERT INTO marketrift.imports (id, tenant_id, source_id, idempotency_key, total_rows) VALUES ($1, $2, $3, $4, $5)',
-        [importId, principal.tenantId, sourceId, `import-${importId}-v1`, rows.length]);
+      await client.query(`INSERT INTO marketrift.imports
+        (id,tenant_id,source_id,idempotency_key,total_rows,b2b_rights_generation)
+        SELECT $1,$2,id,$3,$4,b2b_rights_generation FROM marketrift.sources WHERE id=$5`,
+      [importId,principal.tenantId,`import-${importId}-v1`,rows.length,sourceId]);
       for (const row of rows) await client.query(
         'INSERT INTO marketrift.import_rows (tenant_id, import_id, external_key, source_url, published_at, body, synthetic, review_language, review_rating) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)',
         [principal.tenantId, importId, row.external_key, row.source_url, row.published_at, row.body,
@@ -490,7 +579,8 @@ export class ApiController {
     const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<{
       source_id: string; status: string; source_eligible: boolean }>(client,
       "SELECT i.source_id, i.status, (s.enabled AND (s.source_type <> 'b2b_csv_review' "
-      + "OR (s.storage_permitted AND s.rights_reference IS NOT NULL AND "
+      + "OR (i.b2b_rights_generation=s.b2b_rights_generation AND "
+      + "s.storage_permitted AND s.rights_reference IS NOT NULL AND "
       + "(s.access_environment = 'sandbox' OR s.rights_expires_at > now())))) AS source_eligible "
       + 'FROM marketrift.imports i '
       + 'JOIN marketrift.sources s ON s.tenant_id = i.tenant_id AND s.id = i.source_id '

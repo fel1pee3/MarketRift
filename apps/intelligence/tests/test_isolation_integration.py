@@ -108,3 +108,42 @@ def test_two_tenants_rls_and_repeated_jobs(request, monkeypatch):
             psycopg.errors.InsufficientPrivilege
         ):
             runtime.execute(f"SELECT count(*) FROM marketrift.{private_table}")
+
+
+def test_old_b2b_import_job_cannot_restore_purged_synthetic_text_after_renewal(request):
+    tenant, product, source, imported = (str(uuid4()) for _ in range(4))
+
+    def cleanup():
+        with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+            for table in ("import_rows", "documents", "imports", "sources", "products"):
+                admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id = %s", (tenant,))
+            admin.execute("DELETE FROM marketrift.tenants WHERE id = %s", (tenant,))
+
+    request.addfinalizer(cleanup)
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        admin.execute("INSERT INTO marketrift.tenants (id,name) VALUES (%s,'b2b-old-job-test')", (tenant,))
+        admin.execute("INSERT INTO marketrift.products (id,tenant_id,name,kind) "
+                      "VALUES (%s,%s,'Disposable test','competitor')", (product, tenant))
+        admin.execute("INSERT INTO marketrift.sources (id,tenant_id,product_id,source_type,url,"
+                      "access_environment,rights_reference,rights_attested_at,storage_permitted) "
+                      "VALUES (%s,%s,%s,'b2b_csv_review','https://example.invalid/b2b',"
+                      "'sandbox','synthetic-test-rights',now(),true)", (source, tenant, product))
+        admin.execute("INSERT INTO marketrift.imports "
+                      "(id,tenant_id,source_id,idempotency_key,total_rows,b2b_rights_generation) "
+                      "VALUES (%s,%s,%s,%s,1,1)", (imported, tenant, source, f"import-{imported}-v1"))
+        admin.execute("INSERT INTO marketrift.import_rows "
+                      "(tenant_id,import_id,external_key,source_url,published_at,body,synthetic) "
+                      "VALUES (%s,%s,'synthetic-one','https://example.invalid/b2b/1',now(),"
+                      "'Synthetic fixture: support delayed.',true)", (tenant, imported))
+    job = {"version": 1, "tenant_id": tenant, "source_id": source,
+           "import_id": imported, "idempotency_key": f"import-{imported}-v1"}
+    assert run_ingest(job)["new_documents"] == 1
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        admin.execute("DELETE FROM marketrift.import_rows WHERE import_id=%s", (imported,))
+        admin.execute("DELETE FROM marketrift.documents WHERE source_id=%s", (source,))
+        admin.execute("UPDATE marketrift.sources SET b2b_rights_generation=2 WHERE id=%s", (source,))
+    with pytest.raises(ValueError, match="b2b_import_rights_generation_changed"):
+        run_ingest(job)
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        assert admin.execute("SELECT count(*) FROM marketrift.documents WHERE source_id=%s",
+                             (source,)).fetchone()[0] == 0

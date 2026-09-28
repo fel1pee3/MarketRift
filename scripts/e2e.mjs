@@ -215,7 +215,8 @@ for (const child of children) {
 function launchScheduler() {
   const schedulerProcess = spawn(process.execPath, ['apps/api/dist/page-scheduler-main.js'], {
     env: { ...childEnv, MARKETRIFT_TEST_MODE: '1', PAGE_SCHEDULER_TEST_POLL_MS: '200',
-      PAGE_SCHEDULER_TEST_TENANT_ID: cleanupTenants[0] },
+      PAGE_SCHEDULER_TEST_TENANT_ID: cleanupTenants[0],
+      B2B_RIGHTS_TEST_TENANT_ID: cleanupTenants[0] },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   schedulerProcess.stderr.on('data', chunk => { errors += String(chunk); });
@@ -1243,8 +1244,11 @@ try {
   assert.equal((await b.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).status, 404);
   assert.equal((await a.call(`sources/${b2bSource.body.id}/revoke-review-rights`, { method: 'POST' })).body.documents_removed, 1);
   const qualityAfterRevocation = (await viewer.call(`b2b-quality/sets/${qualitySetId}`)).body;
-  assert.equal(qualityAfterRevocation.items[0].body, null);
-  assert.equal(qualityAfterRevocation.labels[0].issues.length, 0);
+  assert.equal(qualityAfterRevocation.set.status, 'purged');
+  assert.equal(qualityAfterRevocation.set.title, 'Conjunto excluído por direitos');
+  assert.equal(qualityAfterRevocation.items.length, 0);
+  assert.equal(qualityAfterRevocation.labels.length, 0);
+  assert.equal(qualityAfterRevocation.reports.length, 0);
   const purgeDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
   await purgeDb.connect();
   try {
@@ -1270,14 +1274,16 @@ try {
     product_id: competitor.body.id, url: 'https://authorized-vendor.io/reviews',
     rights_reference: 'E2E storage permission declaration', storage_permitted: true,
     external_ai_permitted: false, synthetic_only: false, rights_expires_at: '2030-01-01T00:00:00Z',
+    retention_policy: 'retain_after_expiry',
   }) });
   assert.equal(realRightsSource.status, 201, JSON.stringify(realRightsSource.body));
   const storagePath = `sources/b2b-csv/${realRightsSource.body.id}/storage-rights`;
   const storageRenewal = { rights_reference: 'E2E renewed storage declaration', storage_permitted: true,
-    rights_expires_at: '2031-01-01T00:00:00Z' };
+    rights_expires_at: '2031-01-01T00:00:00Z', retention_policy: 'retain_after_expiry' };
   assert.equal((await viewer.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 403);
   assert.equal((await analyst.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 403);
   assert.equal((await b.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 404);
+  assert.equal((await admin.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 200);
   assert.equal((await a.call(storagePath, { method: 'POST', body: JSON.stringify({
     ...storageRenewal, rights_expires_at: '2020-01-01T00:00:00Z',
   }) })).status, 400);
@@ -1320,6 +1326,32 @@ try {
     .some(item => item.source_ids.includes(realRightsSource.body.id)), false);
   assert.equal((await a.call(storagePath, { method: 'POST', body: JSON.stringify(storageRenewal) })).status, 200);
   assert.equal((await a.call('documents')).body.some(item => item.external_key === 'zz-existing'), true);
+  const expiringSource = await a.call('sources/b2b-csv', { method: 'POST', body: JSON.stringify({
+    product_id: competitor.body.id, url: 'https://authorized-vendor.io/lifecycle',
+    rights_reference: 'E2E synthetic fixture lifecycle declaration',
+    storage_permitted: true, external_ai_permitted: false, synthetic_only: false,
+    rights_expires_at: '2030-01-01T00:00:00Z', retention_policy: 'delete_on_expiry',
+  }) });
+  assert.equal(expiringSource.status, 201, JSON.stringify(expiringSource.body));
+  const dueCsv = realTestCsv.replace('zz-existing', 'synthetic-expiring');
+  const dueUpload = new FormData();
+  dueUpload.set('source_id', expiringSource.body.id);
+  dueUpload.set('file', new Blob([dueCsv], { type: 'text/csv' }), 'synthetic-lifecycle.csv');
+  const dueImport = await analyst.call('imports/b2b-reviews', { method: 'POST', body: dueUpload });
+  assert.equal(dueImport.status, 201);
+  await waitForImport(a, dueImport.body.id);
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'synthetic-expiring'), true);
+  const dueDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
+  await dueDb.connect();
+  try {
+    await dueDb.query("UPDATE marketrift.sources SET rights_expires_at=now()-interval '1 day' WHERE id=$1",
+      [expiringSource.body.id]);
+  } finally { await dueDb.end(); }
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'synthetic-expiring'), false);
+  assert.equal((await viewer.call(`sources/b2b-csv/${expiringSource.body.id}/retry-deletion`, {
+    method: 'POST', body: '{}',
+  })).status, 403);
+  assert.equal((await b.call(`sources/b2b-csv/${expiringSource.body.id}/rights-events`)).status, 404);
   const aiRightsPath = `sources/b2b-csv/${realRightsSource.body.id}/ai-rights`;
   const aiRights = { provider: 'openai', rights_reference: 'E2E external processing declaration',
     external_ai_permitted: true, rights_expires_at: '2030-01-01T00:00:00Z' };
@@ -1706,6 +1738,37 @@ try {
   } finally { await schedulerClockDb.end(); }
   const schedulerA = launchScheduler();
   const schedulerB = launchScheduler();
+  let expiredSourceState;
+  for (let attempt = 0; attempt < 50; attempt++) {
+    expiredSourceState = (await a.call('sources')).body.find(item => item.id === expiringSource.body.id);
+    if (expiredSourceState?.b2b_deletion_status === 'completed') break;
+    await delay(200);
+  }
+  assert.equal(expiredSourceState?.b2b_deletion_status, 'completed');
+  assert.equal(expiredSourceState.b2b_deleted_documents, 1);
+  assert.equal((await a.call(`imports/${dueImport.body.id}/requeue`, { method: 'POST' })).status, 409);
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'synthetic-expiring'), false);
+  assert.equal((await b.call(`sources/b2b-csv/${expiringSource.body.id}/rights-events`)).status, 404);
+  const deletionHistory = await a.call(`sources/b2b-csv/${expiringSource.body.id}/rights-events`);
+  assert.equal(deletionHistory.status, 200);
+  assert.equal(deletionHistory.body.filter(item => item.event_kind === 'deletion_completed').length, 1);
+  const rightsRls = new pg.Client({ connectionString: process.env.RUNTIME_DATABASE_URL });
+  await rightsRls.connect();
+  try {
+    await rightsRls.query('BEGIN');
+    await rightsRls.query("SELECT set_config('app.tenant_id',$1,true)", [registeredB.body.tenant_id]);
+    assert.equal((await rightsRls.query('SELECT count(*)::int AS n FROM marketrift.b2b_rights_events WHERE source_id=$1',
+      [expiringSource.body.id])).rows[0].n, 0);
+    await rightsRls.query('ROLLBACK');
+  } finally { await rightsRls.end(); }
+  assert.equal((await a.call(`sources/b2b-csv/${expiringSource.body.id}/retry-deletion`, {
+    method: 'POST', body: '{}',
+  })).body.status, 'completed');
+  assert.equal((await a.call(`sources/b2b-csv/${expiringSource.body.id}/storage-rights`, {
+    method: 'POST', body: JSON.stringify(storageRenewal),
+  })).status, 200);
+  assert.equal((await a.call('documents')).body.some(item => item.external_key === 'synthetic-expiring'), false,
+    'renewal never recreates purged text');
   const scheduledFirst = await waitForScheduledPageRun(a, autoSource.body.id, 1);
   assert.equal(scheduledFirst.runs.filter(item => item.source_id === autoSource.body.id).length, 1);
   assert.equal(scheduledFirst.snapshots.find(item => item.source_id === autoSource.body.id).interpretation_status, 'confirmed');
@@ -2091,7 +2154,7 @@ try {
   assert((await analyst.call('reviewable-signals')).body.signals.some(item => item.signal_type === 'release_entry'));
   assert.ok((await analyst.call('retrieval-review/sets')).body.some(item => item.id === reviewSet.body.id));
   assert.ok((await analyst.call('b2b-quality/sets')).body.some(item => item.id === qualitySetId));
-  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}`)).body.items[0].body, null);
+  assert.equal((await analyst.call(`b2b-quality/sets/${qualitySetId}`)).body.items.length, 0);
   assert.equal((await analyst.call('documents')).body.filter(document => document.external_key === externalKey).length, 1);
   assert.equal((await analyst.call('evidence/questions', { method: 'POST',
     body: JSON.stringify(foreignQuestion) })).body.citations.length, 0);

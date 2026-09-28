@@ -22,7 +22,15 @@ type Source = { id: string; product_id: string; source_type: string; url: string
   external_product_id: string | null; access_environment: 'sandbox' | 'production' | null; access_status: string;
   rights_recorded: boolean; rights_expires_at: string | null; storage_permitted: boolean; external_ai_permitted: boolean;
   ai_rights_recorded: boolean; ai_provider: string | null; ai_rights_expires_at: string | null;
-  ai_rights_revoked_at: string | null };
+  ai_rights_revoked_at: string | null; b2b_retention_policy: string;
+  b2b_deletion_status: string; b2b_deletion_reason: string | null;
+  b2b_deletion_error: string | null; b2b_deletion_requested_at: string | null;
+  b2b_deletion_next_attempt_at: string | null; b2b_deletion_attempts: number;
+  b2b_deletion_completed_at: string | null; b2b_deleted_documents: number;
+  b2b_deleted_import_rows: number };
+type B2BRightsEvent = { id: string; event_kind: string; created_at: string;
+  retention_policy: string; rights_expires_at: string | null;
+  documents_removed: number; import_rows_removed: number; error_code: string | null };
 function importableB2BSource(source: Source): boolean {
   return source.source_type === 'b2b_csv_review' && source.enabled && source.storage_permitted
     && source.rights_recorded && (source.access_environment === 'sandbox'
@@ -179,6 +187,8 @@ export default function WorkspaceApp({ view }: { view: View }) {
   const [sourceRuns, setSourceRuns] = useState<SourceRun[]>([]);
   const [imports, setImports] = useState<Import[]>([]);
   const [lastB2BImportId, setLastB2BImportId] = useState<string | null>(null);
+  const [b2bRightsEvents, setB2BRightsEvents] = useState<Record<string,B2BRightsEvent[]>>({});
+  const [b2bSyntheticOnly, setB2BSyntheticOnly] = useState(false);
   const [documents, setDocuments] = useState<Document[]>([]);
   const [pageData, setPageData] = useState<PageData>(emptyPageData);
   const [discoveryData, setDiscoveryData] = useState<DiscoveryData>(emptyDiscoveryData);
@@ -238,7 +248,8 @@ export default function WorkspaceApp({ view }: { view: View }) {
     finally { setBusy(false); }
   }
   function clearTenantData(): void {
-    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setLastB2BImportId(null); setDocuments([]); setMembers([]);
+    setProducts([]); setSources([]); setSourceRuns([]); setImports([]); setLastB2BImportId(null);
+    setB2BRightsEvents({}); setDocuments([]); setMembers([]);
     setPageData(emptyPageData); setSignalResult(null); setDiscoveryData(emptyDiscoveryData);
     setDataLoaded(false); setIssuedInvite('');
   }
@@ -363,15 +374,22 @@ export default function WorkspaceApp({ view }: { view: View }) {
               product_id: data.get('product_id'), url: data.get('url'),
               rights_reference: data.get('rights_reference'), storage_permitted: data.get('storage_permitted') === 'on',
               external_ai_permitted: false, synthetic_only: data.get('synthetic_only') === 'on',
+              ...(data.get('retention_policy') ? { retention_policy: data.get('retention_policy') } : {}),
               ...(data.get('synthetic_only') === 'on' ? {} : {
                 rights_expires_at: storageExpiry(data.get('rights_expires_at')),
               }),
-            }) }); form.reset(); await refresh(session);
+            }) }); form.reset(); setB2BSyntheticOnly(false); await refresh(session);
           })}><label>Produto<select name="product_id" required>{products.map(product => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
             <label>URL HTTPS da origem<input name="url" type="url" placeholder="https://fornecedor.example/reviews" required /></label>
             <label>Referência da autorização de armazenamento<input name="rights_reference" placeholder="Contrato/licença e seção, sem segredo" minLength={8} required /></label>
-            <label>Validade do armazenamento para fonte real<input name="rights_expires_at" type="date" /></label>
-            <label><input name="synthetic_only" type="checkbox" /> Fonte somente de teste: todas as linhas deverão ter <code>synthetic=true</code>.</label>
+            <label>Validade do armazenamento para fonte real<input name="rights_expires_at" type="date" required={!b2bSyntheticOnly} /></label>
+            <label>Política declarada após vencimento para fonte real<select name="retention_policy" required={!b2bSyntheticOnly} defaultValue="">
+              <option value="">Selecione para fonte real</option>
+              <option value="retain_after_expiry">Reter texto bloqueado até decisão/revogação</option>
+              <option value="delete_on_expiry">Apagar texto automaticamente ao vencer</option>
+            </select></label>
+            <label><input name="synthetic_only" type="checkbox" checked={b2bSyntheticOnly}
+              onChange={event => setB2BSyntheticOnly(event.target.checked)} /> Fonte somente de teste: todas as linhas deverão ter <code>synthetic=true</code>.</label>
             <label><input name="storage_permitted" type="checkbox" required /> Confirmo que tenho permissão para armazenar estes textos.</label>
             <button disabled={busy || !products.length}>Cadastrar origem B2B</button></form>}
           <form onSubmit={event => void run(async () => {
@@ -390,19 +408,57 @@ export default function WorkspaceApp({ view }: { view: View }) {
           <p>Colunas: <code>external_key,source_url,published_at,body</code>; opcionais: <code>language,rating,synthetic</code>. Até 100 linhas. Uma linha real com URL fictícia é recusada. Fonte de teste aceita apenas linhas <code>synthetic=true</code>. Reenviar o mesmo ID na mesma origem não duplica a review; se texto ou metadados mudarem, a revisão existente é atualizada e análise/índice antigos são invalidados.</p>
           <ul>{sources.filter(source => source.source_type === 'b2b_csv_review').map(source => <li key={source.id}>
             {products.find(p => p.id === source.product_id)?.name} · {source.url} · {source.access_environment === 'sandbox' ? 'TESTE, somente sintético' : 'direitos declarados'} · armazenamento declarado: {source.storage_permitted ? 'sim' : 'não'} · referência registrada: {source.rights_recorded ? 'sim' : 'não'}
+            {source.access_environment === 'production' && <p>Política após vencimento: <strong>{
+              source.b2b_retention_policy === 'delete_on_expiry' ? 'apagar textos' :
+                source.b2b_retention_policy === 'retain_after_expiry' ? 'reter textos bloqueados' :
+                  'não declarada; confira o contrato antes de operar dados reais'}</strong>.
+              {source.rights_expires_at && new Date(source.rights_expires_at) > new Date() &&
+                new Date(source.rights_expires_at).getTime() - Date.now() <= 30 * 86400000 &&
+                ` Vence nos próximos 30 dias: ${new Date(source.rights_expires_at).toLocaleDateString('pt-BR')}.`}</p>}
             {source.access_environment === 'production' && <p>Validade do armazenamento: {source.rights_expires_at && new Date(source.rights_expires_at) > new Date() ?
               `até ${new Date(source.rights_expires_at).toLocaleDateString('pt-BR')}` :
               'ausente ou vencida; novas importações e consultas desta fonte ficam bloqueadas até renovação ou revogação' }.</p>}
-            {canManage && source.access_environment === 'production' && source.storage_permitted && <form onSubmit={event => void run(async () => {
+            <p>Estado dos direitos: <strong>{source.b2b_deletion_status === 'failed' ? 'exclusão falhou' :
+              source.b2b_deletion_status === 'pending' || (source.access_environment === 'production' &&
+                source.b2b_retention_policy === 'delete_on_expiry' && !!source.rights_expires_at &&
+                new Date(source.rights_expires_at) <= new Date() && source.b2b_deletion_status !== 'completed')
+                ? 'exclusão pendente' : source.b2b_deletion_status === 'completed' ? 'exclusão concluída' :
+                  !source.enabled || !source.storage_permitted || (source.access_environment === 'production' &&
+                    (!source.rights_expires_at || new Date(source.rights_expires_at) <= new Date()))
+                    ? 'bloqueada' : 'vigente'}</strong>.
+              {source.b2b_deletion_error && ` Motivo seguro: ${source.b2b_deletion_error}.`}
+              {source.b2b_deletion_status === 'failed' && source.b2b_deletion_next_attempt_at &&
+                ` Próxima tentativa automática: ${new Date(source.b2b_deletion_next_attempt_at).toLocaleString('pt-BR')}.`}
+              {source.b2b_deletion_completed_at && ` Última exclusão: ${new Date(source.b2b_deletion_completed_at).toLocaleString('pt-BR')}; ${source.b2b_deleted_documents} documento(s) e ${source.b2b_deleted_import_rows} linha(s) bruta(s) removidos no total.`}</p>
+            {canManage && source.access_environment === 'production' && source.enabled && <form onSubmit={event => void run(async () => {
               const data = formValues(event); const form = event.currentTarget;
               await api(`sources/b2b-csv/${source.id}/storage-rights`, session, { method: 'POST', body: JSON.stringify({
                 rights_reference: data.get('rights_reference'), storage_permitted: true,
                 rights_expires_at: storageExpiry(data.get('rights_expires_at')),
+                retention_policy: data.get('retention_policy'),
               }) }); form.reset(); await refresh(session);
             })}><label>Referência atual da permissão de armazenamento<input name="rights_reference" minLength={8} required /></label>
               <label>Nova validade<input name="rights_expires_at" type="date" required /></label>
+              <label>Política declarada após a nova validade<select name="retention_policy" required defaultValue="">
+                <option value="">Selecione</option><option value="retain_after_expiry">Reter bloqueado</option>
+                <option value="delete_on_expiry">Apagar ao vencer</option></select></label>
               <button disabled={busy}>Registrar ou renovar armazenamento</button></form>}
-            {source.access_environment === 'production' && <p>Envio à IA externa: {source.external_ai_permitted && source.ai_rights_expires_at && new Date(source.ai_rights_expires_at) > new Date() && !source.ai_rights_revoked_at ?
+            {canManage && (source.b2b_deletion_status === 'failed' || source.b2b_deletion_status === 'pending') &&
+              <button className="small" disabled={busy} onClick={() => void run(async () => {
+                await api(`sources/b2b-csv/${source.id}/retry-deletion`,session,{method:'POST',body:'{}'});
+                await refresh(session);
+              })}>Retomar exclusão</button>}
+            <button className="small" disabled={busy} onClick={() => void run(async () => {
+              const events = await api<B2BRightsEvent[]>(`sources/b2b-csv/${source.id}/rights-events`,session);
+              setB2BRightsEvents(previous => ({...previous,[source.id]:events}));
+            })}>Ver histórico de direitos</button>
+            {b2bRightsEvents[source.id] && <ul>{b2bRightsEvents[source.id].map(event => <li key={event.id}>
+              {new Date(event.created_at).toLocaleString('pt-BR')} · {event.event_kind} ·
+              {event.documents_removed} documentos · {event.import_rows_removed} linhas brutas
+              {event.error_code && ` · ${event.error_code}`}</li>)}</ul>}
+            {source.access_environment === 'production' && <p>Envio à IA externa: {source.storage_permitted && source.rights_expires_at &&
+              new Date(source.rights_expires_at) > new Date() && source.external_ai_permitted &&
+              source.ai_rights_expires_at && new Date(source.ai_rights_expires_at) > new Date() && !source.ai_rights_revoked_at ?
               `declarado para ${source.ai_provider} até ${new Date(source.ai_rights_expires_at).toLocaleDateString('pt-BR')}` :
               source.ai_rights_revoked_at ? 'revogado' : 'não autorizado ou expirado'}. A declaração não verifica o contrato automaticamente.</p>}
             {canManage && source.access_environment === 'production' && source.storage_permitted && <form onSubmit={event => void run(async () => {

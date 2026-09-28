@@ -20,7 +20,7 @@ async def ingest(payload: object) -> dict[str, Any]:
             source = await (
                 await connection.execute(
                     "SELECT source_type, storage_permitted, rights_reference, access_environment, url, "
-                    "rights_expires_at > now() FROM marketrift.sources "
+                    "rights_expires_at > clock_timestamp(), b2b_rights_generation FROM marketrift.sources "
                     "WHERE tenant_id = %s AND id = %s AND enabled "
                     "AND source_type IN ('manual_review', 'b2b_csv_review') FOR UPDATE",
                     (job["tenant_id"], job["source_id"]),
@@ -34,12 +34,15 @@ async def ingest(payload: object) -> dict[str, Any]:
                 raise ValueError("b2b source lacks declared storage rights")
             imported = await (
                 await connection.execute(
-                    "SELECT source_id, status FROM marketrift.imports WHERE tenant_id = %s AND id = %s FOR UPDATE",
+                    "SELECT source_id, status, b2b_rights_generation FROM marketrift.imports "
+                    "WHERE tenant_id = %s AND id = %s FOR UPDATE",
                     (job["tenant_id"], job["import_id"]),
                 )
             ).fetchone()
             if imported is None or str(imported[0]) != job["source_id"]:
                 raise ValueError("import does not belong to job source and tenant")
+            if b2b and imported[2] != source[6]:
+                raise ValueError("b2b_import_rights_generation_changed")
             replayed = imported[1] == "completed"
             rows = await (
                 await connection.execute(
@@ -49,6 +52,8 @@ async def ingest(payload: object) -> dict[str, Any]:
                     (job["tenant_id"], job["import_id"]),
                 )
             ).fetchall()
+            if b2b and not rows:
+                raise ValueError("b2b_import_rows_unavailable")
             if b2b and source[3] == "sandbox" and any(not row[4] for row in rows):
                 raise ValueError("sandbox source contains non-synthetic review")
             if b2b and any(urlparse(row[1]).hostname != urlparse(source[4]).hostname for row in rows):
