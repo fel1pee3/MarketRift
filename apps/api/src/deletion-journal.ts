@@ -124,3 +124,35 @@ export function recordDeletion(kind: 'b2b_review' | 'b2b_source', tenantId: stri
     return true;
   } finally { closeSync(lockFd); unlinkSync(lock); }
 }
+
+/** A failed external publication prevents the database deletion from committing. */
+export async function recordDeletionForOperation(kind: 'b2b_review' | 'b2b_source',
+  tenantId: string, sourceId: string, documentId?: string, externalKey?: string): Promise<boolean> {
+  const recorded = recordDeletion(kind, tenantId, sourceId, documentId, externalKey);
+  if (!process.env.BACKUP_EXTERNAL_BACKEND) return recorded;
+  const local = configuration();
+  if (!local || !recorded) throw new Error('Deletion journal external configuration incomplete');
+  // Operational JavaScript is shared by the CLI and the API build.
+  // @ts-ignore -- the root-level .mjs module has no TypeScript declaration.
+  const module = await import('../../../scripts/backup/s3-object-lock.mjs') as {
+    externalConfig: () => unknown;
+    awsClients: (config: unknown) => unknown;
+    publishJournal: (config: unknown, clients: unknown, directory: string, key: string,
+      read: typeof readDeletionJournal) => Promise<unknown>;
+  };
+  const config = module.externalConfig();
+  try {
+    const clients = module.awsClients(config);
+    try {
+      await module.publishJournal(config, clients, local.directory,
+        local.key, readDeletionJournal);
+    } finally {
+      // The default AWS SDK credential chain can retain sockets otherwise.
+      (clients as { s3: { destroy: () => void }; sts: { destroy: () => void } }).s3.destroy();
+      (clients as { s3: { destroy: () => void }; sts: { destroy: () => void } }).sts.destroy();
+    }
+  } catch {
+    throw new Error('Deletion journal external publication failed');
+  }
+  return true;
+}

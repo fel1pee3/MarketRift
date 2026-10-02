@@ -1,0 +1,13 @@
+.git/
+.env*
+node_modules/
+.tmp/
+evalsets/private/
+apps/api/
+apps/web/
+apps/intelligence/.venv/
+apps/intelligence/.models/
+apps/intelligence/.pytest_cache/
+**/__pycache__/
+**/*.pyc
+**/*.egg-info/

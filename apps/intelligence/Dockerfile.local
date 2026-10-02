@@ -1,0 +1,26 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace/apps/intelligence \
+    HF_HUB_OFFLINE=1 \
+    TRANSFORMERS_OFFLINE=1 \
+    TOKENIZERS_PARALLELISM=false \
+    OMP_NUM_THREADS=2
+
+WORKDIR /workspace
+COPY apps/intelligence/pyproject.toml /workspace/apps/intelligence/pyproject.toml
+COPY apps/intelligence/marketrift_intelligence /workspace/apps/intelligence/marketrift_intelligence
+COPY apps/intelligence/container_entrypoint.py /workspace/apps/intelligence/container_entrypoint.py
+COPY packages/contracts /workspace/packages/contracts
+COPY fixtures/review-analysis.synthetic.json /workspace/fixtures/review-analysis.synthetic.json
+
+# CPU wheel only; the pinned model is mounted read-only at runtime, not downloaded.
+RUN python -m pip install --no-cache-dir 'torch==2.14.0+cpu' \
+      --index-url https://download.pytorch.org/whl/cpu \
+ && python -m pip install --no-cache-dir '/workspace/apps/intelligence[embeddings]'
+
+RUN useradd --uid 10001 --create-home marketrift
+USER 10001
+
+ENTRYPOINT ["python", "/workspace/apps/intelligence/container_entrypoint.py"]

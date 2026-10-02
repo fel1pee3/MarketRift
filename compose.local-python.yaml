@@ -1,0 +1,48 @@
+services:
+  worker:
+    profiles: ["local-python"]
+    build:
+      context: .
+      dockerfile: apps/intelligence/Dockerfile.local
+    env_file:
+      - path: .env
+      - path: .env.worker.local
+        required: false
+    volumes:
+      - type: bind
+        source: ./apps/intelligence/.models
+        target: /workspace/apps/intelligence/.models
+        read_only: true
+        bind:
+          create_host_path: false
+    command: ["worker"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  intelligence-http:
+    profiles: ["local-python"]
+    build:
+      context: .
+      dockerfile: apps/intelligence/Dockerfile.local
+    env_file:
+      - path: .env
+      - path: .env.worker.local
+        required: false
+    volumes:
+      - type: bind
+        source: ./apps/intelligence/.models
+        target: /workspace/apps/intelligence/.models
+        read_only: true
+        bind:
+          create_host_path: false
+    command: ["http"]
+    ports:
+      - "127.0.0.1:${INTELLIGENCE_HTTP_PORT:-8000}:${INTELLIGENCE_HTTP_PORT:-8000}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

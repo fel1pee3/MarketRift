@@ -2,6 +2,8 @@ import { spawn } from 'node:child_process';
 import { join } from 'node:path';
 
 const target = process.argv[2];
+const dockerService = target === 'worker' ? 'worker' : target === 'http' ? 'intelligence-http' : null;
+const useLocalDocker = process.platform === 'win32' && process.env.EMBEDDING_PROVIDER === 'local' && dockerService;
 const args = target === 'worker'
   ? ['-m', 'marketrift_intelligence.worker']
   : target === 'http'
@@ -26,7 +28,13 @@ const args = target === 'worker'
     : null;
 if (!args) throw new Error('Expected worker, http, quality, steam-eval, b2b-eval or evaluate test');
 const python = join('apps', 'intelligence', '.venv', process.platform === 'win32' ? 'Scripts/python.exe' : 'bin/python');
-const child = spawn(python, args, { env: process.env, stdio: 'inherit' });
+const command = useLocalDocker ? 'docker' : python;
+const commandArgs = useLocalDocker
+  ? ['compose', '-f', 'compose.yaml', '-f', 'compose.local-python.yaml', '--profile', 'local-python',
+    'up', '--build', dockerService]
+  : args;
+if (useLocalDocker) console.log(`MiniLM local no Windows: iniciando ${dockerService} pelo Docker Desktop.`);
+const child = spawn(command, commandArgs, { env: process.env, stdio: 'inherit' });
 for (const event of ['SIGINT', 'SIGTERM']) process.on(event, () => child.kill());
 child.on('error', error => { console.error(error); process.exitCode = 1; });
 child.on('exit', code => { process.exitCode = code ?? 0; });

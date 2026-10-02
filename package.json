@@ -7,9 +7,11 @@
     "dev:api": "npm run dev -w @marketrift/api",
     "dev:web": "npm run dev -w @marketrift/web",
     "dev:worker": "node --env-file=.env --env-file-if-exists=.env.worker.local scripts/run-python.mjs worker",
+    "build:python:docker": "docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python build worker intelligence-http",
+    "dev:python:docker": "docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python up --no-build worker intelligence-http",
     "dev:scheduler": "npm run dev:scheduler -w @marketrift/api",
     "start:scheduler": "node --env-file=.env apps/api/dist/page-scheduler-main.js",
-    "dev:intelligence-http": "node --env-file=.env scripts/run-python.mjs http",
+    "dev:intelligence-http": "node --env-file=.env --env-file-if-exists=.env.worker.local scripts/run-python.mjs http",
     "prepare:embeddings": "node --env-file=.env scripts/run-python.mjs prepare-embeddings",
     "eval:retrieval": "node --env-file=.env scripts/run-python.mjs retrieval-eval",
     "label:retrieval": "node --env-file=.env scripts/run-python.mjs retrieval-label",
@@ -26,6 +28,11 @@
     "ops:backup:lab": "node scripts/backup/lab.mjs",
     "ops:restore:audit": "node scripts/backup/quarantine.mjs audit",
     "ops:restore:release": "node scripts/backup/quarantine.mjs release",
+    "ops:external:preflight": "node scripts/backup/external.mjs preflight",
+    "ops:external:verify-receipt": "node scripts/backup/external.mjs verify-receipt",
+    "ops:external:publish-backup": "node scripts/backup/external.mjs publish-backup",
+    "ops:external:publish-journal": "node scripts/backup/external.mjs publish-journal",
+    "test:external": "node scripts/backup/s3-object-lock.test.mjs",
     "pretest:e2e": "npm run build",
     "test:e2e": "node --env-file=.env scripts/e2e.mjs",
     "db:setup": "node --env-file=.env scripts/setup-db.mjs",
@@ -54,5 +61,10 @@
     "db:migrate:b2b-rights-scheduler-grant": "node --env-file=.env scripts/migrate-b2b-rights-scheduler-grant.mjs",
     "db:migrate:github-monitoring": "node --env-file=.env scripts/migrate-github-monitoring.mjs"
   },
-  "dependencies": { "pg": "^8.16.3" }
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1142.0",
+    "@aws-sdk/client-sts": "^3.1142.0",
+    "@smithy/node-http-handler": "^4.12.1",
+    "pg": "^8.16.3"
+  }
 }

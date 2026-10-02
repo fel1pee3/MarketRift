@@ -1,7 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import type { QueryResultRow } from 'pg';
 import { Db } from './db';
-import { recordDeletion } from './deletion-journal';
+import { recordDeletionForOperation } from './deletion-journal';
 
 type Source = QueryResultRow & { id: string; tenant_id: string; source_type: string;
   access_environment: string | null; b2b_retention_policy: string; b2b_deletion_status: string;
@@ -12,6 +12,8 @@ export type PurgeResult = { status: 'completed' | 'failed' | 'not_due';
 function errorCode(error: unknown): string {
   const code = error && typeof error === 'object' && 'code' in error ? String(error.code) : '';
   if (error instanceof Error && error.message.startsWith('Deletion journal'))
+    return 'deletion_journal_unavailable';
+  if (error instanceof Error && error.message.startsWith('external_'))
     return 'deletion_journal_unavailable';
   if (['EACCES', 'ENOENT', 'ENOSPC', 'EROFS'].includes(code))
     return 'deletion_journal_unavailable';
@@ -60,7 +62,7 @@ export class B2BRightsLifecycle {
         if (source.b2b_deletion_status === 'completed' || (!expiryDue && !revocationDue))
           return { status: 'not_due', documents_removed: 0, import_rows_removed: 0, error_code: null };
         const reason = revocationDue ? 'revocation' : 'expiry';
-        recordDeletion('b2b_source', tenantId, sourceId);
+        await recordDeletionForOperation('b2b_source', tenantId, sourceId);
         // Ingest, analysis and indexing lock this source before publishing content.
         // The lock serializes those jobs with the complete purge transaction.
         const setIds = await this.db.rows<{ set_id: string }>(client,

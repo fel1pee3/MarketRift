@@ -3,7 +3,7 @@ import { createHmac } from 'node:crypto';
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import { resolve, join, sep } from 'node:path';
 import test from 'node:test';
-import { readDeletionJournal, recordDeletion } from '../src/deletion-journal';
+import { readDeletionJournal, recordDeletion, recordDeletionForOperation } from '../src/deletion-journal';
 
 const tenant = '11111111-1111-4111-8111-111111111111';
 const source = '22222222-2222-4222-8222-222222222222';
@@ -43,5 +43,31 @@ test('B2B deletion journal contains IDs and an HMAC, rejects tampering and repea
     if (oldKey === undefined) delete process.env.BACKUP_DELETION_JOURNAL_KEY;
     else process.env.BACKUP_DELETION_JOURNAL_KEY = oldKey;
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('external mode refuses a deletion before database work when destination is incomplete', async () => {
+  const root = resolve('.tmp'); mkdirSync(root, { recursive:true });
+  const dir = mkdtempSync(join(root, 'journal-external-test-'));
+  const old = { dir:process.env.BACKUP_DELETION_JOURNAL_DIR,
+    key:process.env.BACKUP_DELETION_JOURNAL_KEY,
+    backend:process.env.BACKUP_EXTERNAL_BACKEND };
+  process.env.BACKUP_DELETION_JOURNAL_DIR = dir;
+  process.env.BACKUP_DELETION_JOURNAL_KEY = 'synthetic-test-key-with-at-least-32-characters';
+  process.env.BACKUP_EXTERNAL_BACKEND = 's3-object-lock';
+  try {
+    await assert.rejects(recordDeletionForOperation('b2b_source', tenant, source),
+      /external_configuration_incomplete/);
+    // Local write is conservative; retry can publish it after configuration is fixed.
+    assert.equal(readDeletionJournal(dir, process.env.BACKUP_DELETION_JOURNAL_KEY).length, 1);
+  } finally {
+    for (const [name,value] of [
+      ['BACKUP_DELETION_JOURNAL_DIR',old.dir],
+      ['BACKUP_DELETION_JOURNAL_KEY',old.key],
+      ['BACKUP_EXTERNAL_BACKEND',old.backend]] as const) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+    rmSync(dir,{ recursive:true, force:true });
   }
 });

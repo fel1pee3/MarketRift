@@ -24,6 +24,22 @@ Exemplo: “O plano mensal do concorrente B passou de R$ 100 para R$ 115 na mesm
 
 O escopo completo está em [00-escopo-completo.md](docs/00-escopo-completo.md); a definição objetiva de “pronto” está em [08-criterios-produto-completo.md](docs/08-criterios-produto-completo.md).
 
+### Windows: PyTorch bloqueado pela política de aplicativos
+
+Se `import torch` falhar com `WinError 4551` em `torch/lib/shm.dll`, o Windows está impedindo o carregamento da biblioteca nativa. A aplicação não consegue liberar essa DLL por configuração própria. A alternativa local verificada usa Python e PyTorch CPU em containers Linux do Docker Desktop, mantendo o mesmo MiniLM de 384 dimensões. A imagem é construída uma vez; os pesos já existentes em `apps/intelligence/.models` são montados somente para leitura e nenhum modelo é baixado ao iniciar ou consultar.
+
+Com Docker Desktop em modo Linux, `.env` configurado e PostgreSQL/Redis ativos, execute na raiz:
+
+```powershell
+docker compose up -d
+npm run build:python:docker
+npm run dev:python:docker
+```
+
+O build instala o PyTorch CPU na imagem uma vez. `dev:python:docker` inicia **worker e FastAPI** juntos, sem refazer o build. No Windows, com `EMBEDDING_PROVIDER=local`, os comandos habituais `npm run dev:worker` e `npm run dev:intelligence-http` agora iniciam os serviços correspondentes via Docker Desktop e constroem a imagem se necessário; com `controlled`, continuam usando Python nativo. Use **ou** o comando conjunto **ou** os dois comandos separados, sem manter duas sessões para o mesmo serviço. Continue iniciando API, web e scheduler pelos comandos existentes em outros terminais. A API continua alcançando FastAPI em `http://127.0.0.1:8000`. `.env.worker.local`, se existir, também é carregado nos dois containers; as credenciais ficam no ambiente local do Docker, fora da imagem e do Git. A montagem usa `host.docker.internal` para alcançar as portas PostgreSQL/Redis publicadas no Windows. Se os pesos locais estiverem ausentes, os serviços falham sem voltar ao modo `controlled`.
+
+Verificação local: `docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python ps` deve mostrar `worker` e `intelligence-http` em execução; `curl.exe --noproxy '*' http://127.0.0.1:8000/health` deve responder `{"status":"ok"}`. Para parar somente esses serviços, use `docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python stop worker intelligence-http`. Não use `down` para esse teste, pois ele também atua sobre os serviços e volumes do projeto. O build da imagem instala dependências Python pela rede, mas não chama OpenAI nem baixa os pesos do modelo.
+
 ## Arquitetura
 
 | Serviço | Tecnologia | Responsabilidade |
@@ -731,3 +747,13 @@ No laboratório, `ops:restore:audit` e `ops:restore:release` são executados **p
 **Seu teste manual é só este:** com Docker, as imagens `pgvector/pgvector:pg16` e `redis:7-alpine`, npm e `apps/intelligence/.venv` preparados, execute na raiz `npm run build -w @marketrift/api` e `npm run ops:backup:lab`. Espere JSON com `status: "passed"`, `api_blocked`, `worker_blocked`, `scheduler_blocked`, `intelligence_http_blocked`, `missing_event_release_rejected`, `unavailable_journal_rejected`, `invalid_signature_rejected`, `real_release_blocked`, `audit_trail`, `processes_released`, `old_jobs_rejected` e `rls` todos `true`. O relatório também fica em `.tmp/backup-lab/<id>/report.json`. Os containers são encerrados ao terminar. Não rode `db:setup` no banco local e não restaure um arquivo real nesse laboratório.
 
 **Produção permanece bloqueada.** A sequência esperada do laboratório não é um atestado externo para dados reais. Sem diário independente, durável e imutável, âncora de continuidade, destino de backup protegido, chaves separadas e política de retenção, não é possível liberar restauração real com segurança. O `.env` local ainda não configura o diário para o banco real. Veja [ADR 0031](docs/adr/0031-trava-operacional-de-restauracao.md).
+
+### Backend externo opcional de backup e diário
+
+O adaptador AWS S3 Object Lock está **desligado por padrão**. `npm run ops:external:preflight` sem `BACKUP_EXTERNAL_BACKEND` retorna `external_backend_disabled` **antes de qualquer chamada externa**. `npm run test:external` executa seis testes com cliente S3/STS controlado e dados sintéticos, sem credenciais nem rede S3. `npm run ops:backup:lab` continua o exercício isolado de quarentena; nenhum destes comandos envia backup real. Os comandos de restauração da ADR 0031 continuam recusando banco real.
+
+Para uma implantação futura, o operador deve primeiro definir fora do Git: `BACKUP_EXTERNAL_BACKEND=s3-object-lock`, `BACKUP_S3_REGION`, `BACKUP_S3_BUCKET`, `BACKUP_S3_ANCHOR_BUCKET` (bucket distinto), `BACKUP_S3_PREFIX`, `BACKUP_S3_EXPECTED_ACCOUNT`, `BACKUP_S3_EXPECTED_PRINCIPAL`, `BACKUP_S3_RETAIN_UNTIL` (ISO UTC) e papéis/credenciais temporárias específicos para escrita e leitura. A sequência `BACKUP_S3_EXPECTED_SEQUENCE` e o SHA-256 `BACKUP_S3_EXPECTED_ANCHOR_SHA256` devem vir de um checkpoint independente. O diário local ainda precisa de `BACKUP_DELETION_JOURNAL_DIR` e `BACKUP_DELETION_JOURNAL_KEY`; nunca armazene a chave com o backup. Sem isso, nenhuma exclusão real pode ser considerada recuperável. `BACKUP_S3_ALLOW_UPLOAD=1` é exigido somente pelos comandos explícitos `ops:external:publish-backup` e `ops:external:publish-journal`; o primeiro também exige `BACKUP_ARCHIVE_PATH`. `ops:external:verify-receipt` lê o recibo indicado por `BACKUP_S3_RECEIPT_PATH` e verifica a versão exata. **Esses comandos de rede não foram executados nesta entrega.** A pré-verificação é somente de leitura e sempre mantém produção bloqueada mesmo se as checagens técnicas retornarem `passed`.
+
+Publicar um evento B2B com backend explicitamente ativado passa a exigir leitura de identidade/capacidade e confirmação da versão protegida no S3 antes da exclusão no banco. Falha externa deixa a exclusão pendente/recusada para retomada; não há fallback silencioso para o diário local. Defina antes políticas de retenção compatíveis com a obrigação de apagar texto, permissões IAM mínimas, acesso ao KMS, destino protegido e custo. Object Lock por si só não comprova esses itens nem a continuidade do checkpoint. Veja [ADR 0032](docs/adr/0032-backend-opcional-s3-object-lock.md) e as referências oficiais nela.
+
+Verificação desta entrega: `npm run test:external` passou **6/6** com S3/STS controlados; `npm run lint`, `npm run build`, `npm test` (**65/65**), `npm run test:db` (**171/171**) e `npm run test:e2e` passaram. `npm run ops:backup:lab` retornou `status: passed`, três exclusões sintéticas reaplicadas, processos bloqueados antes da auditoria e liberados somente depois. A primeira tentativa da suíte Node encontrou `spawn EPERM` no sandbox e foi repetida com execução autorizada. A suíte de banco ficou inconclusiva enquanto os containers do Compose estavam parados; depois de `docker compose up -d`, foi repetida e passou. Nenhuma migração foi criada/aplicada, nenhum backup real foi lido/enviado e nenhuma chamada S3/STS real foi feita.
