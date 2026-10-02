@@ -6,7 +6,7 @@ import { Accounts } from './accounts';
 import { Db } from './db';
 
 const types = ['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue',
-  'github_discussion', 'pricing_page', 'release_notes'] as const;
+  'github_discussion', 'pricing_page', 'release_notes', 'rss_feed'] as const;
 const filterSchema = z.object({ product_id: z.uuid().optional(), source_types: z.string().max(200).optional(),
   from: z.iso.date().optional(), to: z.iso.date().optional(),
   limit: z.coerce.number<number>().int().min(1).max(50).default(20),
@@ -140,6 +140,29 @@ const snapshotsSql = timelineSql(`SELECT ss.id::text AS item_id,
     ORDER BY i.finished_at DESC LIMIT 1) i ON true
   WHERE s.source_type IN ('pricing_page','release_notes') AND ss.version_no IS NOT NULL
     AND ss.normalized_text IS NOT NULL`);
+
+const feedSql = timelineSql(`SELECT (e.id::text || ':' || v.version_no::text) AS item_id,
+  md5(jsonb_build_array('rss_feed',s.url,e.external_id,v.version_no,v.content_sha256)::text) AS identity_key,
+  'document'::text AS kind,'rss_feed'::text AS source_type,
+  e.source_id,s.product_id,p.name AS product_name,e.id AS relation_id,
+  v.title AS title,v.title AS excerpt,v.canonical_url AS source_url,
+  v.published_at AS origin_reported_at,v.date_literal AS origin_date_literal,
+  v.observed_at AS observed_at,NULL::timestamptz AS capture_at,
+  NULL::timestamptz AS structure_observed_at,NULL::timestamptz AS interpretation_at,
+  'rss-atom-v1'::text AS rule_version,'observed'::text AS interpretation_status,
+  'metadata_only'::text AS interpretation_reason,NULL::text AS interpretation_basis,
+  latest.scan_complete AS capture_complete,v.version_no,v.content_sha256,
+  s.access_environment='sandbox' AS synthetic,NULL::text AS data_status,
+  jsonb_build_object('feed_url',s.url,'external_id',e.external_id) AS detail,
+  CASE WHEN latest.scan_complete=false THEN 'partial_cursor'
+    WHEN latest.scan_complete=true THEN 'latest_scan_complete' ELSE 'unknown' END AS coverage
+  FROM marketrift.feed_entries e
+  JOIN marketrift.feed_entry_versions v ON v.tenant_id=e.tenant_id AND v.entry_id=e.id
+  JOIN marketrift.sources s ON s.tenant_id=e.tenant_id AND s.id=e.source_id
+  JOIN marketrift.products p ON p.tenant_id=s.tenant_id AND p.id=s.product_id
+  LEFT JOIN LATERAL (SELECT scan_complete FROM marketrift.source_runs
+    WHERE tenant_id=e.tenant_id AND source_id=e.source_id AND run_kind='feed'
+      AND status='succeeded' ORDER BY finished_at DESC,id DESC LIMIT 1) latest ON true`);
 
 const entriesSql = timelineSql(`SELECT ss.id::text || ':' || coalesce(e.entry->>'url','') AS item_id,
   md5(jsonb_build_array('changelog_entry',e.entry->>'url',e.entry->>'title',e.entry->>'evidence')::text)
@@ -283,8 +306,9 @@ export class EvidenceTimelineController {
       const snapshots = await this.db.rows<RawRow>(client, snapshotsSql, args);
       const entries = await this.db.rows<RawRow>(client, entriesSql, args);
       const prices = await this.db.rows<RawRow>(client, pricesSql, args);
-      const total = [documents, snapshots, entries, prices].reduce((sum, rows) => sum + (rows[0]?.total ?? 0), 0);
-      const selected = [...documents, ...snapshots, ...entries, ...prices]
+      const feeds = await this.db.rows<RawRow>(client, feedSql, args);
+      const total = [documents, snapshots, entries, prices, feeds].reduce((sum, rows) => sum + (rows[0]?.total ?? 0), 0);
+      const selected = [...documents, ...snapshots, ...entries, ...prices, ...feeds]
         .sort((a, b) => b.observed_at.getTime() - a.observed_at.getTime() || a.item_id.localeCompare(b.item_id))
         .slice(f.offset, f.offset + f.limit);
       const sourceIds = [...new Set(selected.flatMap(row => row.source_ids))];

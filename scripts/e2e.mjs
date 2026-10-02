@@ -30,6 +30,7 @@ let g2Body = 'The invoice export failed.';
 let g2Updated = '2026-09-02T12:00:00Z';
 let g2Public = true;
 const g2Requests = [];
+const feedRequests = [];
 const steamMock = createServer((request, response) => {
   const url = new URL(request.url, 'http://127.0.0.1');
   if (url.pathname === '/api/2018-01-01/syndication/reviews') {
@@ -115,6 +116,21 @@ const steamMock = createServer((request, response) => {
     if (url.pathname === '/discovery/plans') {
       response.writeHead(200, { 'Content-Type': 'text/html' });
       response.end('<a href="/support">Support forum</a>'); return;
+    }
+    response.writeHead(404); response.end(); return;
+  }
+  if (url.pathname.startsWith('/feed/')) {
+    feedRequests.push({ path:url.pathname, conditional:request.headers['if-none-match'] ?? null });
+    if (url.pathname === '/feed/robots.txt') { response.writeHead(404); response.end(); return; }
+    if (url.pathname === '/feed/feed.xml') {
+      if (request.headers['if-none-match'] === '"feed-v1"') {
+        response.writeHead(304); response.end(); return;
+      }
+      response.writeHead(200, { 'Content-Type':'application/rss+xml', ETag:'"feed-v1"' });
+      response.end('<rss version="2.0"><channel><item><guid>fixture-publication-1</guid>'
+        + '<title>Controlled product update</title><link>https://example.com/blog/update-1</link>'
+        + '<pubDate>Tue, 29 Sep 2026 12:00:00 GMT</pubDate>'
+        + '<description>Synthetic fixture; not a customer review.</description></item></channel></rss>'); return;
     }
     response.writeHead(404); response.end(); return;
   }
@@ -206,6 +222,7 @@ const workerProcess = spawn(python, ['-m', 'marketrift_intelligence.worker'], {
     DISCOVERY_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_ISSUES_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
+    FEED_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     GITHUB_DISCUSSIONS_TOKEN: 'e2e-read-only-placeholder',
     G2_TEST_BASE_URL: `http://127.0.0.1:${steamPort}`,
     G2_SYNDICATION_TOKEN: 'e2e-g2-placeholder' },
@@ -448,6 +465,89 @@ try {
   }
   assert.equal(discovered.runs.find(item => item.id === discoveryStart.body.id).status, 'succeeded');
   assert.equal((await b.call('source-discovery')).body.candidates.length, 0);
+  const feedCandidate = discovered.candidates.find(item => item.product_id === competitor.body.id
+    && item.canonical_url === 'https://example.com/feed.xml');
+  assert(feedCandidate && feedCandidate.suggested_type === 'blog_or_feed', 'Discovery should expose feed candidate');
+  const feedInput = { product_id:competitor.body.id, url:feedCandidate.canonical_url,
+    candidate_id:feedCandidate.id, association_confirmed:true };
+  assert.equal((await viewer.call('feeds', { method:'POST', body:JSON.stringify(feedInput) })).status,403);
+  assert.equal((await analyst.call('feeds', { method:'POST', body:JSON.stringify(feedInput) })).status,403);
+  assert.equal((await b.call('feeds', { method:'POST', body:JSON.stringify(feedInput) })).status,404);
+  const feedCreated = await admin.call('feeds', { method:'POST', body:JSON.stringify(feedInput) });
+  assert.equal(feedCreated.status,200,JSON.stringify(feedCreated.body));
+  assert.equal(feedCreated.body.monitoring_enabled,false);
+  const feedId = feedCreated.body.id;
+  const pausedFeedRun = await a.call(`feeds/${feedId}/run`, { method:'POST',body:'{}' });
+  assert.equal(pausedFeedRun.status,409);
+  assert.equal(pausedFeedRun.body.code,'monitoring_paused');
+  assert.equal((await viewer.call(`feeds/${feedId}/monitor`, { method:'POST',
+    body:JSON.stringify({ enabled:true,interval_minutes:1440 }) })).status,403);
+  assert.equal((await a.call(`feeds/${feedId}/monitor`, { method:'POST',
+    body:JSON.stringify({ enabled:true,interval_minutes:1440 }) })).status,200);
+  const feedScheduler = launchScheduler();
+  const repeatFeedRegistration = await admin.call('feeds', { method:'POST',
+    body:JSON.stringify(feedInput) });
+  assert.equal(repeatFeedRegistration.status,200,JSON.stringify(repeatFeedRegistration.body));
+  assert.equal(repeatFeedRegistration.body.id,feedId);
+  assert.equal(repeatFeedRegistration.body.monitoring_enabled,true,
+    'Repeated registration must preserve and report the existing monitoring state');
+  const feedRun = await analyst.call(`feeds/${feedId}/run`, { method:'POST',body:'{}' });
+  assert.equal(feedRun.status,200,JSON.stringify(feedRun.body));
+  let feedData;
+  for (let attempt=0; attempt<100; attempt++) {
+    feedData=(await a.call('feeds')).body;
+    const state=feedData.runs.find(item=>item.id===feedRun.body.id);
+    if (state?.status==='succeeded') break;
+    if (state?.status==='failed') throw new Error(`Controlled feed failed: ${JSON.stringify(state)}`);
+    await delay(200);
+  }
+  assert.equal(feedData.runs.find(item=>item.id===feedRun.body.id).status,'succeeded');
+  const tooSoonFeedRun = await a.call(`feeds/${feedId}/run`, { method:'POST',body:'{}' });
+  assert.equal(tooSoonFeedRun.status,409);
+  assert.equal(tooSoonFeedRun.body.code,'minimum_interval');
+  assert(tooSoonFeedRun.body.retry_after_at);
+  assert.equal(feedData.entries.filter(item=>item.source_id===feedId).length,1);
+  assert.equal(feedData.entries.find(item=>item.source_id===feedId).title,'Controlled product update');
+  assert.equal((await b.call('feeds')).body.entries.length,0);
+  const feedEvidence = await a.call('evidence/search?source_type=rss_feed');
+  assert.equal(feedEvidence.status,200,JSON.stringify(feedEvidence.body));
+  assert(feedEvidence.body.items.some(item=>item.source_url==='https://example.com/blog/update-1'));
+  const feedTimeline = await a.call('evidence/timeline?source_types=rss_feed');
+  assert.equal(feedTimeline.status,200,JSON.stringify(feedTimeline.body));
+  assert(feedTimeline.body.items.some(item=>item.source_type==='rss_feed'));
+  assert.equal((await b.call('evidence/search?source_type=rss_feed')).body.items.length,0);
+  assert.equal(feedRequests.some(item=>item.path==='/feed/blog/update-1'),false,
+    'Article links must not be fetched automatically');
+  const feedClock=new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
+  try { await feedClock.connect(); await feedClock.query(`UPDATE marketrift.source_runs
+    SET started_at=now()-interval '6 minutes',finished_at=now()-interval '6 minutes' WHERE id=$1`,
+    [feedRun.body.id]); } finally { await feedClock.end(); }
+  const conditionalRun=await a.call(`feeds/${feedId}/run`, { method:'POST',body:'{}' });
+  assert.equal(conditionalRun.status,200,JSON.stringify(conditionalRun.body));
+  for (let attempt=0; attempt<100; attempt++) {
+    feedData=(await a.call('feeds')).body;
+    if (feedData.runs.find(item=>item.id===conditionalRun.body.id)?.status==='succeeded') break;
+    await delay(200);
+  }
+  assert.equal(feedData.runs.find(item=>item.id===conditionalRun.body.id).documents_new,0);
+  assert.equal(feedData.entries.filter(item=>item.source_id===feedId).length,1);
+  assert(feedRequests.some(item=>item.conditional==='"feed-v1"'));
+  const abandonedFeedRun = randomUUID();
+  const abandonedDb = new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
+  try {
+    await abandonedDb.connect();
+    await abandonedDb.query(`INSERT INTO marketrift.source_runs
+      (id,tenant_id,source_id,status,run_kind,trigger_kind,feed_monitor_generation)
+      SELECT $1,tenant_id,id,'pending','feed','manual',feed_monitor_generation
+      FROM marketrift.sources WHERE id=$2`,[abandonedFeedRun,feedId]);
+  } finally { await abandonedDb.end(); }
+  assert.equal((await a.call(`feeds/${feedId}/monitor`, { method:'POST',
+    body:JSON.stringify({ enabled:false,interval_minutes:1440 }) })).status,200);
+  feedData=(await a.call('feeds')).body;
+  const cancelledFeedRun=feedData.runs.find(item=>item.id===abandonedFeedRun);
+  assert.equal(cancelledFeedRun.status,'cancelled');
+  assert.equal(cancelledFeedRun.error_code,'monitoring_paused');
+  feedScheduler.kill();
   const discoveryRls = new pg.Client({ connectionString: process.env.RUNTIME_DATABASE_URL });
   try {
     await discoveryRls.connect();
@@ -1748,8 +1848,33 @@ try {
       + "finished_at=now()-interval '2 minutes' WHERE tenant_id=$1 AND run_kind='web_page' "
       + "AND status IN ('succeeded','failed')", [registeredA.body.tenant_id]);
   } finally { await schedulerClockDb.end(); }
+  assert.equal((await a.call(`feeds/${feedId}/monitor`, { method:'POST',
+    body:JSON.stringify({ enabled:true,interval_minutes:1440 }) })).status,200);
+  const scheduledFeedClock = new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
+  try {
+    await scheduledFeedClock.connect();
+    await scheduledFeedClock.query(`UPDATE marketrift.source_runs SET
+      started_at=now()-interval '6 minutes',finished_at=now()-interval '6 minutes'
+      WHERE tenant_id=$1 AND source_id=$2 AND run_kind='feed'`,
+    [registeredA.body.tenant_id,feedId]);
+    await scheduledFeedClock.query(`UPDATE marketrift.sources SET next_check_at=now()-interval '1 second'
+      WHERE tenant_id=$1 AND id=$2`,[registeredA.body.tenant_id,feedId]);
+  } finally { await scheduledFeedClock.end(); }
   const schedulerA = launchScheduler();
   const schedulerB = launchScheduler();
+  for (let attempt=0; attempt<100; attempt++) {
+    feedData=(await a.call('feeds')).body;
+    if (feedData.runs.filter(item=>item.source_id===feedId && item.trigger_kind==='scheduled'
+      && item.status==='succeeded').length===1) break;
+    await delay(200);
+  }
+  assert.equal(feedData.runs.filter(item=>item.source_id===feedId
+    && item.trigger_kind==='scheduled').length,1,
+  'Two scheduler instances must claim only one due feed run');
+  assert.equal(feedData.entries.filter(item=>item.source_id===feedId).length,1,
+    'Scheduled 304 must not duplicate feed entry');
+  assert.equal((await a.call(`feeds/${feedId}/monitor`, { method:'POST',
+    body:JSON.stringify({ enabled:false,interval_minutes:1440 }) })).status,200);
   let expiredSourceState;
   for (let attempt = 0; attempt < 50; attempt++) {
     expiredSourceState = (await a.call('sources')).body.find(item => item.id === expiringSource.body.id);
@@ -2286,7 +2411,7 @@ try {
   assert.equal(afterRemoval.body.reports[0].stale, true);
   assert.equal((await a.call(`retrieval-review/sets/${reviewSet.body.id}/evaluate`, {
     method: 'POST', body: JSON.stringify({}) })).status, 400);
-  console.log('E2E passed: sessions, RBAC, controlled source discovery, CSV, B2B quality fixture, G2 controlled API, Steam, GitHub Issues REST and Discussions GraphQL monitoring, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
+  console.log('E2E passed: sessions, RBAC, controlled source discovery, RSS feed review/ingestion, CSV, B2B quality fixture, G2 controlled API, Steam, GitHub Issues REST and Discussions GraphQL monitoring, pages, evidence, retrieval-review synthetic fixture, signals, schedulers, retries and tenant isolation');
 } catch (error) {
   console.error(error, errors);
   process.exitCode = 1;
@@ -2301,7 +2426,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['b2b_quality_sets', 'action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['b2b_quality_sets', 'action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'feed_entry_versions', 'feed_entries', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

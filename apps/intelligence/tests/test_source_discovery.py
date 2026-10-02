@@ -12,6 +12,7 @@ from marketrift_intelligence.source_discovery import (
     collect,
     prioritized_candidates,
     request_discovery_pinned,
+    request_discovery_pinned_prefix,
     safe_link,
     search_external,
     validate_job,
@@ -358,6 +359,69 @@ def test_transport_preserves_rate_limit_headers_without_reading_error_body(monke
     assert status == 429
     assert headers["retry-after"] == "90"
     assert body == b""
+
+
+@pytest.mark.parametrize("declared", [None, 3_719_769])
+def test_prefix_transport_reads_only_limit_plus_one_even_when_declared_larger(monkeypatch, declared):
+    import marketrift_intelligence.source_discovery as discovery
+
+    class Response:
+        status = 200
+        length = declared
+        delivered = 0
+        largest_read = 0
+
+        def getheaders(self):
+            return [("content-type", "application/atom+xml")]
+
+        def read(self, size):
+            self.largest_read = max(self.largest_read, size)
+            self.delivered += size
+            return b"x" * size
+
+    response = Response()
+
+    class Connection:
+        sock = None
+
+        def __init__(self, *_args, **_kwargs): pass
+        def connect(self): pass
+        def request(self, *_args, **_kwargs): pass
+        def getresponse(self): return response
+        def close(self): pass
+
+    monkeypatch.setattr(discovery.http.client, "HTTPSConnection", Connection)
+    status, _, body, complete = request_discovery_pinned_prefix("https://example.com/atom",
+        "93.184.215.14", 512_000)
+    assert status == 200 and len(body) == 512_000 and complete is False
+    assert response.delivered == 512_001 and response.largest_read <= 65_536
+
+
+def test_prefix_transport_rejects_interrupted_response_below_limit(monkeypatch):
+    import marketrift_intelligence.source_discovery as discovery
+
+    class Response:
+        status = 200
+        length = 500_000
+        calls = 0
+        def getheaders(self): return [("content-length", "500000")]
+        def read(self, _size):
+            self.calls += 1
+            return b"short" if self.calls == 1 else b""
+
+    response = Response()
+    class Connection:
+        sock = None
+        def __init__(self, *_args, **_kwargs): pass
+        def connect(self): pass
+        def request(self, *_args, **_kwargs): pass
+        def getresponse(self): return response
+        def close(self): pass
+
+    monkeypatch.setattr(discovery.http.client, "HTTPSConnection", Connection)
+    with pytest.raises(DiscoveryError, match="response_truncated"):
+        request_discovery_pinned_prefix("https://example.com/atom", "93.184.215.14", 512_000)
+    assert response.calls == 2
 
 
 def test_sixty_documentation_links_cannot_hide_pricing_and_changelog():

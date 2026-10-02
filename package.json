@@ -25,6 +25,8 @@
     "lint": "npm run lint -w @marketrift/api && npm run lint -w @marketrift/web",
     "test": "npm run test -w @marketrift/api",
     "test:db": "node --env-file=.env scripts/test-db.mjs",
+    "test:feed:db": "node --env-file=.env scripts/test-feed-db.mjs",
+    "test:feed:docker": "node --env-file=.env scripts/test-feed-docker.mjs",
     "ops:backup:lab": "node scripts/backup/lab.mjs",
     "ops:restore:audit": "node scripts/backup/quarantine.mjs audit",
     "ops:restore:release": "node scripts/backup/quarantine.mjs release",
@@ -59,7 +61,10 @@
     "db:migrate:b2b-quality": "node --env-file=.env scripts/migrate-b2b-quality.mjs",
     "db:migrate:b2b-rights-lifecycle": "node --env-file=.env scripts/migrate-b2b-rights-lifecycle.mjs",
     "db:migrate:b2b-rights-scheduler-grant": "node --env-file=.env scripts/migrate-b2b-rights-scheduler-grant.mjs",
-    "db:migrate:github-monitoring": "node --env-file=.env scripts/migrate-github-monitoring.mjs"
+    "db:migrate:github-monitoring": "node --env-file=.env scripts/migrate-github-monitoring.mjs",
+    "db:migrate:feed-monitoring": "node --env-file=.env scripts/migrate-feed-monitoring.mjs",
+    "db:migrate:feed-run-cancellation": "node --env-file=.env scripts/migrate-feed-run-cancellation.mjs",
+    "db:migrate:feed-scheduler-error-grant": "node --env-file=.env scripts/migrate-feed-scheduler-error-grant.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1142.0",

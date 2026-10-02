@@ -74,7 +74,8 @@ export class SourceDiscoveryController {
         + 'existing.id AS existing_source_id '
         + 'FROM marketrift.discovery_candidates c LEFT JOIN marketrift.sources existing '
         + 'ON existing.tenant_id=c.tenant_id AND existing.product_id=c.product_id '
-        + 'AND existing.source_type=c.suggested_type AND existing.url=c.canonical_url '
+        + "AND (existing.source_type=c.suggested_type OR (c.suggested_type='blog_or_feed' "
+        + "AND existing.source_type='rss_feed')) AND existing.url=c.canonical_url "
         + 'ORDER BY c.last_examined_at DESC LIMIT 500'),
       search_provider: 'brave_optional' as const,
     }));

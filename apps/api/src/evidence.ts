@@ -7,7 +7,7 @@ import { activeExtractorVersion } from './analysis-job';
 import { Db } from './db';
 
 const sourceType = z.enum(['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion',
-  'pricing_page', 'release_notes']);
+  'pricing_page', 'release_notes', 'rss_feed']);
 const date = z.iso.date();
 const filtersSchema = z.object({
   product_id: z.uuid().optional(), source_type: sourceType.optional(),
@@ -81,6 +81,19 @@ const evidenceBase = `WITH raw AS (
   JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
   WHERE s.source_type IN ('pricing_page', 'release_notes') AND ss.version_no IS NOT NULL
     AND ss.normalized_text IS NOT NULL
+  UNION ALL
+  SELECT e.id,e.source_id,s.product_id,p.name,'rss_feed'::text,
+    jsonb_build_array(s.url,e.external_id)::text,e.canonical_url,e.title,
+    e.title,e.title,e.updated_at,e.updated_at,
+    s.access_environment='sandbox',NULL::text,'observed'::text,
+    CASE WHEN latest.scan_complete=false THEN 'partial_feed' ELSE 'metadata_only' END,
+    'publication_not_review'::text
+  FROM marketrift.feed_entries e
+  JOIN marketrift.sources s ON s.tenant_id=e.tenant_id AND s.id=e.source_id
+  JOIN marketrift.products p ON p.tenant_id=s.tenant_id AND p.id=s.product_id
+  LEFT JOIN LATERAL (SELECT scan_complete FROM marketrift.source_runs
+    WHERE tenant_id=e.tenant_id AND source_id=e.source_id AND run_kind='feed'
+      AND status='succeeded' ORDER BY finished_at DESC,id DESC LIMIT 1) latest ON true
 ), associations AS (
   SELECT source_type, origin_key, array_agg(DISTINCT product_id) AS product_ids,
     array_agg(DISTINCT product_name) AS product_names,

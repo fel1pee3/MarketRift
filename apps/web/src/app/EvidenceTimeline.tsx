@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from 'react';
 
 type Product = { id: string; name: string };
 type SourceType = 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review' | 'github_issue' |
-  'github_discussion' | 'pricing_page' | 'release_notes';
+  'github_discussion' | 'pricing_page' | 'release_notes' | 'rss_feed';
 type Filters = { product_id: string; source_types: SourceType[]; from: string; to: string };
 type Link = { signal_id: string; signal_state: string; hypothesis_id: string | null;
   hypothesis_status: string | null; signal_reviewed_at: string | null;
@@ -27,6 +27,7 @@ const sourceLabels: Record<SourceType, string> = {
   steam_review: 'Review Steam', github_issue: 'Issue pública do GitHub',
   github_discussion: 'Discussion pública do GitHub', pricing_page: 'Página de preços',
   release_notes: 'Changelog',
+  rss_feed: 'Publicação de feed (não é review)',
 };
 const sourceTypes = Object.keys(sourceLabels) as SourceType[];
 const empty: Filters = { product_id: '', source_types: [], from: '', to: '' };
@@ -45,6 +46,9 @@ function object(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 function statusExplanation(item: Item): string {
+  if (item.source_type === 'rss_feed') return item.coverage === 'partial_cursor'
+    ? 'Publicação observada em feed parcial. Metadados apenas; não é review nem prova de impacto comercial.'
+    : 'Publicação observada no feed. Metadados apenas; não é review nem prova de impacto comercial.';
   if (item.kind === 'document') return item.coverage === 'partial_cursor'
     ? 'Documento público armazenado; a coleta por cursor ainda é parcial, e o autor não foi identificado como cliente.'
     : item.source_type === 'github_issue' || item.source_type === 'github_discussion'

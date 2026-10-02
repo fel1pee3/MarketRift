@@ -62,8 +62,10 @@ class DiscoveryError(Exception):
         self.attempted = attempted
 
 
-def request_discovery_pinned(url: str, ip: str, limit: int = MAX_RESPONSE_BYTES) -> tuple[int, dict[str, str], bytes]:
-    """Read bounded chunks over TLS to the DNS-checked IP; never buffer an oversized response."""
+def _request_discovery_pinned(url: str, ip: str, limit: int,
+                              extra_headers: dict[str, str] | None,
+                              prefix_mode: bool) -> tuple[int, dict[str, str], bytes, bool]:
+    """Read bounded chunks over TLS to the DNS-checked IP; never buffer an unlimited response."""
     parts = urlsplit(url)
     host = parts.hostname or ""
     connection = http.client.HTTPSConnection(host, 443, timeout=MAX_RESOURCE_SECONDS,
@@ -84,9 +86,9 @@ def request_discovery_pinned(url: str, ip: str, limit: int = MAX_RESPONSE_BYTES)
             raise DiscoveryError("resource_timeout")
         if connection.sock is not None:
             connection.sock.settimeout(remaining)
-        connection.request("GET", parts.path, headers={"Host": host, "User-Agent": USER_AGENT,
+        connection.request("GET", parts.path + ("?" + parts.query if parts.query else ""), headers={"Host": host, "User-Agent": USER_AGENT,
                            "Accept": "text/html, application/xml, application/rss+xml, text/xml;q=0.8",
-                           "Accept-Encoding": "identity", "Connection": "close"})
+                           "Accept-Encoding": "identity", "Connection": "close", **(extra_headers or {})})
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise DiscoveryError("resource_timeout")
@@ -95,9 +97,9 @@ def request_discovery_pinned(url: str, ip: str, limit: int = MAX_RESPONSE_BYTES)
         response = connection.getresponse()
         headers = {key.lower(): value for key, value in response.getheaders()}
         if response.status != 200:
-            return response.status, headers, b""
+            return response.status, headers, b"", True
         declared_length = response.length
-        if declared_length is not None and declared_length > limit:
+        if not prefix_mode and declared_length is not None and declared_length > limit:
             raise DiscoveryError("response_too_large", limit_kind="content_length")
         chunks: list[bytes] = []
         size = 0
@@ -111,18 +113,33 @@ def request_discovery_pinned(url: str, ip: str, limit: int = MAX_RESPONSE_BYTES)
             if not chunk:
                 break
             size += len(chunk)
-            if size > limit:
+            if size > limit and not prefix_mode:
                 raise DiscoveryError("response_too_large", limit_kind="actual_bytes")
             chunks.append(chunk)
+            if prefix_mode and size > limit:
+                return response.status, headers, b"".join(chunks)[:limit], False
         if declared_length is not None and size < declared_length:
             raise DiscoveryError("response_truncated")
-        return response.status, headers, b"".join(chunks)
+        return response.status, headers, b"".join(chunks), True
     except TimeoutError as error:
         raise DiscoveryError("resource_timeout") from error
     except (OSError, ssl.SSLError, http.client.HTTPException) as error:
         raise DiscoveryError("network_failure") from error
     finally:
         connection.close()
+
+
+def request_discovery_pinned(url: str, ip: str, limit: int = MAX_RESPONSE_BYTES,
+                             extra_headers: dict[str, str] | None = None) -> tuple[int, dict[str, str], bytes]:
+    status, headers, body, _complete = _request_discovery_pinned(url, ip, limit, extra_headers, False)
+    return status, headers, body
+
+
+def request_discovery_pinned_prefix(url: str, ip: str, limit: int,
+                                    extra_headers: dict[str, str] | None = None
+                                    ) -> tuple[int, dict[str, str], bytes, bool]:
+    """Return a bounded prefix and mark it incomplete instead of trusting Content-Length."""
+    return _request_discovery_pinned(url, ip, limit, extra_headers, True)
 
 
 def candidate_priority(item: Candidate) -> int:

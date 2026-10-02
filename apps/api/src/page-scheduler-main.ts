@@ -4,6 +4,7 @@ import { Jobs } from './queue';
 import { PageScheduler } from './page-scheduler';
 import { SignalScheduler } from './signal-scheduler';
 import { GitHubScheduler } from './github-scheduler';
+import { FeedScheduler } from './feed-scheduler';
 import { B2BRightsLifecycle } from './b2b-rights-lifecycle';
 import { schedulerErrorLabel } from './scheduler-error';
 import { requireRestoreReleased } from './restore-gate';
@@ -17,6 +18,7 @@ async function main(): Promise<void> {
   const jobs = new Jobs();
   const scheduler = new PageScheduler(db, jobs);
   const github = new GitHubScheduler(db, jobs);
+  const feeds = new FeedScheduler(db, jobs);
   const signals = new SignalScheduler(db, jobs);
   const b2bRights = new B2BRightsLifecycle(db);
   signals.startWorker();
@@ -37,6 +39,8 @@ async function main(): Promise<void> {
       catch (error) { console.warn('Page scheduler tick failed:', schedulerErrorLabel(error)); }
       try { await github.tick(); }
       catch (error) { console.warn('GitHub scheduler tick failed:', schedulerErrorLabel(error)); }
+      try { await feeds.tick(); }
+      catch (error) { console.warn('Feed scheduler tick failed:', schedulerErrorLabel(error)); }
       try { await signals.tick(); }
       catch (error) { console.warn('Signal scheduler tick failed:', schedulerErrorLabel(error)); }
       if (!stopping) await new Promise<void>(resolve => {

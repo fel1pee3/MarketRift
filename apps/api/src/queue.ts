@@ -10,6 +10,7 @@ import { SyncG2ReviewsJobV1 } from './g2-job';
 import { ReconcileSignalsJobV1 } from './signal-job';
 import { DiscoverSourcesJobV1 } from './source-discovery-job';
 import { ReinterpretWebPageJobV1 } from './page-reinterpret-job';
+import { SyncFeedJobV1 } from './feed-job';
 
 export function redisConnection(): { host: string; port: number; username: string;
   password: string | undefined; db: number; tls: object | undefined; maxRetriesPerRequest: number } {
@@ -58,6 +59,12 @@ export class Jobs implements OnModuleDestroy {
     { connection: this.connection });
   private readonly discoveryQueue = new Queue<DiscoverSourcesJobV1>('source-discovery',
     { connection: this.connection });
+  private readonly feedQueue = new Queue<SyncFeedJobV1>('feed-sync', { connection: this.connection });
+
+  async publishFeed(job: SyncFeedJobV1): Promise<void> {
+    await this.feedQueue.add('sync-feed.v1', job, { jobId: job.idempotency_key,
+      attempts: 1, removeOnComplete: true, removeOnFail: true });
+  }
 
   async publishDiscovery(job: DiscoverSourcesJobV1): Promise<void> {
     await this.discoveryQueue.add('discover-sources.v1', job, { jobId: job.idempotency_key,
@@ -138,5 +145,5 @@ export class Jobs implements OnModuleDestroy {
     });
   }
 
-  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.pageReinterpretQueue.close(), this.evidenceQueue.close(), this.signalQueue.close(), this.discoveryQueue.close()]); }
+  async onModuleDestroy(): Promise<void> { await Promise.all([this.queue.close(), this.analysisQueue.close(), this.githubQueue.close(), this.discussionsQueue.close(), this.steamQueue.close(), this.g2Queue.close(), this.webPageQueue.close(), this.pageReinterpretQueue.close(), this.evidenceQueue.close(), this.signalQueue.close(), this.discoveryQueue.close(), this.feedQueue.close()]); }
 }

@@ -8,6 +8,7 @@ import SignalsPanel from './SignalsPanel';
 import QuestionsPanel from './QuestionsPanel';
 import RetrievalReviewPanel from './RetrievalReviewPanel';
 import B2BQualityPanel from './B2BQualityPanel';
+import FeedPanel from './FeedPanel';
 
 type Role = 'owner' | 'admin' | 'analyst' | 'viewer';
 type Tenant = { tenant_id: string; name: string; role: Role };
@@ -193,7 +194,9 @@ async function api<T>(path: string, session: Session | null, init: RequestInit =
   const body = response.status === 204 ? null : await response.json();
   if (!response.ok) {
     const message = Array.isArray(body?.message) ? body.message.join(', ') : body?.message ?? 'Falha na API';
-    const friendly = response.status === 409 && path.startsWith('source-discovery/') ?
+    const friendly = response.status === 409 && path.startsWith('feeds/') ?
+      `${message}${body?.retry_after_at ? ` Tente novamente após ${new Date(body.retry_after_at).toLocaleString('pt-BR')}.` : ''}` :
+      response.status === 409 && path.startsWith('source-discovery/') ?
       `${message}${body?.retry_after_at ? ` Tente novamente após ${new Date(body.retry_after_at).toLocaleString('pt-BR')}.` : ''}` :
       response.status === 409 && path.startsWith('page-sources/') ?
       message.replace(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z/g,
@@ -372,7 +375,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
           <h2>Encontre uma fonte</h2><div className="jump-links">
             <a href="#produtos">Produtos</a><a href="#descoberta">Descoberta</a><a href="#csv-legado">CSV legado</a><a href="#b2b">Reviews B2B</a>
             <a href="#g2">G2</a><a href="#github-issues">GitHub Issues</a><a href="#github-discussions">GitHub Discussions</a>
-            <a href="#steam">Steam</a><a href="#paginas">Preços e changelogs</a><a href="#importacoes">Importações</a>
+            <a href="#steam">Steam</a><a href="#feeds">Feeds RSS/Atom</a><a href="#paginas">Preços e changelogs</a><a href="#importacoes">Importações</a>
           </div></section>
         <section id="produtos" className="card"><h2>Produtos</h2><p>Cadastre o produto próprio e concorrentes.</p>
           <form onSubmit={event => void run(async () => {
@@ -390,6 +393,9 @@ export default function WorkspaceApp({ view }: { view: View }) {
         <DiscoveryPanel data={discoveryData} products={products} role={session.role} busy={busy}
           act={action => run(action)} request={(path, init) => api(path, session, init)}
           refresh={() => refresh(session)} />
+        <FeedPanel key={`feeds-${session.tenant_id}`} products={products} candidates={discoveryData.candidates}
+          role={session.role} busy={busy} act={action => run(action)}
+          request={(path, init) => api(path, session, init)} refresh={() => refresh(session)} />
         <section id="csv-legado" className="card"><h2>Fontes</h2>
           <p>A importação manual exige URL por avaliação. Confirme que você pode usar os dados enviados.</p>
           <p>Para testar, use <code>https://example.invalid/reviews</code>. Esse endereço fictício não abre uma página.</p>
@@ -907,6 +913,7 @@ const sourceLabels: Record<string, { title: string; href: string }> = {
   github_issues: { title: 'GitHub Issues públicas', href: '/fontes#github-issues' },
   github_discussions: { title: 'GitHub Discussions públicas', href: '/fontes#github-discussions' },
   steam_reviews: { title: 'Reviews de usuários do Steam', href: '/fontes#steam' },
+  rss_feed: { title: 'Publicação de feed RSS/Atom', href: '/fontes#feeds' },
 };
 function displayDate(value: string | null): string { return value ? new Date(value).toLocaleString('pt-BR') : 'ainda não registrada'; }
 
@@ -935,6 +942,7 @@ const suggestionReason: Record<string, string> = {
   community: 'caminho ou título sugere comunidade ou fórum',
   support: 'caminho ou título sugere suporte',
   external_mention: 'resultado da consulta, sem classificação confirmada',
+  blog_or_feed: 'link sugere blog ou feed; o formato RSS/Atom só é validado na primeira verificação',
 };
 const externalStatus: Record<string, string> = {
   not_requested: 'não solicitada', not_configured: 'credencial não configurada no worker',
@@ -1061,7 +1069,8 @@ export function DiscoveryPanel({ data, products, role, busy, act, request, refre
                 <p>Tipo sugerido: {item.suggested_type} · estado: <strong>{stale ? 'associação antiga: revisar' : item.status}</strong> · vínculo: {item.confidence === 'official_host' ? 'mesmo domínio oficial' : 'link externo, associação ambígua'}.
                   {' '}{item.discovery_method === 'web_search' ? <>Busca externa {item.search_provider}; consulta: “{item.search_query}”. Resultado não visitado automaticamente.</> : <>Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a>.</>} Examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')} · regra v{item.classification_version}.</p>
                 <p>Motivo da sugestão: {suggestionReason[item.suggested_type] ?? 'indício no caminho ou no título; exige revisão'}. {item.discovery_method === 'web_search' ? 'Título retornado pela busca (não comprova associação)' : 'Texto do link na origem lida; o destino não foi examinado'}: “{item.association_evidence}”. {supported ? <><strong>Fonte existente.</strong> <a href="#paginas">Ver cadastro ↗</a>; nenhuma nova fonte será criada.</> : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' || relatedContent ? 'Conteúdo relacionado, sem conector de índice; não monitorado como página de preços.' : item.status === 'confirmed' ? 'Associação revisada; nenhum conector foi cadastrado pela busca externa. Cadastre manualmente na seção do conector após verificar acesso e direitos.' : 'Ainda não monitorada.'}</p>
-                {canManage && !stale && !supported && item.status === 'pending' && <><button className="small" disabled={busy} onClick={() => void act(async () => {
+                {item.suggested_type === 'blog_or_feed' && !supported && <a href="#feeds">Revisar como feed RSS/Atom ↗</a>}
+                {canManage && !stale && !supported && item.status === 'pending' && item.suggested_type !== 'blog_or_feed' && <><button className="small" disabled={busy} onClick={() => void act(async () => {
                   await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'confirmed' }) }); await refresh();
                 })}>{relatedContent ? 'Marcar como conteúdo relacionado' : 'Confirmar associação'}</button><button className="small ghost" disabled={busy} onClick={() => void act(async () => {
                   await request(`source-discovery/candidates/${item.id}/decision`, { method: 'POST', body: JSON.stringify({ decision: 'rejected' }) }); await refresh();

@@ -3,7 +3,7 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 
 type Product = { id: string; name: string };
-type SourceType = 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review' | 'github_issue' | 'github_discussion' | 'pricing_page' | 'release_notes';
+type SourceType = 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review' | 'github_issue' | 'github_discussion' | 'pricing_page' | 'release_notes' | 'rss_feed';
 type Filters = { product_id: string; source_type: string; from: string; to: string; q: string };
 type EvidenceItem = { item_id: string; source_type: SourceType; product_name: string;
   product_ids: string[]; product_names: string[]; source_url: string; title: string | null;
@@ -37,6 +37,7 @@ const sourceLabels: Record<SourceType, string> = {
   steam_review: 'Review Steam', github_issue: 'Issue pública do GitHub',
   github_discussion: 'Discussion pública do GitHub', pricing_page: 'Captura de preço',
   release_notes: 'Captura de changelog',
+  rss_feed: 'Publicação de feed (não é review)',
 };
 const categoryLabels: Record<string, string> = { support: 'Suporte', price: 'Preço',
   billing: 'Cobrança', performance: 'Desempenho', usability: 'Usabilidade', features: 'Funcionalidades' };
@@ -105,7 +106,7 @@ export default function EvidencePanel({ products }: { products: Product[] }) {
   function submit(event: FormEvent<HTMLFormElement>): void {
     event.preventDefault(); setLoading(true); setOffset(0); setApplied({ ...draft });
   }
-  const activeTypes: SourceType[] = ['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion', 'pricing_page', 'release_notes'];
+  const activeTypes: SourceType[] = ['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion', 'pricing_page', 'release_notes', 'rss_feed'];
   return <section id="explorar" className="card wide evidence-panel" aria-label="Visão de evidências">
     <h2>Visão de evidências</h2>
     <p>Uma linha por documento de origem ou conteúdo distinto de página, mesmo após repetir a coleta. O filtro usa dias UTC da publicação original; quando ela falta, usa a data da coleta. Horários exibidos no fuso do navegador. Os totais descrevem apenas o material armazenado nesta empresa.</p>

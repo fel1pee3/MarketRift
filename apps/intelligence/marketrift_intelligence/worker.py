@@ -9,6 +9,7 @@ from .analyze import analyze
 from .embeddings import embed
 from .evidence_index import index_source
 from .evidence_queue import publish_index
+from .feeds import sync_feed
 from .g2_reviews import sync_g2_reviews
 from .github_discussions import sync_github_discussions
 from .github_issues import sync_github_issues
@@ -93,6 +94,14 @@ async def process_discovery(job, _token):
     return await discover(job.data)
 
 
+async def process_feed(job, _token):
+    result = await sync_feed(job.data)
+    if result.get("status") == "failed":
+        logger.warning("Feed sync failed: run=%s source=%s code=%s",
+                       job.data.get("run_id"), job.data.get("source_id"), result.get("error_code"))
+    return result
+
+
 async def main() -> None:
     await require_released()  # Before subscribing to Redis or loading a model.
     if os.getenv("EMBEDDING_PROVIDER") == "local":
@@ -121,13 +130,14 @@ async def main() -> None:
                                 {"connection": os.environ["REDIS_URL"]})
     index_worker = Worker("evidence-index", guarded(process_index), {"connection": os.environ["REDIS_URL"]})
     discovery_worker = Worker("source-discovery", guarded(process_discovery), {"connection": os.environ["REDIS_URL"]})
+    feed_worker = Worker("feed-sync", guarded(process_feed), {"connection": os.environ["REDIS_URL"]})
     try:
         await stop.wait()
     finally:
         await asyncio.gather(worker.close(), analysis_worker.close(), github_worker.close(), discussions_worker.close(),
                              steam_worker.close(), g2_worker.close(), web_page_worker.close(),
                              reinterpret_worker.close(), index_worker.close(),
-                             discovery_worker.close())
+                             discovery_worker.close(), feed_worker.close())
 
 
 if __name__ == "__main__":
