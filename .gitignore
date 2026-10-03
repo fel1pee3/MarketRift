@@ -1,5 +1,6 @@
 .env
 .env.worker.local
+.env.renderer.local
 node_modules/
 .next/
 .next-dev/

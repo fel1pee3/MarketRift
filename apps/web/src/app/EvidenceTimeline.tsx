@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from 'react';
 
 type Product = { id: string; name: string };
 type SourceType = 'csv_review' | 'b2b_review' | 'g2_review' | 'steam_review' | 'github_issue' |
-  'github_discussion' | 'pricing_page' | 'release_notes' | 'rss_feed';
+  'github_discussion' | 'pricing_page' | 'release_notes' | 'rss_feed' | 'public_page';
 type Filters = { product_id: string; source_types: SourceType[]; from: string; to: string };
 type Link = { signal_id: string; signal_state: string; hypothesis_id: string | null;
   hypothesis_status: string | null; signal_reviewed_at: string | null;
@@ -23,6 +23,7 @@ type Result = { items: Item[]; total: number; limit: number; offset: number };
 
 const apiBase = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:3001';
 const sourceLabels: Record<SourceType, string> = {
+  public_page: 'Página pública observada (não é review)',
   csv_review: 'Review CSV', b2b_review: 'Review B2B importada', g2_review: 'Review G2',
   steam_review: 'Review Steam', github_issue: 'Issue pública do GitHub',
   github_discussion: 'Discussion pública do GitHub', pricing_page: 'Página de preços',
@@ -46,6 +47,11 @@ function object(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null;
 }
 function statusExplanation(item: Item): string {
+  if (item.source_type === 'public_page' && item.status === 'unconfirmed')
+    return 'A captura não preservou conteúdo principal suficiente. O link abre a página atual, que pode ser diferente; esta observação não comprova o artigo.';
+  if (item.source_type === 'public_page') return item.capture_complete
+    ? 'Texto público observado nesta data. Não confirma lançamento, preço, review de cliente ou impacto comercial; a página atual pode ter mudado.'
+    : 'Captura parcial da página pública. Não confirma lançamento, preço ou opinião de cliente.';
   if (item.source_type === 'rss_feed') return item.coverage === 'partial_cursor'
     ? 'Publicação observada em feed parcial. Metadados apenas; não é review nem prova de impacto comercial.'
     : 'Publicação observada no feed. Metadados apenas; não é review nem prova de impacto comercial.';

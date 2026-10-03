@@ -7,8 +7,8 @@
     "dev:api": "npm run dev -w @marketrift/api",
     "dev:web": "npm run dev -w @marketrift/web",
     "dev:worker": "node --env-file=.env --env-file-if-exists=.env.worker.local scripts/run-python.mjs worker",
-    "build:python:docker": "docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python build worker intelligence-http",
-    "dev:python:docker": "docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python up --no-build worker intelligence-http",
+    "build:python:docker": "docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python build worker intelligence-http renderer",
+    "dev:python:docker": "docker compose -f compose.yaml -f compose.local-python.yaml --profile local-python up --no-build worker intelligence-http renderer",
     "dev:scheduler": "npm run dev:scheduler -w @marketrift/api",
     "start:scheduler": "node --env-file=.env apps/api/dist/page-scheduler-main.js",
     "dev:intelligence-http": "node --env-file=.env --env-file-if-exists=.env.worker.local scripts/run-python.mjs http",
@@ -64,7 +64,10 @@
     "db:migrate:github-monitoring": "node --env-file=.env scripts/migrate-github-monitoring.mjs",
     "db:migrate:feed-monitoring": "node --env-file=.env scripts/migrate-feed-monitoring.mjs",
     "db:migrate:feed-run-cancellation": "node --env-file=.env scripts/migrate-feed-run-cancellation.mjs",
-    "db:migrate:feed-scheduler-error-grant": "node --env-file=.env scripts/migrate-feed-scheduler-error-grant.mjs"
+    "db:migrate:feed-scheduler-error-grant": "node --env-file=.env scripts/migrate-feed-scheduler-error-grant.mjs",
+    "db:migrate:individual-public-pages": "node --env-file=.env scripts/migrate-individual-public-pages.mjs",
+    "db:migrate:individual-page-origin-reviewer": "node --env-file=.env scripts/migrate-individual-page-origin-reviewer.mjs",
+    "db:migrate:rendered-public-page-runs": "node --env-file=.env scripts/migrate-rendered-public-page-runs.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1142.0",

@@ -9,6 +9,7 @@ import QuestionsPanel from './QuestionsPanel';
 import RetrievalReviewPanel from './RetrievalReviewPanel';
 import B2BQualityPanel from './B2BQualityPanel';
 import FeedPanel from './FeedPanel';
+import IndividualPagePanel from './IndividualPagePanel';
 
 type Role = 'owner' | 'admin' | 'analyst' | 'viewer';
 type Tenant = { tenant_id: string; name: string; role: Role };
@@ -81,7 +82,8 @@ function GitHubMonitorControls({ monitor, role, busy, onUpdate }: { monitor?: Gi
 type Import = { id: string; source_id: string; status: string; total_rows: number; processed_rows: number; last_error: string | null; created_at: string };
 type Issue = { category: string; sentiment: string; severity: string; description: string; evidence_quote: string };
 type Document = { id: string; source_id: string; product_id: string; product_name: string; document_type: 'review' | 'b2b_review' | 'g2_review' | 'github_issue' | 'github_discussion' | 'steam_review'; external_key: string; source_url: string; source_url_kind: string | null; body: string; steam_app_id: string | null; review_language: string | null; review_rating: number | null; review_data_status: string | null; review_voted_up: boolean | null; source_title: string | null; source_body: string | null; source_state: string | null; source_repository: string | null; discussion_category: string | null; discussion_author: string | null; discussion_content_status: string | null; discussion_relevance: string | null; source_created_at: string | null; source_updated_at: string | null; published_at: string | null; synthetic: boolean; analysis_status: string | null; analysis_model: string | null; analysis_error: string | null; analysis_eligibility: string | null; issues: Issue[] };
-type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number };
+type PageSource = { id: string; product_id: string; product_name: string; source_type: 'pricing_page' | 'release_notes' | 'public_page'; url: string; check_interval_minutes: number; last_checked_at: string | null; monitoring_enabled: boolean; next_check_at: string | null; consecutive_failures: number;
+  origins?: { kind: string; suggested_url: string; from_url: string | null; title: string | null }[] };
 type PageRun = { id: string; source_id: string; status: string; error_code: string | null; retry_after_at: string | null; documents_new: number; started_at: string; finished_at: string | null; trigger_kind: 'manual' | 'scheduled' };
 type PagePlan = { name: string; amount: string | null; currency: string | null; period: string | null; conditions: string; confirmed: boolean; evidence: string };
 type PageEntry = { title: string; date: string | null; url: string; evidence: string;
@@ -375,7 +377,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
           <h2>Encontre uma fonte</h2><div className="jump-links">
             <a href="#produtos">Produtos</a><a href="#descoberta">Descoberta</a><a href="#csv-legado">CSV legado</a><a href="#b2b">Reviews B2B</a>
             <a href="#g2">G2</a><a href="#github-issues">GitHub Issues</a><a href="#github-discussions">GitHub Discussions</a>
-            <a href="#steam">Steam</a><a href="#feeds">Feeds RSS/Atom</a><a href="#paginas">Preços e changelogs</a><a href="#importacoes">Importações</a>
+            <a href="#steam">Steam</a><a href="#feeds">Feeds RSS/Atom</a><a href="#paginas-individuais">Páginas individuais</a><a href="#paginas">Preços e changelogs</a><a href="#importacoes">Importações</a>
           </div></section>
         <section id="produtos" className="card"><h2>Produtos</h2><p>Cadastre o produto próprio e concorrentes.</p>
           <form onSubmit={event => void run(async () => {
@@ -396,6 +398,10 @@ export default function WorkspaceApp({ view }: { view: View }) {
         <FeedPanel key={`feeds-${session.tenant_id}`} products={products} candidates={discoveryData.candidates}
           role={session.role} busy={busy} act={action => run(action)}
           request={(path, init) => api(path, session, init)} refresh={() => refresh(session)} />
+        <IndividualPagePanel key={`individual-${session.tenant_id}`} candidates={discoveryData.candidates}
+          products={products} pages={pageData} role={session.role} busy={busy}
+          act={action => run(action)} request={(path, init) => api(path, session, init)}
+          refresh={() => refresh(session)} />
         <section id="csv-legado" className="card"><h2>Fontes</h2>
           <p>A importação manual exige URL por avaliação. Confirme que você pode usar os dados enviados.</p>
           <p>Para testar, use <code>https://example.invalid/reviews</code>. Esse endereço fictício não abre uma página.</p>
@@ -710,7 +716,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
             <label>URL pública HTTPS, sem parâmetros<input name="url" type="url" placeholder="https://exemplo.com/pricing" required /></label>
             <label>Periodicidade desejada<select name="check_interval_minutes"><option value="1440">Diária</option><option value="360">A cada 6 horas</option><option value="60">Horária</option><option value="10080">Semanal</option></select></label>
             <button disabled={busy || !canManage || !products.length}>Adicionar página</button></form>
-          {pageData.sources.length ? <ul>{pageData.sources.map(source => {
+          {pageData.sources.some(source => source.source_type !== 'public_page') ? <ul>{pageData.sources.filter(source => source.source_type !== 'public_page').map(source => {
             const latest = pageData.runs.find(run => run.source_id === source.id);
             const snapshots = pageData.snapshots.filter(snapshot => snapshot.source_id === source.id)
               .sort((a, b) => b.version_no - a.version_no);
@@ -914,6 +920,7 @@ const sourceLabels: Record<string, { title: string; href: string }> = {
   github_discussions: { title: 'GitHub Discussions públicas', href: '/fontes#github-discussions' },
   steam_reviews: { title: 'Reviews de usuários do Steam', href: '/fontes#steam' },
   rss_feed: { title: 'Publicação de feed RSS/Atom', href: '/fontes#feeds' },
+  public_page: { title: 'Página pública individual', href: '/fontes#paginas-individuais' },
 };
 function displayDate(value: string | null): string { return value ? new Date(value).toLocaleString('pt-BR') : 'ainda não registrada'; }
 
@@ -1149,9 +1156,9 @@ export function Overview({ tenantName, role, products, sources, sourceRuns, page
             .sort((a, b) => b.version_no - a.version_no)[0];
           const flags = [!source.monitoring_enabled && 'monitoramento pausado',
             latest?.error_code && `último erro: ${pageErrorReasons[latest.error_code] ?? latest.error_code}`,
-            snapshot && snapshot.interpretation_status !== 'confirmed' &&
+            snapshot && source.source_type !== 'public_page' && snapshot.interpretation_status !== 'confirmed' &&
               `interpretação ${interpretationStatus[snapshot.interpretation_status] ?? snapshot.interpretation_status}`].filter(Boolean);
-          return <li key={source.id}><strong><Link href="/fontes#paginas">{source.source_type === 'pricing_page' ? 'Página de preços' : 'Changelog'}</Link></strong> · {source.product_name}
+          return <li key={source.id}><strong><Link href={source.source_type === 'public_page' ? '/fontes#paginas-individuais' : '/fontes#paginas'}>{source.source_type === 'pricing_page' ? 'Página de preços' : source.source_type === 'release_notes' ? 'Changelog' : 'Página pública observada'}</Link></strong> · {source.product_name}
             <span className="coverage-meta">Última verificação: {displayDate(source.last_checked_at)} · {latest?.status ?? 'sem execução'}.</span>
             {flags.length > 0 && <span className="coverage-warning">{flags.join(' · ')}</span>}</li>;
         })}</ul>}

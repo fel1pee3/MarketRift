@@ -20,6 +20,7 @@ let steamVotedUp = false;
 const steamRequests = [];
 let pagePrice = '10';
 let releaseVersion = 1;
+let renderedRevision = 1;
 let flakyAttempts = 0;
 const pageRequests = [];
 let discussionBody = 'The integration fails when the account name has spaces.';
@@ -143,9 +144,30 @@ const steamMock = createServer((request, response) => {
       { url: 'https://g2.com.evil.example/reviews', title: 'Deceptive Example result' },
     ] } })); return;
   }
+  if (url.pathname === '/web-page-rendered/blog/update-1') {
+    pageRequests.push(url.pathname);
+    response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+    response.end('<html><head><title>Controlled rendered article</title></head><body>'
+      + '<nav>Skip to content</nav><article id="article"></article>'
+      + '<script>document.getElementById("article").innerHTML = '
+      + '"<p>The product now supports a rendered update with a detailed account of the new workflow. '
+      + (renderedRevision === 1 ? 'This sentence is literal text observed from the controlled page after JavaScript executes.' :
+        'The later controlled observation states that the workflow changed after the first captured version.')
+      + '</p>";</script>'
+      + '</body></html>'); return;
+  }
   if (url.pathname.startsWith('/web-page/')) {
     pageRequests.push(url.pathname);
     if (url.pathname === '/web-page/robots.txt') { response.writeHead(404); response.end(); return; }
+    if (url.pathname === '/web-page/blog/update-1') {
+      response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      response.end('<html><head><title>Controlled public article</title></head><body>'
+        + '<a href="#article">Skip to content</a><nav>Products and pricing</nav>'
+        + '<main><a href="#article">Skip to content</a></main><article id="article">'
+        + '<h1>Controlled public article</h1><time datetime="2026-10-02">2 October 2026</time>'
+        + '<p>A public product article with a literal observed excerpt.</p></article>'
+        + '<footer>Newsletter</footer></body></html>'); return;
+    }
     if (url.pathname === '/web-page/pricing') {
       response.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
       response.end(`<main><section class="plan"><h2>Pro</h2><p>USD ${pagePrice} per month</p><p>API access</p></section><footer>Updated today</footer></main>`);
@@ -518,6 +540,89 @@ try {
   assert.equal((await b.call('evidence/search?source_type=rss_feed')).body.items.length,0);
   assert.equal(feedRequests.some(item=>item.path==='/feed/blog/update-1'),false,
     'Article links must not be fetched automatically');
+  const observedEntry = feedData.entries.find(item=>item.source_id===feedId);
+  const individualInput = { feed_entry_id:observedEntry.id, association_confirmed:true };
+  assert.equal((await viewer.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(individualInput) })).status,403);
+  assert.equal((await analyst.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(individualInput) })).status,403);
+  assert.equal((await b.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(individualInput) })).status,404);
+  const individual = await admin.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(individualInput) });
+  assert.equal(individual.status,200,JSON.stringify(individual.body));
+  assert.equal(individual.body.monitoring_enabled,false);
+  const individualId=individual.body.id;
+  assert.equal((await admin.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(individualInput) })).body.id,individualId);
+  assert.equal((await analyst.call(`page-sources/${individualId}/check`, { method:'POST' })).status,403);
+  assert.equal((await b.call(`page-sources/${individualId}/check`, { method:'POST' })).status,404);
+  assert.equal(pageRequests.includes('/web-page/blog/update-1'),false,
+    'Registration must not request the page');
+  const individualRun = await admin.call(`page-sources/${individualId}/check`, { method:'POST' });
+  assert.equal(individualRun.status,200,JSON.stringify(individualRun.body));
+  const observedPages=await waitForPageRun(admin,individualRun.body.id);
+  const individualSnapshot=observedPages.snapshots.find(item=>item.source_id===individualId);
+  assert.equal(individualSnapshot.version_no,1);
+  assert.equal(individualSnapshot.extracted.title,'Controlled public article');
+  assert.equal(individualSnapshot.extracted.status,'unconfirmed');
+  assert.equal(individualSnapshot.extracted.origin_date_literal,'2 October 2026');
+  assert.equal(individualSnapshot.extracted.origin_date_evidence.datetime_attribute,'2026-10-02');
+  assert.equal(individualSnapshot.extracted.origin_reported_at,undefined);
+  assert(!individualSnapshot.extracted.excerpt.includes('Skip to content'));
+  assert(individualSnapshot.extracted.excerpt.includes('literal observed excerpt'));
+  assert(observedPages.sources.find(item=>item.id===individualId)?.origins?.some(item=>item.kind==='feed'));
+  assert(pageRequests.includes('/web-page/blog/update-1'));
+  assert((await admin.call('evidence/search?source_type=public_page')).body.items.some(item=>
+    item.source_url==='https://example.com/blog/update-1'));
+  assert((await admin.call('evidence/timeline?source_types=public_page')).body.items.some(item=>
+    item.source_url==='https://example.com/blog/update-1' && item.status==='observed'));
+  assert.equal((await b.call('evidence/search?source_type=public_page')).body.items.length,0);
+  assert.equal((await admin.call('page-sources')).body.sources.find(item=>item.id===individualId).monitoring_enabled,false);
+  assert.equal((await viewer.call(`page-sources/${individualId}/check-rendered`, { method:'POST' })).status,403);
+  assert.equal((await analyst.call(`page-sources/${individualId}/check-rendered`, { method:'POST' })).status,403);
+  assert.equal((await b.call(`page-sources/${individualId}/check-rendered`, { method:'POST' })).status,404);
+  const renderedClock = new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
+  try { await renderedClock.connect(); await renderedClock.query(`UPDATE marketrift.source_runs
+    SET finished_at=now()-interval '2 minutes' WHERE id=$1`, [individualRun.body.id]); }
+  finally { await renderedClock.end(); }
+  const renderedRun = await admin.call(`page-sources/${individualId}/check-rendered`, { method:'POST' });
+  assert.equal(renderedRun.status,200,JSON.stringify(renderedRun.body));
+  const renderedPages = await waitForPageRun(admin,renderedRun.body.id);
+  const renderedSnapshots = renderedPages.snapshots.filter(item=>item.source_id===individualId);
+  assert.equal(renderedSnapshots.length,2);
+  const renderedSnapshot = renderedSnapshots.find(item=>item.extracted.capture_method==='rendered_dom');
+  assert.equal(renderedSnapshot.version_no,2);
+  assert(renderedSnapshot.extracted.excerpt.includes('literal text observed'));
+  assert.equal(renderedSnapshot.extracted.origin_date_literal,null);
+  assert.equal(renderedSnapshot.extracted.comparison_status,'previous_markup_unavailable');
+  assert.equal(renderedSnapshots.find(item=>item.id===individualSnapshot.id).content_sha256,
+    individualSnapshot.content_sha256,'Historical static snapshot must keep its original hash');
+  assert.equal(renderedPages.runs.find(item=>item.id===renderedRun.body.id).capture_mode,'rendered_dom');
+  assert.equal(renderedPages.changes.filter(item=>item.source_id===individualId).length,0,
+    'Changing capture method must not invent a page-change event');
+  assert.equal((await b.call('page-sources')).body.snapshots.some(item=>item.id===renderedSnapshot.id),false);
+  const replayClock = new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
+  try { await replayClock.connect(); await replayClock.query(`UPDATE marketrift.source_runs
+    SET finished_at=now()-interval '2 minutes' WHERE id=$1`, [renderedRun.body.id]); }
+  finally { await replayClock.end(); }
+  const repeatedRenderedRun = await admin.call(`page-sources/${individualId}/check-rendered`, { method:'POST' });
+  assert.equal(repeatedRenderedRun.status,200,JSON.stringify(repeatedRenderedRun.body));
+  const repeatedPages = await waitForPageRun(admin,repeatedRenderedRun.body.id);
+  assert.equal(repeatedPages.runs.find(item=>item.id===repeatedRenderedRun.body.id).documents_new,0);
+  assert.equal(repeatedPages.snapshots.filter(item=>item.source_id===individualId).length,2);
+  renderedRevision = 2;
+  const changeClock = new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
+  try { await changeClock.connect(); await changeClock.query(`UPDATE marketrift.source_runs
+    SET finished_at=now()-interval '2 minutes' WHERE id=$1`, [repeatedRenderedRun.body.id]); }
+  finally { await changeClock.end(); }
+  const changedRenderedRun = await admin.call(`page-sources/${individualId}/check-rendered`, { method:'POST' });
+  assert.equal(changedRenderedRun.status,200,JSON.stringify(changedRenderedRun.body));
+  const changedPages = await waitForPageRun(admin,changedRenderedRun.body.id);
+  assert.equal(changedPages.snapshots.filter(item=>item.source_id===individualId).length,3);
+  assert.equal(changedPages.runs.find(item=>item.id===changedRenderedRun.body.id).documents_new,1);
+  assert.equal(changedPages.changes.filter(item=>item.source_id===individualId).length,0);
+  assert.equal((await admin.call('page-sources')).body.sources.find(item=>item.id===individualId).monitoring_enabled,false);
   const feedClock=new pg.Client({ connectionString:process.env.DATABASE_ADMIN_URL });
   try { await feedClock.connect(); await feedClock.query(`UPDATE marketrift.source_runs
     SET started_at=now()-interval '6 minutes',finished_at=now()-interval '6 minutes' WHERE id=$1`,
@@ -654,8 +759,30 @@ try {
   assert.equal(relatedDecision.status, 200);
   assert.equal(relatedDecision.body.status, 'access_unavailable');
   assert.equal(relatedDecision.body.linked_source_id, null);
+  const candidateIndividualInput={ candidate_id:entryCandidate.id, association_confirmed:true };
+  assert.equal((await viewer.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(candidateIndividualInput) })).status,403);
+  assert.equal((await b.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(candidateIndividualInput) })).status,404);
+  const candidateIndividual=await admin.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(candidateIndividualInput) });
+  assert.equal(candidateIndividual.status,200,JSON.stringify(candidateIndividual.body));
+  assert.equal(candidateIndividual.body.monitoring_enabled,false);
+  const candidateRepeat=await admin.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify(candidateIndividualInput) });
+  assert.equal(candidateRepeat.body.id,candidateIndividual.body.id);
+  const candidateSource=(await admin.call('page-sources')).body.sources.find(item=>item.id===candidateIndividual.body.id);
+  assert.equal(candidateSource.source_type,'public_page');
+  assert(candidateSource.origins.some(item=>item.kind==='discovery'));
   assert(discovered.candidates.some(item => item.canonical_url === 'https://instagram.com/example'));
   assert.equal(discovered.candidates.find(item => item.canonical_url === 'https://thirdparty.com/pricing').confidence, 'ambiguous');
+  const externalCandidate=discovered.candidates.find(item=>item.canonical_url==='https://thirdparty.com/pricing');
+  const externalPage=await admin.call('page-sources/individual', { method:'POST',
+    body:JSON.stringify({ candidate_id:externalCandidate.id,association_confirmed:true }) });
+  assert.equal(externalPage.status,200,JSON.stringify(externalPage.body));
+  assert.equal(externalPage.body.monitoring_enabled,false);
+  assert.equal((await admin.call('page-sources')).body.snapshots.some(item=>item.source_id===externalPage.body.id),false,
+    'A misleading external URL must not be fetched or treated as an official page by registration');
   const existingDiscoveryDb = new pg.Client({ connectionString: process.env.DATABASE_ADMIN_URL });
   let alreadyRegisteredId;
   try {
@@ -2426,7 +2553,7 @@ try {
       const users = await admin.query('SELECT id FROM marketrift.users WHERE email = ANY($1::text[])', [cleanupEmails]);
       await admin.query('DELETE FROM marketrift.member_invitations WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
       await admin.query('DELETE FROM marketrift.browser_sessions WHERE tenant_id = ANY($1::uuid[])', [cleanupTenants]);
-      for (const table of ['b2b_quality_sets', 'action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'feed_entry_versions', 'feed_entries', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
+      for (const table of ['b2b_quality_sets', 'action_hypothesis_events', 'action_hypotheses', 'product_capabilities', 'watch_topics', 'public_page_origins', 'discovery_candidates', 'discovery_runs', 'competitor_profiles', 'signal_alert_reads', 'reviewable_signals', 'retrieval_sets', 'evidence_chunks', 'insights', 'document_analyses', 'import_rows', 'page_changes', 'snapshot_interpretations', 'source_snapshots', 'feed_entry_versions', 'feed_entries', 'source_runs', 'documents', 'imports', 'sources', 'products', 'memberships']) {
         await admin.query(`DELETE FROM marketrift.${table} WHERE tenant_id = ANY($1::uuid[])`, [cleanupTenants]);
       }
       await admin.query('DELETE FROM marketrift.tenants WHERE id = ANY($1::uuid[])', [cleanupTenants]);

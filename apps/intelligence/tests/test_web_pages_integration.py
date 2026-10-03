@@ -42,6 +42,108 @@ def markup(amount):
     return f"<main><section class='plan'><h2>Pro</h2><p>USD {amount} per month</p><p>API access</p></section></main>"
 
 
+def test_paused_individual_page_is_manual_versioned_and_tenant_isolated(request):
+    tenant_a, tenant_b = str(uuid4()), str(uuid4())
+    source, product = str(uuid4()), str(uuid4())
+    run_ids = [str(uuid4()) for _ in range(3)]
+
+    def cleanup():
+        with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+            for table in ("page_changes", "snapshot_interpretations", "source_snapshots", "source_runs",
+                          "sources", "products"):
+                admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id = ANY(%s::uuid[])",
+                              ([tenant_a, tenant_b],))
+            admin.execute("DELETE FROM marketrift.tenants WHERE id = ANY(%s::uuid[])",
+                          ([tenant_a, tenant_b],))
+
+    request.addfinalizer(cleanup)
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        for tenant in (tenant_a, tenant_b):
+            admin.execute("INSERT INTO marketrift.tenants(id,name) VALUES (%s,'individual-test')", (tenant,))
+        admin.execute("INSERT INTO marketrift.products(id,tenant_id,name,kind) "
+                      "VALUES (%s,%s,'Controlled competitor','competitor')", (product, tenant_a))
+        admin.execute("INSERT INTO marketrift.sources(id,tenant_id,product_id,source_type,url,monitoring_enabled) "
+                      "VALUES (%s,%s,%s,'public_page','https://example.com/article',false)",
+                      (source, tenant_a, product))
+        admin.execute("INSERT INTO marketrift.source_runs(id,tenant_id,source_id,status,run_kind) "
+                      "VALUES (%s,%s,%s,'pending','web_page')", (run_ids[0], tenant_a, source))
+
+    def job(tenant, run_id):
+        return {"version": 1, "tenant_id": tenant, "source_id": source, "run_id": run_id,
+                "idempotency_key": f"web-page-{run_id}-v1"}
+
+    html = "<main><h1>Public article</h1><p>A literal public product statement.</p></main>"
+    with pytest.raises(PageError, match="source_product_or_run_not_in_tenant"):
+        invoke(job(tenant_b, run_ids[0]), html)
+    assert invoke(job(tenant_a, run_ids[0]), html) == {"status": "succeeded", "new_snapshot": True}
+    assert invoke(job(tenant_a, run_ids[0]), html)["replayed"] is True
+    for run_id, markup_text, expected in ((run_ids[1], html, False),
+                                          (run_ids[2], html.replace("literal", "updated"), True)):
+        with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+            admin.execute("INSERT INTO marketrift.source_runs(id,tenant_id,source_id,status,run_kind) "
+                          "VALUES (%s,%s,%s,'pending','web_page')", (run_id, tenant_a, source))
+        assert invoke(job(tenant_a, run_id), markup_text)["new_snapshot"] is expected
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        assert admin.execute("SELECT count(*) FROM marketrift.source_snapshots WHERE source_id=%s",
+                             (source,)).fetchone()[0] == 2
+        assert admin.execute("SELECT count(*) FROM marketrift.page_changes WHERE source_id=%s",
+                             (source,)).fetchone()[0] == 0
+        assert admin.execute("SELECT monitoring_enabled FROM marketrift.sources WHERE id=%s",
+                             (source,)).fetchone()[0] is False
+    with psycopg.connect(os.environ["RUNTIME_DATABASE_URL"]) as runtime:
+        runtime.execute("SELECT set_config('app.tenant_id',%s,true)", (tenant_b,))
+        assert runtime.execute("SELECT count(*) FROM marketrift.source_snapshots WHERE source_id=%s",
+                               (source,)).fetchone()[0] == 0
+
+
+def test_legacy_skip_capture_remains_historical_after_new_observation(request):
+    tenant, source, product = [str(uuid4()) for _ in range(3)]
+    old_run, new_run = str(uuid4()), str(uuid4())
+
+    def cleanup():
+        with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+            for table in ("page_changes", "snapshot_interpretations", "source_snapshots", "source_runs",
+                          "sources", "products"):
+                admin.execute(f"DELETE FROM marketrift.{table} WHERE tenant_id=%s", (tenant,))
+            admin.execute("DELETE FROM marketrift.tenants WHERE id=%s", (tenant,))
+
+    request.addfinalizer(cleanup)
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        admin.execute("INSERT INTO marketrift.tenants(id,name) VALUES (%s,'legacy-page-test')", (tenant,))
+        admin.execute("INSERT INTO marketrift.products(id,tenant_id,name,kind) "
+                      "VALUES (%s,%s,'Controlled competitor','competitor')", (product, tenant))
+        admin.execute("INSERT INTO marketrift.sources(id,tenant_id,product_id,source_type,url,monitoring_enabled) "
+                      "VALUES (%s,%s,%s,'public_page','https://example.com/article',false)",
+                      (source, tenant, product))
+        admin.execute("INSERT INTO marketrift.source_runs(id,tenant_id,source_id,status,run_kind) "
+                      "VALUES (%s,%s,%s,'succeeded','web_page'),(%s,%s,%s,'pending','web_page')",
+                      (old_run, tenant, source, new_run, tenant, source))
+        old = {"kind": "public_page", "text": "Skip to content", "excerpt": "Skip to content",
+               "extractor_version": 3, "status": "unconfirmed", "reason": "public_page_observation"}
+        admin.execute("INSERT INTO marketrift.source_snapshots "
+                      "(tenant_id,source_id,run_id,source_url,storage_key,content_sha256,version_no,"
+                      "final_url,normalized_text,extracted,interpretation_version,interpretation_status,"
+                      "interpretation_reason) VALUES (%s,%s,%s,'https://example.com/article',"
+                      "'legacy:test',%s,1,'https://example.com/article','Skip to content',%s::jsonb,"
+                      "3,'unconfirmed','public_page_observation')",
+                      (tenant, source, old_run, "a" * 64, json.dumps(old)))
+    job = {"version": 1, "tenant_id": tenant, "source_id": source, "run_id": new_run,
+           "idempotency_key": f"web-page-{new_run}-v1"}
+    html = ('<main><a href="#article">Skip to content</a></main><article><h1>Update</h1>'
+            '<p>The product now supports a controlled upload method.</p></article>')
+    assert invoke(job, html) == {"status": "succeeded", "new_snapshot": True}
+    with psycopg.connect(os.environ["TEST_DATABASE_ADMIN_URL"]) as admin:
+        rows = admin.execute("SELECT version_no,content_sha256,normalized_text,extracted "
+                             "FROM marketrift.source_snapshots WHERE tenant_id=%s AND source_id=%s "
+                             "ORDER BY version_no", (tenant, source)).fetchall()
+        assert len(rows) == 2
+        assert rows[0][1:3] == ("a" * 64, "Skip to content")
+        assert rows[1][2].startswith("Update\nThe product now supports")
+        assert rows[1][3]["comparison_status"] == "previous_markup_unavailable"
+        assert admin.execute("SELECT count(*) FROM marketrift.page_changes WHERE tenant_id=%s",
+                             (tenant,)).fetchone()[0] == 0
+
+
 def test_two_tenants_snapshots_changes_replay_and_unextractable(request):
     tenants = [str(uuid4()) for _ in range(2)]
     sources = [str(uuid4()) for _ in range(2)]

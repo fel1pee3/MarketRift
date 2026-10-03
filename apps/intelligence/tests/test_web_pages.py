@@ -12,6 +12,7 @@ from marketrift_intelligence.web_pages import (
     e2e_fetch_public_page,
     fetch_public_page,
     page_content,
+    public_content_hash,
     reparse_markup,
     request_pinned_capture,
     resolve_public,
@@ -126,6 +127,76 @@ def test_robots_disallow_and_no_visible_content():
     with pytest.raises(PageError, match="no_extractable_content"):
         page_content("<main><script>secret</script><footer>2026</footer></main>",
                      "pricing_page", "https://example.com/pricing")
+
+
+def test_individual_public_page_is_observation_only_and_literal():
+    html = ('<html><head><title>Public article</title></head><body><main>'
+            '<h1>Public article</h1><time datetime="2026-10-02">2 October 2026</time>'
+            '<p>A product article with a specific public statement.</p></main></body></html>')
+    observed = page_content(html, "public_page", "https://example.com/blog/article")
+    assert observed["title"] == "Public article"
+    assert observed["origin_date_literal"] == "2 October 2026"
+    assert observed["origin_date_evidence"] == {"element": "time", "text": "2 October 2026",
+                                                "datetime_attribute": "2026-10-02"}
+    assert observed["excerpt"] in observed["text"]
+    assert observed["status"] == "unconfirmed"
+    assert observed["reason"] == "public_page_observation"
+    assert "plans" not in observed and "entries" not in observed
+    assert page_content(html, "public_page", "https://example.com/blog/article") == observed
+    changed = page_content(html.replace("specific public", "updated public"), "public_page",
+                           "https://example.com/blog/article")
+    assert semantic_hash(changed) != semantic_hash(observed)
+    partial = page_content(html, "public_page", "https://example.com/blog/article", complete=False)
+    assert partial["reason"] == "capture_truncated"
+
+
+def test_individual_page_ignores_skip_navigation_and_repeated_chrome():
+    html = ('<title>Article title</title><body><a href="#content">Skip to content</a>'
+            '<nav>All products and pricing</nav><main><a href="#content">Skip to content</a></main>'
+            '<article><h1>Article title</h1><p>The product now supports image uploads from '
+            'GitHub Actions with short-lived credentials.</p><p>The product now supports image uploads '
+            'from GitHub Actions with short-lived credentials.</p></article>'
+            '<footer>Join our newsletter</footer></body>')
+    result = page_content(html, "public_page", "https://example.com/changelog/article")
+    assert result["reason"] == "public_page_observation"
+    assert result["excerpt"].startswith("Article title")
+    assert "short-lived credentials" in result["excerpt"]
+    assert "Skip to content" not in result["text"]
+    assert "newsletter" not in result["text"]
+    assert result["text"].count("GitHub Actions") == 1
+    assert result["origin_date_literal"] is None
+    assert result["origin_date_evidence"] is None
+
+
+def test_individual_page_without_main_content_is_insufficient():
+    result = page_content('<title>Article</title><body><a href="#main">Skip to content</a>'
+                          '<main><a href="#main">Skip to content</a></main><footer>2026</footer></body>',
+                          "public_page", "https://example.com/article")
+    assert result["reason"] == "insufficient_main_content"
+    assert result["excerpt"] == ""
+    assert result["text"] == ""
+    assert result["origin_date_literal"] is None
+
+
+def test_individual_page_date_requires_literal_on_page():
+    html = ('<article><h1>Release</h1><time datetime="2026-09-25">25 September</time>'
+            '<p>The application now supports short-lived authentication for uploads.</p></article>')
+    result = page_content(html, "public_page", "https://example.com/article")
+    assert result["origin_date_literal"] == "25 September"
+    assert result["origin_date_evidence"]["datetime_attribute"] == "2026-09-25"
+    assert result.get("origin_reported_at") is None
+
+
+def test_individual_page_hash_ignores_rule_metadata_but_detects_html_content_change():
+    first = page_content('<article><h1>Update</h1><p>The product now supports '
+                         'short-lived upload credentials.</p></article>', "public_page",
+                         "https://example.com/article")
+    same = {**first, "extractor_version": 999, "comparison_status": "older_rule"}
+    assert public_content_hash(first) == public_content_hash(same)
+    changed = page_content('<article><h1>Update</h1><p>The product now supports '
+                           'a different upload method.</p></article>', "public_page",
+                           "https://example.com/article")
+    assert public_content_hash(first) != public_content_hash(changed)
 
 
 def pricing(amount="10", currency="USD", period="per month", footer="2025", banner="Accept cookies"):

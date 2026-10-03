@@ -7,7 +7,7 @@ import { activeExtractorVersion } from './analysis-job';
 import { Db } from './db';
 
 const sourceType = z.enum(['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion',
-  'pricing_page', 'release_notes', 'rss_feed']);
+  'pricing_page', 'release_notes', 'rss_feed', 'public_page']);
 const date = z.iso.date();
 const filtersSchema = z.object({
   product_id: z.uuid().optional(), source_type: sourceType.optional(),
@@ -73,13 +73,21 @@ const evidenceBase = `WITH raw AS (
   UNION ALL
   SELECT ss.id, ss.source_id, s.product_id, p.name, s.source_type,
     jsonb_build_array(coalesce(ss.final_url, s.url), ss.content_sha256)::text,
-    coalesce(ss.final_url, s.url), NULL::text, left(ss.normalized_text, 500),
-    ss.normalized_text, ss.fetched_at, ss.fetched_at, false, NULL::text,
-    ss.interpretation_status, ss.interpretation_reason, NULL::text
+    coalesce(ss.final_url, s.url), ss.extracted->>'title',
+    CASE WHEN s.source_type='public_page' AND (ss.interpretation_reason='insufficient_main_content'
+      OR lower(trim(ss.normalized_text))='skip to content') THEN ''
+      ELSE left(ss.normalized_text, 500) END,
+    CASE WHEN s.source_type='public_page' AND (ss.interpretation_reason='insufficient_main_content'
+      OR lower(trim(ss.normalized_text))='skip to content') THEN ''
+      ELSE ss.normalized_text END, ss.fetched_at, ss.fetched_at, false, NULL::text,
+    ss.interpretation_status, ss.interpretation_reason,
+    CASE WHEN s.source_type='public_page' AND (ss.interpretation_reason='insufficient_main_content'
+      OR lower(trim(ss.normalized_text))='skip to content') THEN 'insufficient_main_content'
+      WHEN s.source_type='public_page' AND NOT ss.capture_complete THEN 'partial_capture' ELSE NULL::text END
   FROM marketrift.source_snapshots ss
   JOIN marketrift.sources s ON s.tenant_id = ss.tenant_id AND s.id = ss.source_id
   JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
-  WHERE s.source_type IN ('pricing_page', 'release_notes') AND ss.version_no IS NOT NULL
+  WHERE s.source_type IN ('pricing_page', 'release_notes', 'public_page') AND ss.version_no IS NOT NULL
     AND ss.normalized_text IS NOT NULL
   UNION ALL
   SELECT e.id,e.source_id,s.product_id,p.name,'rss_feed'::text,

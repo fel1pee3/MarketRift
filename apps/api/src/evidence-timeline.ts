@@ -6,7 +6,7 @@ import { Accounts } from './accounts';
 import { Db } from './db';
 
 const types = ['csv_review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue',
-  'github_discussion', 'pricing_page', 'release_notes', 'rss_feed'] as const;
+  'github_discussion', 'pricing_page', 'release_notes', 'rss_feed', 'public_page'] as const;
 const filterSchema = z.object({ product_id: z.uuid().optional(), source_types: z.string().max(200).optional(),
   from: z.iso.date().optional(), to: z.iso.date().optional(),
   limit: z.coerce.number<number>().int().min(1).max(50).default(20),
@@ -122,9 +122,16 @@ const documentsSql = timelineSql(`SELECT d.id::text AS item_id,
 const snapshotsSql = timelineSql(`SELECT ss.id::text AS item_id,
   md5(jsonb_build_array(s.source_type,coalesce(ss.final_url,s.url),ss.content_sha256)::text) AS identity_key,
   'snapshot'::text AS kind,s.source_type,ss.source_id,s.product_id,p.name AS product_name,
-  ss.id AS relation_id,('Captura v' || ss.version_no)::text AS title,
-  left(ss.normalized_text,500) AS excerpt,coalesce(ss.final_url,s.url) AS source_url,
-  NULL::timestamptz AS origin_reported_at,NULL::text AS origin_date_literal,
+  ss.id AS relation_id,coalesce(ss.extracted->>'title',('Captura v' || ss.version_no)::text) AS title,
+  CASE WHEN s.source_type='public_page' AND (ss.interpretation_reason='insufficient_main_content'
+    OR lower(trim(ss.normalized_text))='skip to content') THEN ''
+    ELSE left(ss.normalized_text,500) END AS excerpt,coalesce(ss.final_url,s.url) AS source_url,
+  CASE WHEN s.source_type='public_page' AND ss.extracted->>'origin_date_basis' IS DISTINCT FROM 'feed_metadata'
+    AND ss.extracted->'origin_date_evidence' IS NOT NULL THEN
+    (ss.extracted->>'origin_reported_at')::timestamptz ELSE NULL END AS origin_reported_at,
+  CASE WHEN s.source_type='public_page' AND ss.extracted->>'origin_date_basis' IS DISTINCT FROM 'feed_metadata'
+    AND ss.extracted->'origin_date_evidence' IS NOT NULL THEN
+    ss.extracted->>'origin_date_literal' ELSE NULL END AS origin_date_literal,
   ss.fetched_at AS observed_at,ss.fetched_at AS capture_at,
   ss.markup_observed_at AS structure_observed_at,i.finished_at AS interpretation_at,
   ss.interpretation_version::text AS rule_version,ss.interpretation_status,
@@ -138,7 +145,7 @@ const snapshotsSql = timelineSql(`SELECT ss.id::text AS item_id,
     WHERE i.tenant_id=ss.tenant_id AND i.snapshot_id=ss.id AND i.status='completed'
       AND i.rule_version=ss.interpretation_version
     ORDER BY i.finished_at DESC LIMIT 1) i ON true
-  WHERE s.source_type IN ('pricing_page','release_notes') AND ss.version_no IS NOT NULL
+  WHERE s.source_type IN ('pricing_page','release_notes','public_page') AND ss.version_no IS NOT NULL
     AND ss.normalized_text IS NOT NULL`);
 
 const feedSql = timelineSql(`SELECT (e.id::text || ':' || v.version_no::text) AS item_id,
@@ -329,7 +336,9 @@ export class EvidenceTimelineController {
           ...publicRow } = row;
         void _total; void _identityKey; void _sourceId; void _relationIds;
         void _anySynthetic; void _syntheticGroup; void _allConfirmed; void _anyPartial;
-        const status: TimelineItem['status'] = row.kind === 'changelog_entry' || row.kind === 'price_change'
+        const status: TimelineItem['status'] = row.source_type === 'public_page'
+          ? row.interpretation_reason === 'insufficient_main_content' || !row.excerpt ? 'unconfirmed'
+            : row.capture_complete ? 'observed' : 'partial' : row.kind === 'changelog_entry' || row.kind === 'price_change'
           ? 'confirmed' : row.kind === 'document' ? 'observed'
             : row.any_partial ? 'partial' : row.all_confirmed ? 'confirmed' : 'unconfirmed';
         const links = signals.flatMap(signal => {

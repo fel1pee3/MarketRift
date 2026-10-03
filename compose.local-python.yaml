@@ -21,6 +21,8 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      renderer:
+        condition: service_started
 
   intelligence-http:
     profiles: ["local-python"]
@@ -46,3 +48,22 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+
+  renderer:
+    profiles: ["local-python"]
+    build:
+      context: .
+      dockerfile: apps/intelligence/Dockerfile.renderer
+    env_file:
+      - path: .env.renderer.local
+        required: false
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop: ["ALL"]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 768m
+    pids_limit: 128
+    shm_size: 128m

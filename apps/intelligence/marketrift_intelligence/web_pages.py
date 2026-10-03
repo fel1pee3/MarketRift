@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.robotparser import RobotFileParser
 
+import httpx
 import psycopg
 from jsonschema import Draft202012Validator, FormatChecker
 
@@ -42,6 +43,7 @@ RELEASE_EVIDENCE = re.compile(r"(?:\b(?:release|version|v\d+(?:\.\d+)*|fixed|add
 PRICING_CONTEXT = re.compile(r"(?:pricing|prices|plans?[-_/ ]?(?:and[-_/ ]?)?pricing|"
                              r"pre[cç]os?|planos?)", re.IGNORECASE)
 EXTRACTOR_VERSION = 3
+PUBLIC_PAGE_EXTRACTOR_VERSION = 4
 PRODUCT_CHANGE_EVIDENCE = re.compile(
     r"\b(?:fixed|added|adds|improved|changed|shipped|supports|enabled|enables|allows|logs|"
     r"removes|removed|introduced)\b|\b(?:is|are) now available\b|\bcan now\b|\bno longer\b",
@@ -184,6 +186,7 @@ def fetch_public_page(start_url: str, *, lookup: Callable = socket.getaddrinfo,
     ip = resolve_public(host, lookup)
     robots_url = f"https://{host}/robots.txt"
     status, headers, body = request(robots_url, ip)
+    parser = None
     if status == 404:
         pass
     elif status != 200:
@@ -212,6 +215,8 @@ def fetch_public_page(start_url: str, *, lookup: Callable = socket.getaddrinfo,
             if not location:
                 raise PageError("redirect_without_location")
             url = canonical_url(urljoin(url, location), expected_host=host)
+            if parser is not None and not parser.can_fetch(USER_AGENT, url):
+                raise PageError("robots_disallowed")
             if status == 303:
                 raise PageError("unsupported_redirect")
             continue
@@ -445,6 +450,66 @@ def release_entries(root: Node, final_url: str) -> tuple[list[dict], int]:
     return entries[:50], candidates
 
 
+def individual_page_content(document: Node, *, complete: bool) -> dict:
+    """Keep only literal main content; navigation and a skip link are not evidence."""
+    skip = re.compile(r"^(?:skip to (?:main )?content|pular para (?:o )?conte[uú]do)$", re.IGNORECASE)
+
+    def blocks(node: Node) -> tuple[list[str], int]:
+        values: list[str] = []
+        prose = 0
+        for child in descendants(node):
+            if child.tag not in ("h1", "h2", "h3", "p", "blockquote"):
+                continue
+            value = node_text(child)
+            if not value or skip.fullmatch(value) or value in values:
+                continue
+            if child.tag in ("p", "blockquote") and len(value) >= 25:
+                prose += len(value)
+            values.append(value[:1000])
+        return values, prose
+
+    candidates = [node for node in descendants(document) if node.tag in ("article", "main") or
+                  node.attrs.get("role", "").lower() == "main"]
+    ranked = [(blocks(node), node) for node in candidates]
+    ranked = [item for item in ranked if item[0][1] >= 25]
+    if ranked:
+        # An article nested in a broad main container excludes unrelated cards and repeated site text.
+        (values, _), root = max(ranked, key=lambda item: (item[1].tag == "article", item[0][1]))
+    else:
+        body = next(descendants(document, "body"), document)
+        values, prose = blocks(body)
+        root = body if prose >= 25 else None
+
+    document_title = next(descendants(document, "title"), None)
+    heading = next(descendants(root, "h1"), None) if root else None
+    title = node_text(heading or document_title)[:200] if heading or document_title else None
+    text = "\n".join(values)[:MAX_TEXT] if root else ""
+    evidence = text[:1500]
+    date_literal = None
+    date_evidence = None
+    if root:
+        time = next(descendants(root, "time"), None)
+        if time:
+            visible = node_text(time)[:100]
+            attribute = time.attrs.get("datetime", "")[:100]
+            date_literal = visible or attribute or None
+            if date_literal:
+                date_evidence = {"element": "time", "text": visible or None,
+                                 "datetime_attribute": attribute or None}
+    useful = bool(root and text and len(text) >= 40)
+    if not useful:
+        evidence = ""
+    observed_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return {"kind": "public_page", "title": title, "text": evidence, "excerpt": evidence[:500],
+            "capture_method": "static_html",
+            "status": "unconfirmed", "reason": ("insufficient_main_content" if not useful else
+            "public_page_observation" if complete else "capture_truncated"),
+            "extractor_version": PUBLIC_PAGE_EXTRACTOR_VERSION, "capture_complete": complete,
+            "origin_date_literal": date_literal if useful else None,
+            "origin_date_evidence": date_evidence if useful else None,
+            "observed_text_hash": observed_hash}
+
+
 def page_content(html: str, kind: str, final_url: str, *, complete: bool = True) -> dict:
     if len(html) > MAX_BYTES:
         raise PageError("response_too_large")
@@ -453,6 +518,8 @@ def page_content(html: str, kind: str, final_url: str, *, complete: bool = True)
         html = html[:endings[-1].end()] if endings else html
     parser = TreeParser()
     parser.feed(html)
+    if kind == "public_page":
+        return individual_page_content(parser.root, complete=complete)
     root = next(descendants(parser.root, "main"), None) or next(descendants(parser.root, "body"), parser.root)
     blocks = content_blocks(root)
     text = ("\n".join(blocks) if blocks else node_text(root))[:MAX_TEXT]
@@ -527,6 +594,13 @@ def page_content(html: str, kind: str, final_url: str, *, complete: bool = True)
 
 def semantic_hash(content: dict) -> str:
     return hashlib.sha256(json.dumps(content, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def public_content_hash(content: dict) -> str:
+    """A public page's observed content identity does not depend on extractor version."""
+    fields = (content.get("capture_method"), content.get("title"), content["observed_text_hash"],
+              content.get("origin_date_literal"), content.get("origin_date_evidence"))
+    return hashlib.sha256(json.dumps(fields, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def compare_pages(before: dict, after: dict, *, before_trusted: bool = True) -> list[dict]:
@@ -610,23 +684,58 @@ async def mark_failed(job: dict, error: PageError) -> None:
                     (delay_seconds, error.retry_at, job["tenant_id"], job["source_id"]))
 
 
-async def check_web_page(payload: object, fetcher: Callable = capture_public_page) -> dict:
+def capture_rendered_public_page(url: str, *, last_checked_at: datetime | None = None) -> dict:
+    endpoint = os.getenv("RENDERER_INTERNAL_URL", "")
+    token = os.getenv("RENDERER_INTERNAL_TOKEN", "")
+    parsed = urlsplit(endpoint)
+    if (not token or parsed.scheme != "http" or parsed.hostname not in ("renderer", "127.0.0.1")
+            or not parsed.port or parsed.path not in ("", "/") or parsed.username or parsed.password):
+        raise PageError("renderer_not_configured")
+    try:
+        with httpx.Client(timeout=25, trust_env=False) as client:
+            response = client.post(endpoint.rstrip("/") + "/render",
+                json={"url": url, "last_checked_at": last_checked_at.isoformat() if last_checked_at else None},
+                headers={"Authorization": f"Bearer {token}"})
+    except (httpx.HTTPError, ValueError) as error:
+        raise PageError("renderer_unavailable") from error
+    try:
+        data = response.json()
+    except ValueError as error:
+        raise PageError("renderer_invalid_response") from error
+    if response.status_code != 200:
+        detail = data.get("detail", {}) if isinstance(data, dict) else {}
+        code = detail.get("error_code", "renderer_failure") if isinstance(detail, dict) else "renderer_failure"
+        allowed = {"robots_disallowed", "robots_unavailable", "robots_crawl_delay", "access_denied",
+                   "rate_limited", "http_failure", "response_too_large", "unsafe_destination",
+                   "render_timeout", "render_budget_exceeded", "renderer_not_configured",
+                   "renderer_unauthorized", "renderer_failure", "insufficient_main_content"}
+        raise PageError(code if code in allowed else "renderer_failure")
+    if not isinstance(data, dict) or not isinstance(data.get("content"), dict) or \
+            data["content"].get("capture_method") != "rendered_dom":
+        raise PageError("renderer_invalid_response")
+    return data
+
+
+async def check_web_page(payload: object, fetcher: Callable = capture_public_page,
+                         rendered_fetcher: Callable = capture_rendered_public_page) -> dict:
     job = validate_job(payload)
     async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
         source = await (await connection.execute(
             "SELECT s.url, s.source_type, s.last_checked_at, s.monitoring_enabled FROM marketrift.sources s "
             "JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id "
-            "WHERE s.tenant_id = %s AND s.id = %s AND s.source_type IN ('pricing_page', 'release_notes') "
+            "WHERE s.tenant_id = %s AND s.id = %s AND s.source_type IN ('pricing_page', 'release_notes', 'public_page') "
             "AND s.enabled = true", (job["tenant_id"], job["source_id"]))).fetchone()
         run = await (await connection.execute(
-            "SELECT status, trigger_kind FROM marketrift.source_runs WHERE tenant_id = %s AND source_id = %s "
+            "SELECT status, trigger_kind, capture_mode FROM marketrift.source_runs WHERE tenant_id = %s AND source_id = %s "
             "AND id = %s AND run_kind = 'web_page' FOR UPDATE",
             (job["tenant_id"], job["source_id"], job["run_id"]))).fetchone()
         if source is None or run is None:
             raise PageError("source_product_or_run_not_in_tenant")
         if run[0] != "pending":
             return {"status": run[0], "replayed": True}
+        if run[2] == "rendered_dom" and (run[1] != "manual" or source[1] != "public_page"):
+            raise PageError("invalid_capture_mode")
         if run[1] == "scheduled" and not source[3]:
             await connection.execute(
                 "UPDATE marketrift.source_runs SET status = 'failed', error_code = 'monitor_paused', "
@@ -636,13 +745,22 @@ async def check_web_page(payload: object, fetcher: Callable = capture_public_pag
         await connection.execute("UPDATE marketrift.source_runs SET status = 'running', started_at = now() "
                                  "WHERE tenant_id = %s AND id = %s", (job["tenant_id"], job["run_id"]))
     try:
-        fetched = await asyncio.to_thread(fetcher, source[0], last_checked_at=source[2])
-        final_url, html = fetched[:2]
-        complete = fetched[2] if len(fetched) > 2 else True
-        limit_kind = fetched[3] if len(fetched) > 3 else None
-        content = page_content(html, source[1], final_url, complete=complete)
-        markup = reparse_markup(html)
-        digest = semantic_hash(content)
+        if run[2] == "rendered_dom":
+            rendered = await asyncio.to_thread(rendered_fetcher, source[0], last_checked_at=source[2])
+            final_url = canonical_url(rendered["final_url"], expected_host=urlsplit(source[0]).hostname)
+            content = rendered["content"]
+            complete = bool(rendered["complete"])
+            limit_kind = rendered.get("limit_kind")
+            markup = None
+        else:
+            fetched = await asyncio.to_thread(fetcher, source[0], last_checked_at=source[2])
+            final_url, html = fetched[:2]
+            complete = fetched[2] if len(fetched) > 2 else True
+            limit_kind = fetched[3] if len(fetched) > 3 else None
+            content = page_content(html, source[1], final_url, complete=complete)
+            markup = None if source[1] == "public_page" else reparse_markup(html)
+        digest = public_content_hash(content) if source[1] == "public_page" else semantic_hash(content)
+        rule_version = content["extractor_version"]
         async with await psycopg.AsyncConnection.connect(os.environ["RUNTIME_DATABASE_URL"]) as connection:
             await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
             locked = await (await connection.execute(
@@ -650,12 +768,23 @@ async def check_web_page(payload: object, fetcher: Callable = capture_public_pag
                 "AND id = %s FOR UPDATE", (job["tenant_id"], job["source_id"], job["run_id"]))).fetchone()
             if locked is None or locked[0] != "running":
                 raise PageError("run_state_changed")
+            current_source = await (await connection.execute(
+                "SELECT s.url,s.source_type,s.enabled FROM marketrift.sources s "
+                "JOIN marketrift.products p ON p.tenant_id=s.tenant_id AND p.id=s.product_id "
+                "WHERE s.tenant_id=%s AND s.id=%s FOR UPDATE OF s",
+                (job["tenant_id"], job["source_id"]))).fetchone()
+            if current_source is None or current_source != (source[0], source[1], True):
+                raise PageError("source_changed")
             previous = await (await connection.execute(
                 "SELECT id, version_no, content_sha256, extracted, final_url, normalized_text, "
-                "interpretation_version, interpretation_status FROM marketrift.source_snapshots "
+                "interpretation_version, interpretation_status, reparse_markup IS NOT NULL "
+                "FROM marketrift.source_snapshots "
                 "WHERE tenant_id = %s AND source_id = %s AND extracted IS NOT NULL "
                 "ORDER BY version_no DESC LIMIT 1", (job["tenant_id"], job["source_id"]))).fetchone()
-            changed = previous is None or previous[5] != content["text"] or previous[4] != final_url
+            if source[1] == "public_page" and previous and previous[6] != rule_version and not previous[8]:
+                content["comparison_status"] = "previous_markup_unavailable"
+            changed = previous is None or previous[4] != final_url or (
+                previous[2] != digest if source[1] == "public_page" else previous[5] != content["text"])
             if changed:
                 inserted = await (await connection.execute(
                     "INSERT INTO marketrift.source_snapshots (tenant_id, source_id, run_id, source_url, "
@@ -667,16 +796,16 @@ async def check_web_page(payload: object, fetcher: Callable = capture_public_pag
                     (job["tenant_id"], job["source_id"], job["run_id"], source[0],
                      f"db:page-snapshot/{job['run_id']}", digest, (previous[1] + 1) if previous else 1,
                      final_url, content["text"], json.dumps(content, ensure_ascii=False),
-                     EXTRACTOR_VERSION, content["status"], content["reason"], markup, markup,
+                     rule_version, content["status"], content["reason"], markup, markup,
                      complete, limit_kind))).fetchone()
                 await connection.execute(
                     "INSERT INTO marketrift.snapshot_interpretations "
                     "(tenant_id,source_id,snapshot_id,rule_version,status,interpretation_status,reason,"
                     "extracted,basis,finished_at) VALUES (%s,%s,%s,%s,'completed',%s,%s,%s::jsonb,"
                     "'initial_capture',now())",
-                    (job["tenant_id"], job["source_id"], inserted[0], EXTRACTOR_VERSION,
+                    (job["tenant_id"], job["source_id"], inserted[0], rule_version,
                      content["status"], content["reason"], json.dumps(content, ensure_ascii=False)))
-                if previous:
+                if previous and source[1] != "public_page":
                     details = compare_pages(previous[3], content,
                                             before_trusted=previous[6] == EXTRACTOR_VERSION and
                                             previous[7] == "confirmed")

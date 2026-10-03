@@ -1,4 +1,4 @@
-import { BadRequestException, Body, ConflictException, Controller, Get, HttpCode, Inject, NotFoundException, Param, Post, Req, UnprocessableEntityException } from '@nestjs/common';
+import { BadRequestException, Body, ConflictException, Controller, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Post, Req, UnprocessableEntityException } from '@nestjs/common';
 import type { Request } from 'express';
 import type { QueryResultRow } from 'pg';
 import { z } from 'zod';
@@ -14,12 +14,16 @@ const createInput = z.object({ product_id: uuid, url: z.string().min(1).max(2048
   source_type: z.enum(['pricing_page', 'release_notes']),
   check_interval_minutes: z.union([z.literal(60), z.literal(360), z.literal(1440), z.literal(10080)]),
 }).strict();
+const individualInput = z.object({ candidate_id: uuid.optional(), feed_entry_id: uuid.optional(),
+  association_confirmed: z.literal(true) }).strict().refine(value => Boolean(value.candidate_id) !== Boolean(value.feed_entry_id),
+    'Escolha uma candidata descoberta OU uma entrada de feed');
 type Source = QueryResultRow & { id: string; product_id: string; product_name: string; source_type: string;
   url: string; check_interval_minutes: number; last_checked_at: Date | null;
-  monitoring_enabled: boolean; next_check_at: Date | null; consecutive_failures: number };
+  monitoring_enabled: boolean; next_check_at: Date | null; consecutive_failures: number;
+  origins?: { kind: string; suggested_url: string; from_url: string | null; title: string | null }[] };
 type Run = QueryResultRow & { id: string; source_id: string; status: string; error_code: string | null;
   retry_after_at: Date | null; documents_new: number; started_at: Date; finished_at: Date | null;
-  trigger_kind: 'manual' | 'scheduled' };
+  trigger_kind: 'manual' | 'scheduled'; capture_mode: 'static' | 'rendered_dom' };
 type Snapshot = QueryResultRow & { id: string; source_id: string; version_no: number; final_url: string;
   content_sha256: string; normalized_text: string; extracted: object; fetched_at: Date;
   interpretation_version: number | null; interpretation_status: string; interpretation_reason: string;
@@ -41,6 +45,58 @@ function parse<T>(schema: z.ZodType<T>, value: unknown): T {
 export class WebPagesController {
   constructor(@Inject(Db) private readonly db: Db, @Inject(Jobs) private readonly jobs: Jobs,
     @Inject(Accounts) private readonly accounts: Accounts) {}
+
+  @Post('individual')
+  @HttpCode(200)
+  async createIndividual(@Req() request: Request, @Body() body: unknown): Promise<{ id: string; monitoring_enabled: boolean }> {
+    const principal = await this.accounts.principal(request, ['owner', 'admin']);
+    const data = parse(individualInput, body);
+    return this.db.tenant(principal.tenantId, async client => {
+      const suggested = data.candidate_id ? await this.db.rows<{ product_id: string; canonical_url: string;
+        discovered_from_url: string; identity_version: number; status: string;
+        category: string; suggested_type: string }>(client,
+        'SELECT product_id,canonical_url,discovered_from_url,identity_version,status,category,suggested_type '
+        + 'FROM marketrift.discovery_candidates WHERE tenant_id=$1 AND id=$2 FOR UPDATE',
+        [principal.tenantId, data.candidate_id]) : await this.db.rows<{ product_id: string;
+        canonical_url: string; discovered_from_url: string; identity_version: number; status: string;
+        category?: string; suggested_type?: string }>(client,
+        "SELECT s.product_id,e.canonical_url,s.url AS discovered_from_url,0 AS identity_version,'available' AS status "
+        + 'FROM marketrift.feed_entries e JOIN marketrift.sources s ON s.tenant_id=e.tenant_id AND s.id=e.source_id '
+        + "WHERE e.tenant_id=$1 AND e.id=$2 AND s.source_type='rss_feed' FOR UPDATE OF e",
+        [principal.tenantId, data.feed_entry_id]);
+      const item = suggested[0];
+      if (!item || item.status === 'rejected') throw new NotFoundException('URL não disponível na empresa ativa');
+      if (item.category === 'reviews' ||
+        ['g2','reclameaqui','app_store','play_store'].includes(item.suggested_type ?? ''))
+        throw new ConflictException('Fontes de avaliações exigem conector e direitos específicos');
+      if (data.candidate_id) {
+        const profiles = await this.db.rows<{ identity_version: number }>(client,
+          'SELECT identity_version FROM marketrift.competitor_profiles WHERE tenant_id=$1 AND product_id=$2',
+          [principal.tenantId, item.product_id]);
+        if (profiles[0]?.identity_version !== item.identity_version)
+          throw new ConflictException('Identidade do concorrente mudou; revise o vínculo antes de cadastrar');
+      }
+      const url = publicPageUrl(item.canonical_url);
+      const existing = await this.db.rows<{ id: string; source_type: string }>(client,
+        "SELECT id,source_type FROM marketrift.sources WHERE tenant_id=$1 AND product_id=$2 AND url=$3 "
+        + "AND source_type IN ('public_page','pricing_page','release_notes') FOR UPDATE",
+        [principal.tenantId, item.product_id, url]);
+      if (existing.some(row => row.source_type !== 'public_page'))
+        throw new ConflictException('Esta URL já está cadastrada como página de preços ou changelog');
+      const rows = existing.length ? existing : await this.db.rows<{ id: string; source_type: string }>(client,
+        "INSERT INTO marketrift.sources (tenant_id,product_id,source_type,url,monitoring_enabled,next_check_at,access_environment) "
+        + "VALUES ($1,$2,'public_page',$3,false,NULL,$4) "
+        + "ON CONFLICT (tenant_id,product_id,source_type,url) DO UPDATE SET url=EXCLUDED.url "
+        + "RETURNING id,source_type",
+        [principal.tenantId, item.product_id, url, process.env.MARKETRIFT_TEST_MODE === '1' ? 'sandbox' : null]);
+      await client.query('INSERT INTO marketrift.public_page_origins '
+        + '(tenant_id,source_id,candidate_id,feed_entry_id,suggested_url,confirmed_by) '
+        + 'VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
+      [principal.tenantId, rows[0]!.id, data.candidate_id ?? null, data.feed_entry_id ?? null,
+        item.canonical_url, principal.userId]);
+      return { id: rows[0]!.id, monitoring_enabled: false };
+    });
+  }
 
   @Post()
   async create(@Req() request: Request, @Body() body: unknown): Promise<Omit<Source, 'product_name'>> {
@@ -76,11 +132,18 @@ export class WebPagesController {
       const sources = await this.db.rows<Source>(client,
         "SELECT s.id, s.product_id, p.name AS product_name, s.source_type, s.url, "
         + "s.check_interval_minutes, s.last_checked_at, s.monitoring_enabled, s.next_check_at, "
-        + "s.consecutive_failures FROM marketrift.sources s "
+        + "s.consecutive_failures,coalesce((SELECT jsonb_agg(jsonb_build_object('kind', "
+        + "CASE WHEN o.candidate_id IS NOT NULL THEN 'discovery' ELSE 'feed' END, "
+        + "'suggested_url',o.suggested_url,'from_url',coalesce(c.discovered_from_url,fs.url), "
+        + "'title',e.title)) FROM marketrift.public_page_origins o "
+        + "LEFT JOIN marketrift.discovery_candidates c ON c.tenant_id=o.tenant_id AND c.id=o.candidate_id "
+        + "LEFT JOIN marketrift.feed_entries e ON e.tenant_id=o.tenant_id AND e.id=o.feed_entry_id "
+        + "LEFT JOIN marketrift.sources fs ON fs.tenant_id=e.tenant_id AND fs.id=e.source_id "
+        + "WHERE o.tenant_id=s.tenant_id AND o.source_id=s.id),'[]'::jsonb) AS origins FROM marketrift.sources s "
         + "JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id "
-        + "WHERE s.source_type IN ('pricing_page', 'release_notes') ORDER BY s.id");
+        + "WHERE s.source_type IN ('pricing_page', 'release_notes','public_page') ORDER BY s.id");
       const runs = await this.db.rows<Run>(client,
-        "SELECT r.id, r.source_id, r.status, r.error_code, r.retry_after_at, r.documents_new, r.trigger_kind, "
+        "SELECT r.id, r.source_id, r.status, r.error_code, r.retry_after_at, r.documents_new, r.trigger_kind, r.capture_mode, "
         + "r.started_at, r.finished_at FROM marketrift.source_runs r JOIN marketrift.sources s "
         + "ON s.tenant_id = r.tenant_id AND s.id = r.source_id "
         + "WHERE r.run_kind = 'web_page' ORDER BY r.started_at DESC LIMIT 100");
@@ -194,23 +257,40 @@ export class WebPagesController {
   @Post(':id/check')
   @HttpCode(200)
   async check(@Req() request: Request, @Param('id') value: string): Promise<{ id: string; status: string }> {
+    return this.queueCheck(request, value, 'static');
+  }
+
+  @Post(':id/check-rendered')
+  @HttpCode(200)
+  async checkRendered(@Req() request: Request, @Param('id') value: string): Promise<{ id: string; status: string }> {
+    return this.queueCheck(request, value, 'rendered_dom');
+  }
+
+  private async queueCheck(request: Request, value: string, captureMode: 'static' | 'rendered_dom'):
+      Promise<{ id: string; status: string }> {
     const principal = await this.accounts.principal(request, ['owner', 'admin', 'analyst']);
     const sourceId = parse(uuid, value);
     const run = await this.db.tenant(principal.tenantId, async client => {
-      const source = await this.db.rows<{ id: string }>(client,
-        "SELECT id FROM marketrift.sources WHERE tenant_id = $1 AND id = $2 "
-        + "AND source_type IN ('pricing_page', 'release_notes') AND enabled = true FOR UPDATE",
+      const source = await this.db.rows<{ id: string; source_type: string }>(client,
+        "SELECT id,source_type FROM marketrift.sources WHERE tenant_id = $1 AND id = $2 "
+        + "AND source_type IN ('pricing_page', 'release_notes','public_page') AND enabled = true FOR UPDATE",
         [principal.tenantId, sourceId]);
       if (!source[0]) throw new NotFoundException('Page source not found in active company');
+      if (source[0].source_type === 'public_page' && !['owner', 'admin'].includes(principal.role))
+        throw new ForbiddenException('Somente owner/admin podem capturar página individual');
+      if (captureMode === 'rendered_dom' && source[0].source_type !== 'public_page')
+        throw new BadRequestException('Renderização é permitida apenas para página pública individual');
       await client.query("UPDATE marketrift.source_runs SET status = 'failed', error_code = 'worker_timeout', finished_at = now() "
         + "WHERE tenant_id = $1 AND source_id = $2 AND run_kind = 'web_page' AND status = 'running' "
         + "AND started_at < now() - interval '10 minutes'", [principal.tenantId, sourceId]);
-      const active = await this.db.rows<{ id: string; status: string }>(client,
-        "SELECT id, status FROM marketrift.source_runs WHERE tenant_id = $1 AND source_id = $2 "
+      const active = await this.db.rows<{ id: string; status: string; capture_mode: string }>(client,
+        "SELECT id, status, capture_mode FROM marketrift.source_runs WHERE tenant_id = $1 AND source_id = $2 "
         + "AND run_kind = 'web_page' AND status IN ('pending', 'running') LIMIT 1",
         [principal.tenantId, sourceId]);
       if (active[0]) {
         if (active[0].status === 'running') throw new ConflictException('Já existe uma verificação em andamento. Aguarde a conclusão.');
+        if (active[0].capture_mode !== captureMode)
+          throw new ConflictException('Há uma captura de outro modo pendente para esta fonte. Aguarde sua conclusão.');
         return active[0];
       }
       const blocked = await this.db.rows<{ retry_after_at: Date }>(client,
@@ -224,8 +304,9 @@ export class WebPagesController {
         + 'ORDER BY finished_at DESC LIMIT 1', [principal.tenantId, sourceId]);
       if (recent[0]) throw new ConflictException(`Aguarde o intervalo mínimo. Tente novamente após ${new Date(recent[0].finished_at.getTime() + 60_000).toISOString()}.`);
       const rows = await this.db.rows<{ id: string; status: string }>(client,
-        "INSERT INTO marketrift.source_runs (tenant_id, source_id, status, run_kind) "
-        + "VALUES ($1, $2, 'pending', 'web_page') RETURNING id, status", [principal.tenantId, sourceId]);
+        "INSERT INTO marketrift.source_runs (tenant_id, source_id, status, run_kind, capture_mode) "
+        + "VALUES ($1, $2, 'pending', 'web_page', $3) RETURNING id, status",
+        [principal.tenantId, sourceId, captureMode]);
       return rows[0]!;
     });
     try { await this.jobs.publishWebPage(makeWebPageJob(principal.tenantId, sourceId, run.id)); }

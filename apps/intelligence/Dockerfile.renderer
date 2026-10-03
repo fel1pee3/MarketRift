@@ -1,0 +1,20 @@
+FROM python:3.13-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/workspace/apps/intelligence \
+    PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
+WORKDIR /workspace
+COPY apps/intelligence/pyproject.toml /workspace/apps/intelligence/pyproject.toml
+
+# Install only the headless shell required for this one-page flow, at the pinned
+# Playwright revision. No alternate browser engines or browser caches enter Git.
+RUN python -c "import subprocess,tomllib; p=tomllib.load(open('/workspace/apps/intelligence/pyproject.toml','rb')); subprocess.check_call(['python','-m','pip','install','--no-cache-dir',*p['project']['dependencies'],*p['project']['optional-dependencies']['rendering']])" \
+ && python -m playwright install --with-deps --only-shell chromium \
+ && useradd --uid 10002 --create-home marketrift-renderer \
+ && chmod -R a+rX /ms-playwright
+COPY apps/intelligence/marketrift_intelligence /workspace/apps/intelligence/marketrift_intelligence
+COPY packages/contracts /workspace/packages/contracts
+USER 10002
+CMD ["python", "-m", "uvicorn", "marketrift_intelligence.rendered_pages:app", "--host", "0.0.0.0", "--port", "8011", "--workers", "1"]
