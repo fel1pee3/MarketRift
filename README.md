@@ -55,16 +55,29 @@ Veja [02-arquitetura.md](docs/02-arquitetura.md), [05-sinais-e-decisoes.md](docs
 
 ## Navegação do painel atual
 
-Com API e web iniciadas (`npm run dev:api` e `npm run dev:web` em terminais separados), entre em `http://localhost:3000`. O menu leva diretamente às áreas abaixo; você também pode abrir qualquer URL e atualizar a página. O navegador recupera a sessão por cookie `HttpOnly`. Se a sessão expirou, a URL aberta mostra o formulário de entrada e volta à mesma área após o login.
+Com API e web iniciadas (`npm run dev:api` e `npm run dev:web` em terminais separados), entre em `http://localhost:3000`. O menu principal tem **Visão geral**, **Concorrentes**, **Investigar** e **Configurações**. O navegador recupera a sessão por cookie `HttpOnly`; uma URL interna continua válida após atualizar a página. As rotas técnicas anteriores continuam acessíveis em **Administração avançada**, respeitando as permissões existentes.
+
+| URL principal | O que contém |
+| --- | --- |
+| `http://localhost:3000/` | Acompanhamento da empresa ativa. |
+| `http://localhost:3000/concorrentes` | Cadastro com nome e domínio confirmado, descoberta manual e resumo por concorrente. |
+| `http://localhost:3000/investigar` | Entrada para evidências e perguntas com citações. |
+| `http://localhost:3000/configuracoes` | Empresa ativa, troca de empresa, equipe e convites. |
+
+Em **Concorrentes**, owner/admin preenchem **Nome do concorrente** e **Domínio oficial**, marcam **Confirmei que este domínio pertence ao concorrente informado** e clicam **Cadastrar e confirmar vínculo**. Esse passo só registra produto e identidade; não visita o site, não cobra busca externa e não ativa fontes. Depois, **Descobrir fontes** solicita uma descoberta limitada **somente no site oficial** usando a fila existente. O resumo separa sugestões, fontes cadastradas, fontes com coleta, cobertura parcial e bloqueios; **Ver detalhes e fontes sugeridas** abre uma amostra curta das URLs, e **Abrir revisão detalhada** leva ao fluxo técnico completo. Uma execução pendente impede outro clique nessa tela; a recuperação operacional continua na rota técnica. Analyst conserva a descoberta manual de concorrente já confirmado; viewer consulta sem alterar.
+
+Para conferir a jornada sem tocar na API ou no banco reais, com Playwright instalado no ambiente Python local: execute `npm run build -w @marketrift/web`, inicie `npm run start -w @marketrift/web -- -p 3100` em outro terminal e rode `& .\apps\intelligence\.venv\Scripts\python.exe apps/web/tests/competitors_browser.py` no PowerShell. O teste intercepta todas as chamadas da API e usa somente dados controlados.
+
+As rotas antigas abaixo permanecem disponíveis por URL direta e por **Administração avançada**. A navegação nova não muda as regras de acesso da API.
 
 | URL | O que contém |
 | --- | --- |
-| `http://localhost:3000/` | Visão geral da empresa ativa: produtos, associações de fontes, cobertura, últimas execuções, candidatos e alertas internos recentes. |
 | `http://localhost:3000/fontes` | Cadastro de produtos, descoberta limitada por concorrente, GitHub Issues/Discussions, Steam, CSV B2B e legado, G2 condicionado ao acesso, páginas e importações. Os atalhos internos levam ao conector desejado. |
 | `http://localhost:3000/evidencias` | Busca com filtros, indicadores descritivos, Discussions, documentos e análises com origem. |
 | `http://localhost:3000/perguntas` | Estado da indexação e perguntas extrativas com citações; sintéticos continuam excluídos por padrão. |
 | `http://localhost:3000/revisao` | Candidatos, aprovação/descartes por owner/admin, reconciliação e alertas lidos/não lidos. |
 | `http://localhost:3000/avaliacao-busca` | Conjuntos e julgamentos humanos da recuperação, separados do resumo executivo. |
+| `http://localhost:3000/avaliacao-b2b` | Rotulagem humana e avaliação controlada da extração em reviews B2B. |
 | `http://localhost:3000/conta` | Empresa ativa, troca de tenant, membros, convites e logout (também no cabeçalho). |
 
 A visão geral **não** coleta dados, chama IA ou aprova sinais ao abrir. “Fontes associadas” conta vínculos cadastrados, não documentos distintos; uma mesma origem em dois produtos não duplica o total de evidências. Issues, Discussions, reviews e páginas conservam rótulos e limites próprios. `TESTE`, coleta parcial, direitos pendentes, interpretação não confirmada e erros aparecem explicitamente. A API mantém a validação de membership, RBAC, CSRF e RLS nas operações; a navegação não concede permissão adicional.
