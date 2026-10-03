@@ -22,11 +22,12 @@ type Profile = QueryResultRow & { product_id: string; official_domain: string; i
   discovery_paused: boolean; aliases: string[]; country_code: string | null; languages: string[]; official_urls: string[] };
 type Run = QueryResultRow & { id: string; product_id: string; identity_version: number;
   status: string; error_code: string | null; partial: boolean; include_external_search: boolean;
+  test_data?: boolean | null;
   external_search_status: string; external_queries: number; resource_failures: {
     resource: string | null; url?: string | null; code: string; limit_kind: string }[] };
 type Candidate = QueryResultRow & { id: string; product_id: string; canonical_url: string;
   suggested_type: string; confidence: string; status: string; identity_version: number;
-  existing_source_id: string | null; classification_version: number };
+  existing_source_id: string | null; classification_version: number; test_data?: boolean | null };
 
 export function monitorablePageCandidate(type: string, url: string): boolean {
   const path = new URL(url).pathname.toLowerCase().replace(/\/$/, '');
@@ -62,7 +63,7 @@ export class SourceDiscoveryController {
         'SELECT p.*, pr.name AS product_name FROM marketrift.competitor_profiles p '
         + 'JOIN marketrift.products pr ON pr.tenant_id=p.tenant_id AND pr.id=p.product_id ORDER BY pr.name'),
       runs: await this.db.rows<Run>(client,
-        'SELECT id,product_id,identity_version,status,error_code,partial,resource_failures,'
+        'SELECT id,product_id,identity_version,status,error_code,partial,resource_failures,test_data,'
         + 'include_external_search,external_search_status,external_queries,'
         + 'pages_examined,candidates_seen,candidates_new,'
         + 'created_at,finished_at,retry_after_at FROM marketrift.discovery_runs ORDER BY created_at DESC LIMIT 100'),
@@ -70,7 +71,7 @@ export class SourceDiscoveryController {
         'SELECT c.id,c.product_id,c.canonical_url,c.category,c.suggested_type,c.discovered_from_url,'
         + 'c.discovery_method,c.association_evidence,c.confidence,c.status,c.linked_source_id,'
         + 'c.identity_version,c.first_seen_at,c.last_examined_at,c.search_provider,c.search_query,'
-        + 'c.classification_version,c.first_discovered_from_url,c.first_discovery_method,'
+        + 'c.classification_version,c.first_discovered_from_url,c.first_discovery_method,c.test_data,'
         + 'existing.id AS existing_source_id '
         + 'FROM marketrift.discovery_candidates c LEFT JOIN marketrift.sources existing '
         + 'ON existing.tenant_id=c.tenant_id AND existing.product_id=c.product_id '
@@ -183,9 +184,10 @@ export class SourceDiscoveryController {
       if (recent[0]) throw new ConflictException({ code: 'minimum_interval',
         message: 'Aguarde cinco minutos entre descobertas.', retry_after_at: recent[0].retry_at.toISOString() });
       return (await this.db.rows<Run>(client,
-        'INSERT INTO marketrift.discovery_runs (tenant_id,product_id,identity_version,include_external_search) '
-        + 'VALUES ($1,$2,$3,$4) RETURNING id,product_id,identity_version,status,include_external_search',
-        [principal.tenantId, productId, profile.identity_version, includeExternalSearch]))[0]!;
+        'INSERT INTO marketrift.discovery_runs (tenant_id,product_id,identity_version,include_external_search,test_data) '
+        + 'VALUES ($1,$2,$3,$4,$5) RETURNING id,product_id,identity_version,status,include_external_search',
+        [principal.tenantId, productId, profile.identity_version, includeExternalSearch,
+          process.env.MARKETRIFT_TEST_MODE === '1']))[0]!;
     });
     if (run.status === 'pending') {
       try { await this.jobs.publishDiscovery(makeDiscoveryJob(principal.tenantId, productId,

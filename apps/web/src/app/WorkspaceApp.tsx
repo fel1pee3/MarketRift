@@ -18,9 +18,11 @@ export function sessionIdentity(value: Pick<Session, 'user_id' | 'tenant_id' | '
   return JSON.stringify([value.user_id, value.tenant_id, value.role, value.csrf_token]);
 }
 type Member = { user_id: string; email: string; display_name: string; role: Role };
-type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
+type Classification = 'unreviewed' | 'real' | 'test';
+type Product = { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null;
+  usage_classification: Classification };
 type Source = { id: string; product_id: string; source_type: string; url: string; last_checked_at: string | null;
-  enabled: boolean;
+  enabled: boolean; usage_classification: Classification;
   external_product_id: string | null; access_environment: 'sandbox' | 'production' | null; access_status: string;
   rights_recorded: boolean; rights_expires_at: string | null; storage_permitted: boolean; external_ai_permitted: boolean;
   ai_rights_recorded: boolean; ai_provider: string | null; ai_rights_expires_at: string | null;
@@ -44,6 +46,15 @@ function storageExpiry(value: FormDataEntryValue | null): string {
   return new Date(`${day}T23:59:59`).toISOString();
 }
 type SourceRun = { id: string; source_id: string; status: string; trigger_kind: 'manual' | 'scheduled'; documents_seen: number; documents_new: number; documents_updated: number; documents_ignored: number; scan_complete: boolean | null; pages_fetched: number; pull_requests_skipped: number; error_code: string | null; retry_after_at: string | null; started_at: string; finished_at: string | null };
+type Experience = {
+  products: (Product & { official_domain: string | null; discovery_paused: boolean | null })[];
+  sources: { id: string; product_id: string; source_type: string; url: string; evidence_count: number;
+    last_observed_at: string | null; partial: boolean; blocked: boolean; association_confirmed: boolean }[];
+  discovery: { product_id: string; status: string; partial: boolean; finished_at: string | null;
+    retry_after_at: string | null }[];
+  suggestions: { product_id: string; count: number }[];
+  attention: { id: string; summary: string; state: string; observed_at: string; read_at: string | null }[];
+};
 type GitHubMonitor = { source_id: string; monitoring_enabled: boolean; interval_minutes: number | null;
   next_check_at: string | null; last_attempt_at: string | null; last_success_at: string | null;
   last_status: string | null; last_error: string | null; retry_after_at: string | null;
@@ -102,11 +113,13 @@ type DiscoveryProfile = { product_id: string; product_name: string; official_dom
   country_code: string | null; languages: string[]; official_urls: string[]; identity_version: number;
   discovery_paused: boolean };
 type DiscoveryRun = { id: string; product_id: string; identity_version: number; status: string;
+  test_data?: boolean | null;
   error_code: string | null; pages_examined: number; candidates_seen: number; candidates_new: number;
   created_at: string; finished_at: string | null; retry_after_at: string | null; partial: boolean;
   include_external_search: boolean; external_search_status: string; external_queries: number;
   resource_failures: { resource: string | null; url?: string | null; code: string; limit_kind: string }[] };
 type DiscoveryCandidate = { id: string; product_id: string; canonical_url: string;
+  test_data?: boolean | null;
   category: 'official_site' | 'product' | 'reviews' | 'community' | 'apps' | 'social' | 'news' | 'other';
   suggested_type: string; discovered_from_url: string; discovery_method: string; association_evidence: string;
   search_provider: string | null; search_query: string | null;
@@ -116,13 +129,10 @@ type DiscoveryCandidate = { id: string; product_id: string; canonical_url: strin
 type DiscoveryData = { profiles: DiscoveryProfile[]; runs: DiscoveryRun[];
   candidates: DiscoveryCandidate[]; search_provider: 'brave_optional' };
 type View = 'overview' | 'competitors' | 'investigate' | 'settings' | 'sources' | 'evidence' | 'questions' | 'signals' | 'retrieval-review' | 'b2b-quality' | 'account';
-type SignalSummary = { id: string; state: string; summary: string; source_type: string; test_data: boolean; read_at: string | null };
-type SignalResult = { signals: SignalSummary[]; alerts: SignalSummary[];
-  reconciliation: { last_at: string | null; pending: number; failed: number; reasons: string[] } };
 export const views: { id: View; href: string; title: string; description: string }[] = [
   { id: 'overview', href: '/', title: 'Visão geral', description: 'Acompanhamento, mudanças observadas e atenção necessária.' },
   { id: 'competitors', href: '/concorrentes', title: 'Concorrentes', description: 'Cadastre, confirme o domínio e descubra fontes públicas.' },
-  { id: 'investigate', href: '/investigar', title: 'Investigar', description: 'Explore evidências e faça perguntas com citações.' },
+  { id: 'investigate', href: '/investigar', title: 'Investigar', description: 'Busque evidências revisadas por concorrente, tipo e termo.' },
   { id: 'settings', href: '/configuracoes', title: 'Configurações', description: 'Empresa ativa, equipe e acesso.' },
   { id: 'sources', href: '/fontes', title: 'Produtos e fontes', description: 'Produtos, conectores, permissões e importações.' },
   { id: 'evidence', href: '/evidencias', title: 'Evidências', description: 'Documentos, origem e indicadores descritivos.' },
@@ -244,24 +254,29 @@ export default function WorkspaceApp({ view }: { view: View }) {
   const [pageData, setPageData] = useState<PageData>(emptyPageData);
   const [discoveryData, setDiscoveryData] = useState<DiscoveryData>(emptyDiscoveryData);
   const [members, setMembers] = useState<Member[]>([]);
-  const [signalResult, setSignalResult] = useState<SignalResult | null>(null);
+  const [experience, setExperience] = useState<Experience | null>(null);
   const [dataLoaded, setDataLoaded] = useState(false);
 
   const refresh = useCallback(async (current: Session) => {
-    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages, nextSignals, nextDiscovery, nextMonitors] = await Promise.all([
+    if (view === 'overview' || view === 'competitors' || view === 'investigate') {
+      const next = await api<Experience>('experience', current);
+      if (sessionKey.current !== sessionIdentity(current)) return;
+      setExperience(next); setDataLoaded(true);
+      return;
+    }
+    const [nextProducts, nextSources, nextRuns, nextImports, nextDocuments, nextMembers, nextPages, nextDiscovery, nextMonitors] = await Promise.all([
       api<Product[]>('products', current), api<Source[]>('sources', current),
       api<SourceRun[]>('source-runs', current),
       api<Import[]>('imports', current), api<Document[]>('documents', current),
       api<Member[]>('members', current),
       api<PageData>('page-sources', current),
-      view === 'overview' ? api<SignalResult>('reviewable-signals', current) : Promise.resolve(null),
-      view === 'overview' || view === 'sources' || view === 'competitors' ? api<DiscoveryData>('source-discovery', current) : Promise.resolve(emptyDiscoveryData),
+      view === 'sources' ? api<DiscoveryData>('source-discovery', current) : Promise.resolve(emptyDiscoveryData),
       view === 'sources' ? api<GitHubMonitor[]>('github-monitor', current) : Promise.resolve([]),
     ]);
     if (sessionKey.current !== sessionIdentity(current)) return;
     setProducts(nextProducts); setSources(nextSources); setSourceRuns(nextRuns); setImports(nextImports);
     setDocuments(nextDocuments); setMembers(nextMembers); setPageData(nextPages);
-    setSignalResult(nextSignals); setDiscoveryData(nextDiscovery); setDataLoaded(true);
+    setDiscoveryData(nextDiscovery); setDataLoaded(true);
     setGithubMonitors(nextMonitors);
   }, [view]);
 
@@ -305,7 +320,7 @@ export default function WorkspaceApp({ view }: { view: View }) {
   function clearTenantData(): void {
     setProducts([]); setSources([]); setSourceRuns([]); setGithubMonitors([]); setImports([]); setLastB2BImportId(null);
     setB2BRightsEvents({}); setDocuments([]); setMembers([]);
-    setPageData(emptyPageData); setSignalResult(null); setDiscoveryData(emptyDiscoveryData);
+    setPageData(emptyPageData); setDiscoveryData(emptyDiscoveryData); setExperience(null);
     setDataLoaded(false); setIssuedInvite('');
   }
   async function switchTo(current: Session, tenantId: string): Promise<void> {
@@ -366,18 +381,11 @@ export default function WorkspaceApp({ view }: { view: View }) {
         </section>}
         {!dataLoaded && <div className="card wide" role="status"><p>{error ? 'Não foi possível carregar os dados desta empresa.' : `Carregando dados de ${activeTenant?.name ?? 'sua empresa'}...`}</p>
           {error && <button className="small" onClick={() => void run(() => refresh(session))}>Tentar novamente</button>}</div>}
-        {view === 'overview' && dataLoaded && <Overview tenantName={activeTenant?.name ?? 'Empresa ativa'}
-          role={session.role} products={products} sources={sources} sourceRuns={sourceRuns}
-          pages={pageData} signals={signalResult} discovery={discoveryData} />}
-        {view === 'competitors' && dataLoaded && <CompetitorsPanel key={session.tenant_id}
-          products={products} sources={sources} sourceRuns={sourceRuns} pages={pageData}
-          discovery={discoveryData} role={session.role} busy={busy} act={action => run(action)}
-          request={(path, init) => api(path, session, init)} refresh={() => refresh(session)} />}
-        {view === 'investigate' && <section className="card wide"><h2>Investigar evidências</h2>
-          <p>Escolha como investigar. Issues, Discussions, reviews e páginas mantêm suas origens e limites próprios.</p>
-          <div className="journey-links"><Link href="/evidencias">Explorar evidências e linha do tempo</Link>
-            <Link href="/perguntas">Fazer perguntas com citações</Link></div>
-        </section>}
+        {view === 'overview' && dataLoaded && experience && <NormalOverview tenantName={activeTenant?.name ?? 'Empresa ativa'} data={experience} />}
+        {view === 'competitors' && dataLoaded && experience && <NormalCompetitors key={session.tenant_id}
+          data={experience} session={session} busy={busy} act={action => run(action)} refresh={() => refresh(session)} />}
+        {view === 'investigate' && dataLoaded && experience && <NormalInvestigate key={session.tenant_id}
+          data={experience} session={session} />}
         {view === 'evidence' && <section className="card wide source-jump" aria-label="Ir para evidências">
           <h2>Encontre uma evidência</h2><div className="jump-links"><a href="#linha-do-tempo">Linha do tempo</a>
             <a href="#explorar">Busca e indicadores</a>
@@ -412,6 +420,19 @@ export default function WorkspaceApp({ view }: { view: View }) {
             <label>Site (opcional)<input name="website_url" type="url" /></label>
             <button disabled={busy || !canManage}>Adicionar produto</button></form>
           <ul>{products.map(product => <li key={product.id}><strong>{product.name}</strong> <small>{product.kind === 'own' ? 'Próprio' : 'Concorrente'}</small></li>)}</ul>
+        </section>
+        <section className="card wide"><h2>Classificação para a experiência normal</h2>
+          <p>Revise produto e fonte separadamente. Dados antigos ficam fora da experiência normal até a classificação. Marcar como real não valida automaticamente a associação nem os direitos do documento.</p>
+          <h3>Produtos</h3><ul>{products.map(product => <li key={product.id}><strong>{product.name}</strong> · {product.kind === 'own' ? 'Produto próprio' : 'Concorrente'} · {classificationLabel(product.usage_classification)}
+            {canManage && <select aria-label={`Classificação do produto ${product.name}`} value={product.usage_classification} disabled={busy} onChange={event => void run(async () => {
+              await api(`products/${product.id}/classification`, session, { method: 'PATCH', body: JSON.stringify({ usage_classification: event.target.value }) }); await refresh(session);
+            })}><ClassificationOptions /></select>}</li>)}</ul>
+          <h3>Fontes</h3>{sources.length ? <ul>{sources.map(source => <li key={source.id}>
+            <strong>{normalSourceLabels[source.source_type] ?? source.source_type}</strong> · {products.find(item => item.id === source.product_id)?.name} · {source.url} · {classificationLabel(source.usage_classification)}
+            {source.access_environment === 'sandbox' && ' · sandbox: não pode ser classificada para uso normal'}
+            {canManage && <select aria-label={`Classificação da fonte ${source.url}`} value={source.usage_classification} disabled={busy} onChange={event => void run(async () => {
+              await api(`sources/${source.id}/classification`, session, { method: 'PATCH', body: JSON.stringify({ usage_classification: event.target.value }) }); await refresh(session);
+            })}><ClassificationOptions /></select>}</li>)}</ul> : <p className="empty">Nenhuma fonte cadastrada.</p>}
         </section>
         <DiscoveryPanel data={discoveryData} products={products} role={session.role} busy={busy}
           act={action => run(action)} request={(path, init) => api(path, session, init)}
@@ -933,16 +954,6 @@ export default function WorkspaceApp({ view }: { view: View }) {
   </main>;
 }
 
-const sourceLabels: Record<string, { title: string; href: string }> = {
-  manual_review: { title: 'CSV legado', href: '/fontes#csv-legado' },
-  b2b_csv_review: { title: 'Review B2B importada', href: '/fontes#b2b' },
-  g2: { title: 'G2 condicionado ao acesso', href: '/fontes#g2' },
-  github_issues: { title: 'GitHub Issues públicas', href: '/fontes#github-issues' },
-  github_discussions: { title: 'GitHub Discussions públicas', href: '/fontes#github-discussions' },
-  steam_reviews: { title: 'Reviews de usuários do Steam', href: '/fontes#steam' },
-  rss_feed: { title: 'Publicação de feed RSS/Atom', href: '/fontes#feeds' },
-  public_page: { title: 'Página pública individual', href: '/fontes#paginas-individuais' },
-};
 function displayDate(value: string | null): string { return value ? new Date(value).toLocaleString('pt-BR') : 'ainda não registrada'; }
 
 const discoveryCategories: { id: DiscoveryCandidate['category']; label: string }[] = [
@@ -1019,124 +1030,150 @@ function competitorDomain(value: string): string {
   return url.hostname.toLowerCase();
 }
 
-function CompetitorsPanel({ products, sources, sourceRuns, pages, discovery, role, busy, act, request, refresh }: {
-  products: Product[]; sources: Source[]; sourceRuns: SourceRun[]; pages: PageData;
-  discovery: DiscoveryData; role: Role; busy: boolean;
-  act: (action: () => Promise<void>) => Promise<void>;
-  request: (path: string, init: RequestInit) => Promise<unknown>; refresh: () => Promise<void>;
-}) {
-  const [notice, setNotice] = useState('');
-  const canManage = role === 'owner' || role === 'admin';
-  const competitors = products.filter(product => product.kind === 'competitor');
+const normalSourceLabels: Record<string, string> = {
+  github_issues: 'Issues públicas', github_issue: 'Issue pública',
+  github_discussions: 'Discussions públicas', github_discussion: 'Discussion pública',
+  steam_reviews: 'Reviews Steam', steam_review: 'Review Steam',
+  b2b_csv_review: 'Reviews B2B', b2b_review: 'Review B2B', g2: 'Reviews G2', g2_review: 'Review G2',
+  pricing_page: 'Página de preços', release_notes: 'Changelog', public_page: 'Página observada',
+  rss_feed: 'Publicações de feed', manual_review: 'CSV',
+};
+function classificationLabel(value: Classification): string {
+  return value === 'real' ? 'Uso normal revisado' : value === 'test' ? 'Uso interno/teste' : 'Pendente de classificação';
+}
+function ClassificationOptions() {
+  return <><option value="unreviewed">Pendente de classificação</option>
+    <option value="real">Uso normal revisado</option><option value="test">Uso interno/teste</option></>;
+}
+
+export function NormalOverview({ tenantName, data }: { tenantName: string; data: Experience }) {
+  const sourcesWithData = data.sources.filter(source => source.evidence_count > 0);
+  const distinctSourcesWithData = new Set(sourcesWithData.map(source => `${source.source_type}:${source.url}`)).size;
+  const candidates = data.attention.filter(item => item.state === 'candidate');
+  const alerts = data.attention.filter(item => item.state === 'approved' && !item.read_at);
   return <>
-    {canManage && <section className="card wide competitor-intro"><h2>Adicionar concorrente</h2>
-      <p>Confirme o domínio oficial antes de salvar. O cadastro não visita o site nem ativa fontes. A descoberta é um passo separado.</p>
-      <form onSubmit={event => {
-        const form = event.currentTarget;
-        const data = formValues(event);
-        void act(async () => {
-          const name = String(data.get('name') ?? '').trim();
-          const domain = competitorDomain(String(data.get('official_domain') ?? ''));
-          const existing = competitors.find(item => item.name.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'));
-          const sameDomain = discovery.profiles.find(item => item.official_domain === domain && item.product_id !== existing?.id);
-          if (sameDomain) throw new Error('Este domínio já pertence a outro concorrente desta empresa. Revise o vínculo existente.');
-          if (existing && discovery.profiles.some(item => item.product_id === existing.id && item.official_domain !== domain))
-            throw new Error('Esse concorrente já tem outro domínio confirmado. Revise a identidade em Administração avançada.');
-          const product = existing ?? await request('products', { method: 'POST', body: JSON.stringify({
-            name, kind: 'competitor', website_url: `https://${domain}/`,
-          }) }) as Product;
-          if (!discovery.profiles.some(item => item.product_id === product.id && item.official_domain === domain))
-            await request('source-discovery/profiles', { method: 'POST', body: JSON.stringify({
-              product_id: product.id, official_domain: domain,
-            }) });
-          setNotice(existing ? 'Concorrente existente reaproveitado; vínculo confirmado.' : 'Concorrente cadastrado; vínculo confirmado.');
-          form.reset(); await refresh();
-        });
-      }}><label>Nome do concorrente<input name="name" maxLength={120} required /></label>
-        <label>Domínio oficial<input name="official_domain" placeholder="exemplo.com" required /></label>
-        <label className="competitor-confirm"><input type="checkbox" name="confirmed" required /> Confirmei que este domínio pertence ao concorrente informado.</label>
-        <button disabled={busy}>Cadastrar e confirmar vínculo</button>
-      </form>{notice && <p role="status">{notice}</p>}</section>}
-    <section className="card wide"><h2>Seus concorrentes</h2>
-      {!competitors.length && <p className="empty">Nenhum concorrente cadastrado nesta empresa.</p>}
-      <div className="competitor-list">{competitors.map(product => {
-        const profile = discovery.profiles.find(item => item.product_id === product.id);
-        const latest = discovery.runs.find(item => item.product_id === product.id);
-        const candidates = discovery.candidates.filter(item => item.product_id === product.id
-          && item.identity_version === profile?.identity_version);
-        const productSources = sources.filter(item => item.product_id === product.id);
-        const productPages = pages.sources.filter(item => item.product_id === product.id);
-        const registered = new Set([...productSources, ...productPages].map(item => item.id));
-        const collected = new Set([
-          ...productSources.filter(item => item.last_checked_at || sourceRuns.some(run => run.source_id === item.id && run.status === 'succeeded')),
-          ...productPages.filter(item => item.last_checked_at || pages.runs.some(run => run.source_id === item.id && run.status === 'succeeded')),
-        ].map(item => item.id));
-        const partial = !!latest?.partial || productSources.some(item => sourceRuns.find(run => run.source_id === item.id)?.scan_complete === false)
-          || productPages.some(item => pages.snapshots.filter(snapshot => snapshot.source_id === item.id)
-            .sort((a, b) => b.version_no - a.version_no)[0]?.capture_complete === false);
-        const blockedSources = productSources.filter(item => item.access_status === 'insufficient_scope' || item.access_status === 'access_denied'
-          || item.source_type === 'b2b_csv_review' && !item.storage_permitted
-          || item.source_type === 'b2b_csv_review' && !!item.rights_expires_at && Date.parse(item.rights_expires_at) <= Date.now()
-          || item.source_type === 'g2' && (item.access_status !== 'authorized' || !item.storage_permitted)
-          || sourceRuns.find(run => run.source_id === item.id)?.status === 'failed');
-        const blockedPages = productPages.filter(item => pages.runs.find(run => run.source_id === item.id)?.status === 'failed');
-        const blocked = candidates.filter(item => ['rights_pending', 'access_unavailable'].includes(item.status)).length
-          + blockedSources.length + blockedPages.length + Number(!!latest?.error_code);
-        const suggested = candidates.filter(item => item.status === 'pending' && !item.existing_source_id && !item.linked_source_id).length;
-        return <article className="competitor-item" key={product.id}><div className="competitor-head">
-          <div><h3>{product.name}</h3><p>{profile ? <>Domínio confirmado: <strong>{profile.official_domain}</strong></> : 'Domínio ainda não confirmado'}</p></div>
-          {latest && <span className="competitor-state" role="status">Descoberta: {latest.status === 'pending' || latest.status === 'running' ? 'em andamento' : latest.status === 'succeeded' ? 'concluída' : 'falhou'}</span>}
-        </div>
-          <div className="competitor-summary" aria-label={`Resumo de ${product.name}`}>
-            <span><strong>{suggested}</strong> fontes sugeridas</span>
-            <span><strong>{registered.size}</strong> fontes cadastradas</span>
-            <span><strong>{collected.size}</strong> fontes com coleta</span>
-            <span><strong>{partial ? 'Sim' : 'Não'}</strong> cobertura parcial</span>
-            <span><strong>{blocked}</strong> bloqueios</span>
-          </div>
-          {!profile && canManage && <form onSubmit={event => {
-            const data = formValues(event);
-            void act(async () => { const domain = competitorDomain(String(data.get('official_domain') ?? ''));
-              if (discovery.profiles.some(item => item.official_domain === domain && item.product_id !== product.id))
-                throw new Error('Domínio já associado a outro concorrente desta empresa.');
-              await request('source-discovery/profiles', { method: 'POST', body: JSON.stringify({ product_id: product.id, official_domain: domain }) });
-              await refresh();
-            });
-          }}><label>Domínio oficial<input name="official_domain" defaultValue={product.website_url ?? ''} required /></label>
-            <label className="competitor-confirm"><input type="checkbox" required /> Confirmei o vínculo deste domínio com {product.name}.</label>
-            <button disabled={busy}>Confirmar domínio</button></form>}
-          {profile && <div className="competitor-actions">
-            {role !== 'viewer' && <button disabled={busy || profile.discovery_paused || latest?.status === 'running' || latest?.status === 'pending'}
-              onClick={() => void act(async () => { await request(`source-discovery/profiles/${product.id}/run`, {
-                method: 'POST', body: JSON.stringify({ include_external_search: false }),
-              }); await refresh(); })}>Descobrir fontes</button>}
-            <Link href="/fontes#descoberta">Abrir revisão detalhada</Link>
-          </div>}
-          {profile?.discovery_paused && <p className="coverage-warning">Descoberta pausada. Retome em Administração avançada antes de executar.</p>}
-          {latest?.partial && <p className="coverage-warning">Cobertura parcial: nem todos os recursos do domínio foram examinados.</p>}
-          {latest?.error_code && <p className="coverage-warning">Bloqueio da última descoberta: {discoveryErrors[latest.error_code] ?? latest.error_code}.</p>}
-          {latest?.retry_after_at && <p>Tente novamente após {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</p>}
-          <details><summary>Ver detalhes e fontes sugeridas</summary>
-            <p>URLs sugeridas exigem revisão humana. Descoberta não equivale a cadastro nem a coleta.</p>
-            {latest && <p>Última execução: {latest.status} · {latest.pages_examined} requisições · {latest.candidates_seen} candidatas examinadas · {latest.candidates_new} novas · {displayDate(latest.finished_at)}.</p>}
-            {latest?.resource_failures?.map((failure, index) => <p key={index} className="coverage-warning">{discoveryResourceNames[failure.resource ?? ''] ?? failure.resource ?? 'Recurso'}: {discoveryErrors[failure.code] ?? failure.code}.</p>)}
-            {blockedSources.map(item => <p key={item.id} className="coverage-warning">{sourceLabels[item.source_type]?.title ?? item.source_type}: {sourceRuns.find(run => run.source_id === item.id)?.error_code
-              ?? (item.source_type === 'b2b_csv_review' && !item.storage_permitted ? 'armazenamento não autorizado'
-                : item.source_type === 'b2b_csv_review' && !!item.rights_expires_at && Date.parse(item.rights_expires_at) <= Date.now() ? 'direito de armazenamento vencido'
-                  : item.source_type === 'g2' && !item.storage_permitted ? 'direitos de armazenamento pendentes'
-                    : item.access_status === 'not_assessed' ? 'acesso ainda não confirmado' : item.access_status)}.</p>)}
-            {blockedPages.map(item => <p key={item.id} className="coverage-warning">Página {item.url}: {pages.runs.find(run => run.source_id === item.id)?.error_code ?? 'última verificação falhou'}.</p>)}
-            {candidates.length ? <><ul>{candidates.slice(0, 5).map(item => <li key={item.id}>
-              <a href={item.canonical_url} target="_blank" rel="noreferrer">{item.canonical_url}</a> · {item.existing_source_id || item.linked_source_id ? 'fonte existente' : item.status === 'pending' ? 'sugestão pendente' : item.status}
-            </li>)}</ul>{candidates.length > 5 && <p>Mais {candidates.length - 5} URLs na revisão detalhada.</p>}</> : <p>Nenhuma URL sugerida.</p>}
-            <p><Link href="/fontes#descoberta">Revisar todas as candidatas e conectores</Link></p>
-          </details>
-        </article>;
-      })}</div>
-      {discovery.candidates.length >= 500 && <p className="coverage-warning">A API retornou somente as 500 candidatas mais recentes. Consulte a revisão detalhada; este resumo não mede cobertura completa.</p>}
+    <section className="card wide"><h2>O que está sendo acompanhado</h2>
+      <p>{tenantName}: {data.products.filter(item => item.kind === 'competitor').length} concorrente(s) e {data.sources.length} fonte(s) acompanhada(s).</p>
+      {!data.products.some(item => item.kind === 'competitor') && <p className="empty">Ainda não há concorrentes acompanhados. Cadastre um concorrente para começar.</p>}
+      <div className="overview-stats"><Link href="/concorrentes"><strong>{data.products.filter(item => item.kind === 'competitor').length}</strong><span>Concorrentes</span></Link>
+        <Link href="/investigar"><strong>{distinctSourcesWithData}</strong><span>Origens com dados</span></Link>
+        <Link href="/revisao"><strong>{candidates.length}</strong><span>Sinais para revisão</span></Link>
+        <Link href="/revisao"><strong>{alerts.length}</strong><span>Alertas internos não lidos</span></Link></div>
+    </section>
+    <section className="card"><h2>O que mudou</h2>
+      {sourcesWithData.length ? <ul>{sourcesWithData.slice().sort((a,b) => Date.parse(b.last_observed_at ?? '') - Date.parse(a.last_observed_at ?? '')).slice(0,5).map(source =>
+        <li key={source.id}><Link href="/investigar">{normalSourceLabels[source.source_type] ?? 'Fonte pública'}</Link> · {data.products.find(item => item.id === source.product_id)?.name} · observada em {displayDate(source.last_observed_at)}
+          {source.partial && ' · cobertura parcial'}</li>)}</ul> : <p className="empty">Ainda não há evidências coletadas nas fontes revisadas.</p>}
+    </section>
+    <section className="card"><h2>O que exige atenção</h2>
+      {data.sources.some(source => source.blocked || source.partial) && <p>Há fontes com acesso bloqueado ou cobertura parcial. Veja o detalhe em <Link href="/concorrentes">Concorrentes</Link>.</p>}
+      {data.attention.length ? <ul>{data.attention.slice(0,4).map(item => <li key={item.id}><Link href="/revisao">{item.summary}</Link> · {item.state === 'candidate' ? 'aguarda revisão' : 'aprovado internamente'}</li>)}</ul>
+        : <p className="empty">Nenhum sinal ou alerta dos dados revisados.</p>}
     </section>
   </>;
 }
+
+function NormalCompetitors({ data, session, busy, act, refresh }: { data: Experience; session: Session;
+  busy: boolean; act: (action: () => Promise<void>) => Promise<void>; refresh: () => Promise<void> }) {
+  const canManage = session.role === 'owner' || session.role === 'admin';
+  const competitors = data.products.filter(item => item.kind === 'competitor');
+  const [notice, setNotice] = useState('');
+  return <>
+    {canManage && <section className="card wide"><h2>Adicionar concorrente</h2>
+      <p>Confirme o domínio oficial. O cadastro não coleta dados nem ativa fontes.</p>
+      <form onSubmit={event => { const form = event.currentTarget; const values = formValues(event); void act(async () => {
+        const name = String(values.get('name') ?? '').trim();
+        const domain = competitorDomain(String(values.get('official_domain') ?? ''));
+        const existing = competitors.find(item => item.name.toLocaleLowerCase('pt-BR') === name.toLocaleLowerCase('pt-BR'));
+        if (existing?.official_domain && existing.official_domain !== domain) throw new Error('Revise o domínio existente na Administração avançada.');
+        const product = existing ?? await api<Product>('products', session, { method: 'POST', body: JSON.stringify({
+          name, kind: 'competitor', website_url: `https://${domain}/`, usage_classification: 'real',
+        }) });
+        if (!existing?.official_domain) await api('source-discovery/profiles', session, { method: 'POST', body: JSON.stringify({
+          product_id: product.id, official_domain: domain,
+        }) });
+        setNotice(existing ? 'Concorrente existente confirmado.' : 'Concorrente cadastrado.');
+        form.reset(); await refresh();
+      }); }}><label>Nome do concorrente<input name="name" maxLength={120} required /></label>
+        <label>Domínio oficial<input name="official_domain" placeholder="exemplo.com" required /></label>
+        <label className="competitor-confirm"><input type="checkbox" required /> Confirmei o vínculo deste domínio com o concorrente.</label>
+        <button disabled={busy}>Cadastrar e confirmar vínculo</button></form>
+      {notice && <p role="status">{notice}</p>}
+    </section>}
+    <section className="card wide"><h2>Seus concorrentes</h2>
+      {competitors.length === 0 && <p className="empty">Nenhum concorrente acompanhado nesta empresa.</p>}
+      {competitors.map(product => { const sources = data.sources.filter(item => item.product_id === product.id);
+        const discovery = data.discovery.find(item => item.product_id === product.id);
+        const suggestions = data.suggestions.find(item => item.product_id === product.id)?.count ?? 0;
+        return <article className="competitor-item" key={product.id}><div className="competitor-head"><div><h3>{product.name}</h3>
+          <p>{product.official_domain ? `Domínio confirmado: ${product.official_domain}` : 'Domínio ainda não confirmado'}</p></div></div>
+          <div className="competitor-summary"><span><strong>{suggestions}</strong> fontes sugeridas</span>
+            <span><strong>{sources.length}</strong> fontes acompanhadas</span>
+            <span><strong>{sources.filter(item => item.evidence_count > 0).length}</strong> fontes com dados</span>
+            <span><strong>{sources.some(item => item.partial) || discovery?.partial ? 'Sim' : 'Não'}</strong> cobertura parcial</span>
+            <span><strong>{sources.filter(item => item.blocked).length}</strong> bloqueios</span></div>
+          {product.official_domain && session.role !== 'viewer' && <button className="small" disabled={busy || !!product.discovery_paused || discovery?.status === 'running' || discovery?.status === 'pending'} onClick={() => void act(async () => {
+            await api(`source-discovery/profiles/${product.id}/run`, session, { method: 'POST', body: JSON.stringify({ include_external_search: false }) }); await refresh();
+          })}>Descobrir fontes</button>}
+          {!product.official_domain && <p>Confirme o domínio na Administração avançada antes de descobrir fontes.</p>}
+          {discovery && <p>Última descoberta: {discovery.status === 'succeeded' ? 'concluída' : discovery.status === 'failed' ? 'não concluída' : 'em andamento'} · {displayDate(discovery.finished_at)}{discovery.partial && ' · cobertura parcial'}.</p>}
+          <details><summary>Ver fontes e limites</summary>{sources.length ? <ul>{sources.map(item => <li key={item.id}>
+            {normalSourceLabels[item.source_type] ?? 'Fonte pública'} · {item.evidence_count ? `${item.evidence_count} registro(s) observados` : 'sem dados'}
+            {item.partial && ' · cobertura parcial'}{item.blocked && ' · acesso ou coleta pendente'}
+            {!item.association_confirmed && ' · vínculo com o concorrente ainda não confirmado'}
+          </li>)}</ul> : <p className="empty">Nenhuma fonte disponível. Confira as fontes na Administração avançada.</p>}
+          <Link href="/fontes#descoberta">Revisar fontes sugeridas</Link></details>
+        </article>;
+      })}
+    </section>
+  </>;
+}
+
+type NormalEvidence = { items: { item_id: string; source_id: string; source_type: string; source_url: string; title: string | null;
+  excerpt: string; observed_at: string; product_names: string[]; association_count: number }[];
+  counts: { source_type: string; count: number }[]; total: number; limit: number; offset: number };
+function NormalInvestigate({ data, session }: { data: Experience; session: Session }) {
+  const [productId, setProductId] = useState('');
+  const [sourceType, setSourceType] = useState('');
+  const [term, setTerm] = useState('');
+  const [offset, setOffset] = useState(0);
+  const [result, setResult] = useState<NormalEvidence | null>(null);
+  const [error, setError] = useState('');
+  useEffect(() => { const params = new URLSearchParams({ scope: 'normal', limit: '20', offset: String(offset) });
+    if (productId) params.set('product_id', productId);
+    if (sourceType) params.set('source_type', sourceType);
+    if (term.trim()) params.set('q', term.trim());
+    let active = true;
+    void api<NormalEvidence>(`evidence/search?${params}`, session).then(value => { if (active) { setResult(value); setError(''); } })
+      .catch(() => { if (active) setError('Não foi possível carregar as evidências.'); });
+    return () => { active = false; };
+  }, [productId, sourceType, term, offset, session]);
+  return <section className="card wide"><h2>Investigar evidências</h2>
+    <p>Reviews de clientes, atividade pública, publicações e páginas observadas são tipos distintos. A origem pode ter mudado desde a coleta.</p>
+    <div className="investigate-filters"><label>Concorrente<select value={productId} onChange={event => { setProductId(event.target.value); setOffset(0); }}>
+      <option value="">Todos</option>{data.products.filter(item => item.kind === 'competitor').map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+    </select></label><label>Tipo de fonte<select value={sourceType} onChange={event => { setSourceType(event.target.value); setOffset(0); }}>
+      <option value="">Todos</option>{Object.entries({ b2b_review: 'Review B2B', steam_review: 'Review Steam', g2_review: 'Review G2',
+        github_issue: 'Issue pública', github_discussion: 'Discussion pública', rss_feed: 'Publicação de feed',
+        pricing_page: 'Página de preços', release_notes: 'Changelog', public_page: 'Página observada' }).map(([value,label]) =>
+        <option key={value} value={value}>{label}</option>)}
+    </select></label><label>Pesquisar<input value={term} onChange={event => { setTerm(event.target.value); setOffset(0); }} /></label></div>
+    {error && <p role="alert">{error}</p>}
+    {result && <><p>{result.total} evidência(s) distintas nos filtros atuais.</p>
+      {result.items.length ? <ul className="coverage-list">{result.items.map(item => <li key={item.item_id}>
+        <strong>{normalSourceLabels[item.source_type] ?? 'Fonte pública'}</strong> · {item.product_names.join(', ')} · {displayDate(item.observed_at)}
+        {item.association_count > 1 && ' · origem associada a mais de um produto'}
+        {data.sources.find(source => source.id === item.source_id)?.association_confirmed === false && ' · vínculo com concorrente ainda não confirmado'}
+        <p>{item.title || item.excerpt}</p>{item.title && <p>{item.excerpt}</p>}
+        <a href={item.source_url} target="_blank" rel="noreferrer">Abrir origem</a>
+      </li>)}</ul> : <p className="empty">Nenhuma evidência disponível nos filtros atuais.</p>}
+      <div className="pagination"><button className="small ghost" disabled={offset === 0} onClick={() => setOffset(Math.max(0,offset-20))}>Anterior</button>
+        <button className="small ghost" disabled={offset+20 >= result.total} onClick={() => setOffset(offset+20)}>Próxima</button></div>
+    </>}
+  </section>;
+}
+
+
 export function DiscoveryPanel({ data, products, role, busy, act, request, refresh }: {
   data: DiscoveryData; products: Product[]; role: Role; busy: boolean;
   act: (action: () => Promise<void>) => Promise<void>;
@@ -1183,7 +1220,7 @@ export function DiscoveryPanel({ data, products, role, busy, act, request, refre
           <button disabled={busy}>Salvar identidade</button>
         </form>}
         {profile ? <><p>Domínio: <strong>{profile.official_domain}</strong> · versão {profile.identity_version} · {profile.discovery_paused ? 'pausada' : 'disponível para execução manual'}.</p>
-          {latest && <p>Última descoberta: <strong>{latest.status}</strong>{latest.partial && <> · cobertura parcial</>} · {latest.pages_examined} requisição(ões) · {latest.candidates_seen} candidato(s) examinado(s) · {latest.candidates_new} novo(s) · {latest.finished_at ? new Date(latest.finished_at).toLocaleString('pt-BR') : 'em andamento'}.
+          {latest && <p>Última descoberta: <strong>{latest.status}</strong>{latest.test_data === true && <> · TESTE controlado</>}{latest.test_data === null && <> · ambiente histórico não identificado</>}{latest.partial && <> · cobertura parcial</>} · {latest.pages_examined} requisição(ões) · {latest.candidates_seen} candidato(s) examinado(s) · {latest.candidates_new} novo(s) · {latest.finished_at ? new Date(latest.finished_at).toLocaleString('pt-BR') : 'em andamento'}.
             {latest.error_code && <> Motivo: {discoveryErrors[latest.error_code] ?? latest.error_code}.</>}
             {latest.retry_after_at && <> Aguarde até {new Date(latest.retry_after_at).toLocaleString('pt-BR')}.</>}</p>}
           <p>Links encontrados a partir do site oficial: {onsiteCount} candidata(s), inclusive links para outros domínios. Busca externa: {outsideCount} sugestão(ões). Com os filtros: {visible.length}. {latest && <>Busca externa na última execução: {externalStatus[latest.external_search_status] ?? latest.external_search_status} ({latest.external_queries} consulta(s)).</>}</p>
@@ -1221,7 +1258,7 @@ export function DiscoveryPanel({ data, products, role, busy, act, request, refre
               const supported = !!(item.linked_source_id || item.existing_source_id);
               const relatedContent = item.suggested_type === 'changelog_entry' || item.suggested_type === 'product_mention';
               return <li key={item.id}><a href={item.canonical_url} target="_blank" rel="noreferrer">{item.canonical_url}</a>
-                <p>Tipo sugerido: {item.suggested_type} · estado: <strong>{stale ? 'associação antiga: revisar' : item.status}</strong> · vínculo: {item.confidence === 'official_host' ? 'mesmo domínio oficial' : 'link externo, associação ambígua'}.
+                <p>Tipo sugerido: {item.suggested_type} · estado: <strong>{stale ? 'associação antiga: revisar' : item.status}</strong>{item.test_data === true && ' · TESTE controlado'}{item.test_data === null && ' · ambiente histórico não identificado'} · vínculo: {item.confidence === 'official_host' ? 'mesmo domínio oficial' : 'link externo, associação ambígua'}.
                   {' '}{item.discovery_method === 'web_search' ? <>Busca externa {item.search_provider}; consulta: “{item.search_query}”. Resultado não visitado automaticamente.</> : <>Descoberto via {item.discovery_method} em <a href={item.discovered_from_url} target="_blank" rel="noreferrer">origem ↗</a>.</>} Examinado em {new Date(item.last_examined_at).toLocaleString('pt-BR')} · regra v{item.classification_version}.</p>
                 <p>Motivo da sugestão: {suggestionReason[item.suggested_type] ?? 'indício no caminho ou no título; exige revisão'}. {item.discovery_method === 'web_search' ? 'Título retornado pela busca (não comprova associação)' : 'Texto do link na origem lida; o destino não foi examinado'}: “{item.association_evidence}”. {supported ? <><strong>Fonte existente.</strong> <a href="#paginas">Ver cadastro ↗</a>; nenhuma nova fonte será criada.</> : item.status === 'rights_pending' ? 'Direitos/credencial pendentes; não monitorada.' : item.status === 'access_unavailable' || relatedContent ? 'Conteúdo relacionado, sem conector de índice; não monitorado como página de preços.' : item.status === 'confirmed' ? 'Associação revisada; nenhum conector foi cadastrado pela busca externa. Cadastre manualmente na seção do conector após verificar acesso e direitos.' : 'Ainda não monitorada.'}</p>
                 {item.suggested_type === 'blog_or_feed' && !supported && <a href="#feeds">Revisar como feed RSS/Atom ↗</a>}
@@ -1238,101 +1275,4 @@ export function DiscoveryPanel({ data, products, role, busy, act, request, refre
       </div>;
     })}
   </section>;
-}
-
-export function Overview({ tenantName, role, products, sources, sourceRuns, pages, signals, discovery }: {
-  tenantName: string; role: Role; products: Product[]; sources: Source[]; sourceRuns: SourceRun[];
-  pages: PageData; signals: SignalResult | null; discovery: DiscoveryData;
-}) {
-  const candidates = signals?.signals.filter(item => item.state === 'candidate') ?? [];
-  const alerts = signals?.alerts ?? [];
-  const unread = alerts.filter(item => !item.read_at);
-  const candidateTests = candidates.filter(item => item.test_data).length;
-  const unreadTests = unread.filter(item => item.test_data).length;
-  const latestRuns = [
-    ...sourceRuns.map(item => ({ id: item.id, sourceId: item.source_id, at: item.finished_at ?? item.started_at,
-      status: item.status, error: item.error_code, newItems: item.documents_new, updatedItems: item.documents_updated,
-      partial: item.scan_complete === false, page: false })),
-    ...pages.runs.map(item => ({ id: item.id, sourceId: item.source_id, at: item.finished_at ?? item.started_at,
-      status: item.status, error: item.error_code, newItems: item.documents_new, updatedItems: 0,
-      partial: false, page: true })),
-  ].sort((a, b) => Date.parse(b.at) - Date.parse(a.at)).slice(0, 6);
-  return <>
-    <section className="card wide overview-intro"><h2>O que está sendo acompanhado</h2>
-      <p><strong>{tenantName}</strong> · {products.length} produto(s) · {sources.length + pages.sources.length} associação(ões) de fonte.</p>
-      <p>Associações não são documentos distintos: a mesma origem pode estar ligada a mais de um produto. Confira os totais deduplicados e filtros em <Link href="/evidencias">Evidências</Link>.</p>
-      <div className="overview-stats"><Link href="/fontes#produtos"><strong>{products.length}</strong><span>Produtos</span></Link>
-        <Link href="/fontes"><strong>{sources.length + pages.sources.length}</strong><span>Fontes associadas</span></Link>
-        <Link href="/revisao"><strong>{role === 'viewer' ? '—' : candidates.length - candidateTests}</strong><span>Candidatos reais para revisão{role === 'viewer' ? ' (papel sem acesso)' : ''}{candidateTests > 0 && ` · ${candidateTests} TESTE`}</span></Link>
-        <Link href="/revisao"><strong>{unread.length - unreadTests}</strong><span>Alertas internos reais não lidos{unreadTests > 0 && ` · ${unreadTests} TESTE`}</span></Link></div>
-    </section>
-    <section className="card wide"><h2>Cobertura e limites das fontes</h2>
-      <p>Issues e Discussions são atividade pública; reviews B2B, CSV e Steam são populações separadas. Coleta parcial, direitos pendentes e interpretações não confirmadas continuam visíveis.</p>
-      <p><Link href="/concorrentes">Fontes descobertas</Link>: {new Set(discovery.candidates.map(item => item.canonical_url)).size} URL(s) distinta(s) em {discovery.candidates.length} associação(ões) candidata(s),
-        {' '}{discovery.candidates.filter(item => item.status === 'pending' && !item.existing_source_id).length} pendente(s) de revisão;
-        fontes cadastradas: {sources.length + pages.sources.length}; última coleta bem-sucedida:
-        {' '}{[...sourceRuns.filter(run => run.status === 'succeeded'), ...pages.runs.filter(run => run.status === 'succeeded')]
-          .sort((a, b) => Date.parse(b.finished_at ?? '') - Date.parse(a.finished_at ?? ''))[0]?.finished_at
-          ? displayDate([...sourceRuns.filter(run => run.status === 'succeeded'), ...pages.runs.filter(run => run.status === 'succeeded')]
-            .sort((a, b) => Date.parse(b.finished_at ?? '') - Date.parse(a.finished_at ?? ''))[0]!.finished_at) : 'nenhuma'}.
-        {' '}Cobertura parcial por cursor: {sourceRuns.filter(run => run.scan_complete === false).length} execução(ões).
-        Descoberta não equivale a fonte monitorada.</p>
-      {sources.length + pages.sources.length === 0 ? <p className="empty">Nenhuma fonte cadastrada. <Link href="/fontes">Cadastrar produto e fonte</Link>.</p> :
-        <ul className="coverage-list">{sources.map(source => {
-          const latest = sourceRuns.find(run => run.source_id === source.id);
-          const config = sourceLabels[source.source_type] ?? { title: source.source_type, href: '/fontes' };
-          const product = products.find(item => item.id === source.product_id);
-          const flags = [latest?.scan_complete === false && 'coleta parcial por cursor',
-            latest?.error_code && `último erro: ${latest.error_code}`,
-            source.source_type === 'g2' && source.access_status !== 'authorized' &&
-              `acesso G2: ${source.access_status}`,
-            source.source_type === 'g2' && (!source.storage_permitted || !source.rights_recorded) && 'direitos de armazenamento pendentes',
-            source.source_type === 'g2' && source.rights_expires_at && Date.parse(source.rights_expires_at) <= Date.now() &&
-              'direitos de armazenamento expirados',
-            source.source_type === 'b2b_csv_review' && !source.storage_permitted && 'armazenamento não autorizado',
-            source.source_type === 'b2b_csv_review' && source.access_environment === 'production' &&
-              (!source.external_ai_permitted || !!source.ai_rights_revoked_at || !source.ai_rights_expires_at ||
-                Date.parse(source.ai_rights_expires_at) <= Date.now()) && 'envio à IA não autorizado ou expirado',
-            source.access_environment === 'sandbox' && 'TESTE / sandbox',
-          ].filter(Boolean);
-          return <li key={source.id}><strong><Link href={config.href}>{config.title}</Link></strong> · {product?.name ?? 'produto indisponível'}
-            <span className="coverage-meta">Última coleta: {displayDate(source.last_checked_at)} · {latest?.status ?? 'sem execução'}.</span>
-            {flags.length > 0 && <span className="coverage-warning">{flags.join(' · ')}</span>}</li>;
-        })}{pages.sources.map(source => {
-          const latest = pages.runs.find(run => run.source_id === source.id);
-          const snapshot = pages.snapshots.filter(item => item.source_id === source.id)
-            .sort((a, b) => b.version_no - a.version_no)[0];
-          const flags = [!source.monitoring_enabled && 'monitoramento pausado',
-            latest?.error_code && `último erro: ${pageErrorReasons[latest.error_code] ?? latest.error_code}`,
-            snapshot && source.source_type !== 'public_page' && snapshot.interpretation_status !== 'confirmed' &&
-              `interpretação ${interpretationStatus[snapshot.interpretation_status] ?? snapshot.interpretation_status}`].filter(Boolean);
-          return <li key={source.id}><strong><Link href={source.source_type === 'public_page' ? '/fontes#paginas-individuais' : '/fontes#paginas'}>{source.source_type === 'pricing_page' ? 'Página de preços' : source.source_type === 'release_notes' ? 'Changelog' : 'Página pública observada'}</Link></strong> · {source.product_name}
-            <span className="coverage-meta">Última verificação: {displayDate(source.last_checked_at)} · {latest?.status ?? 'sem execução'}.</span>
-            {flags.length > 0 && <span className="coverage-warning">{flags.join(' · ')}</span>}</li>;
-        })}</ul>}
-    </section>
-    <section className="card"><h2>O que mudou</h2>
-      <p>Execuções recentes e dados persistidos; novas linhas ou capturas ainda exigem interpretação. Abrir esta página não inicia coletas.</p>
-      {latestRuns.length ? <ul>{latestRuns.map(run => <li key={run.id}><Link href={run.page ? '/fontes#paginas' : sourceLabels[sources.find(item => item.id === run.sourceId)?.source_type ?? '']?.href ?? '/fontes'}>
-        {run.page ? 'Verificação de página' : sourceLabels[sources.find(item => item.id === run.sourceId)?.source_type ?? '']?.title ?? 'Coleta'}</Link>
-        {' '}· {displayDate(run.at)} · {run.status} · {run.newItems} novo(s), {run.updatedItems} atualizado(s)
-        {run.partial && <span className="coverage-warning">Cobertura parcial por cursor.</span>}
-        {run.error && <span className="coverage-warning">Erro: {run.error}</span>}</li>)}</ul> :
-        <p className="empty">Ainda não há coletas ou verificações nesta empresa.</p>}
-    </section>
-    <section className="card"><h2>O que exige atenção</h2>
-      <p>Revisão humana separa fatos observados de decisões. Nenhuma aprovação ou recomendação é automática.</p>
-      {signals?.reconciliation && <p>Reconciliação: {signals.reconciliation.pending} pendente(s), {signals.reconciliation.failed} com falha · última conclusão {displayDate(signals.reconciliation.last_at)}.</p>}
-      {candidates.length > 0 && <p><Link href="/revisao">{candidates.length - candidateTests} candidato(s) reais e {candidateTests} de TESTE aguardam decisão</Link>.</p>}
-      {unread.length > 0 && <p><Link href="/revisao">{unread.length - unreadTests} alerta(s) reais e {unreadTests} de TESTE não lidos</Link>.</p>}
-      {alerts.length > 0 && <ul>{alerts.slice(0, 3).map(item => <li key={item.id}>
-        <Link href="/revisao">{item.summary}</Link> · {item.read_at ? 'lido' : 'não lido'}
-        {item.test_data && <span className="badge">TESTE</span>}</li>)}</ul>}
-      {signals?.reconciliation.reasons.length ? <p className="coverage-warning">Falha de reconciliação: {signals.reconciliation.reasons.join('; ')}</p> : null}
-      {!candidates.length && !unread.length && !signals?.reconciliation.pending && !signals?.reconciliation.failed &&
-        <p className="empty">Nenhum candidato ou alerta pendente nos dados consultados.</p>}
-      {role === 'viewer' && <p>Seu papel mostra somente sinais aprovados; candidatos exigem acesso de revisão.</p>}
-      <p><Link href="/avaliacao-busca">Avaliação humana da busca</Link> fica fora desta visão executiva.</p>
-    </section>
-  </>;
 }

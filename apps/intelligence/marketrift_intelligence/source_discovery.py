@@ -660,7 +660,7 @@ async def discover(payload: object) -> dict:
         await connection.execute("SELECT set_config('app.tenant_id', %s, true)", (job["tenant_id"],))
         row = await (await connection.execute(
             "SELECT p.official_domain,p.official_urls,p.aliases,p.identity_version,p.discovery_paused,"
-            "r.status,r.include_external_search,pr.name "
+            "r.status,r.include_external_search,pr.name,r.test_data "
             "FROM marketrift.competitor_profiles p JOIN marketrift.products pr "
             "ON pr.tenant_id=p.tenant_id AND pr.id=p.product_id AND pr.kind='competitor' "
             "JOIN marketrift.discovery_runs r ON r.tenant_id=p.tenant_id AND r.product_id=p.product_id "
@@ -668,7 +668,8 @@ async def discover(payload: object) -> dict:
             (job["tenant_id"], job["product_id"], job["run_id"]))).fetchone()
         if row is None:
             raise DiscoveryError("profile_or_run_not_in_tenant")
-        domain, urls, aliases, version, paused, status, include_external, name = row
+        domain, urls, aliases, version, paused, status, include_external, name, test_data = row
+        test_data = bool(test_data) or os.getenv("MARKETRIFT_TEST_MODE") == "1"
         if status == "succeeded":
             return {"status": "succeeded", "replayed": True}
         if status != "pending":
@@ -678,8 +679,8 @@ async def discover(payload: object) -> dict:
                                      "finished_at=now() WHERE id=%s",
                                      ("discovery_paused" if paused else "identity_changed", job["run_id"]))
             return {"status": "failed", "error_code": "discovery_paused" if paused else "identity_changed"}
-        await connection.execute("UPDATE marketrift.discovery_runs SET status='running',started_at=now() WHERE id=%s",
-                                 (job["run_id"],))
+        await connection.execute("UPDATE marketrift.discovery_runs SET status='running',started_at=now(),"
+                                 "test_data=%s WHERE id=%s", (test_data, job["run_id"]))
     try:
         if os.getenv("MARKETRIFT_TEST_MODE") == "1" and os.getenv("DISCOVERY_TEST_BASE_URL"):
             lookup, request = e2e_transport()
@@ -726,8 +727,8 @@ async def discover(payload: object) -> dict:
                     "INSERT INTO marketrift.discovery_candidates (tenant_id,product_id,canonical_url,category,"
                     "suggested_type,discovered_from_url,discovery_method,association_evidence,confidence,identity_version,"
                     "search_provider,search_query,classification_version,"
-                    "first_discovered_from_url,first_discovery_method) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "first_discovered_from_url,first_discovery_method,test_data) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (tenant_id,product_id,canonical_url) DO UPDATE SET "
                     "last_examined_at=now(),"
                     "identity_version=CASE WHEN discovery_candidates.status='pending' "
@@ -749,12 +750,14 @@ async def discover(payload: object) -> dict:
                     "search_provider=CASE WHEN discovery_candidates.status='pending' "
                     "THEN excluded.search_provider ELSE discovery_candidates.search_provider END,"
                     "search_query=CASE WHEN discovery_candidates.status='pending' "
-                    "THEN excluded.search_query ELSE discovery_candidates.search_query END "
+                    "THEN excluded.search_query ELSE discovery_candidates.search_query END,"
+                    "test_data=CASE WHEN discovery_candidates.status='pending' "
+                    "THEN excluded.test_data ELSE discovery_candidates.test_data END "
                     "RETURNING (xmax=0)",
                     (job["tenant_id"], job["product_id"], item.url, item.category, item.suggested_type,
                      item.from_url, item.method, item.evidence, item.confidence, version,
                      item.search_provider, item.search_query, CLASSIFICATION_VERSION,
-                     item.from_url, item.method))
+                     item.from_url, item.method, test_data))
                 inserted += int((await result.fetchone())[0])
             await connection.execute(
                 "UPDATE marketrift.discovery_runs SET status='succeeded',pages_examined=%s,candidates_seen=%s,"

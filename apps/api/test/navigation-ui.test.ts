@@ -2,13 +2,14 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createElement } from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
-import { DiscoveryPanel, Overview, WorkspaceNavigation, sessionIdentity, views } from '../../web/src/app/WorkspaceApp';
+import { DiscoveryPanel, NormalOverview, WorkspaceNavigation, sessionIdentity, views } from '../../web/src/app/WorkspaceApp';
 
-type Props = Parameters<typeof Overview>[0];
+type Props = Parameters<typeof NormalOverview>[0];
 
 test('navigation has distinct direct URLs for every existing workflow', () => {
   assert.deepEqual(views.map(item => item.href), [
-    '/', '/fontes', '/evidencias', '/perguntas', '/revisao', '/avaliacao-busca', '/avaliacao-b2b', '/conta',
+    '/', '/concorrentes', '/investigar', '/configuracoes', '/fontes', '/evidencias', '/perguntas',
+    '/revisao', '/avaliacao-busca', '/avaliacao-b2b', '/conta',
   ]);
   assert.equal(new Set(views.map(item => item.id)).size, views.length);
   const html = renderToStaticMarkup(createElement(WorkspaceNavigation, { view: 'questions' }));
@@ -23,55 +24,25 @@ test('late responses from another tenant or role cannot share the active session
   assert.notEqual(sessionIdentity(first), sessionIdentity({ ...first, role: 'viewer' }));
 });
 
-test('overview separates source associations, coverage warnings and human decisions', () => {
-  const source: Props['sources'][number] = {
-    id: 'source-a', product_id: 'product-a', source_type: 'github_issues', url: 'https://github.com/example/repo',
-    last_checked_at: '2026-09-25T12:00:00Z', external_product_id: null, access_environment: null,
-    access_status: 'available', rights_recorded: false, rights_expires_at: null,
-    storage_permitted: false, external_ai_permitted: false, ai_rights_recorded: false,
-    ai_provider: null, ai_rights_expires_at: null, ai_rights_revoked_at: null,
-  };
-  const props: Props = {
-    tenantName: 'Empresa A', role: 'owner',
-    products: [{ id: 'product-a', name: 'Produto A', kind: 'competitor', website_url: null }],
-    sources: [source, { ...source, id: 'source-b', source_type: 'b2b_csv_review',
-      access_environment: 'production', url: 'https://example.com/reviews' }],
-    sourceRuns: [{ id: 'run-a', source_id: 'source-a', status: 'succeeded', documents_seen: 5,
-      documents_new: 3, documents_updated: 0, documents_ignored: 0, scan_complete: false,
-      pages_fetched: 1, pull_requests_skipped: 0, error_code: null, retry_after_at: null,
-      started_at: '2026-09-25T11:59:00Z', finished_at: '2026-09-25T12:00:00Z' }],
-    pages: { sources: [], runs: [], snapshots: [], changes: [] },
-    discovery: { profiles: [], runs: [], search_provider: 'brave_optional', candidates: [{
-      id: 'candidate-a', product_id: 'product-a', canonical_url: 'https://example.com/pricing',
-      category: 'product', suggested_type: 'pricing_page', discovered_from_url: 'https://example.com/',
-      discovery_method: 'homepage', association_evidence: 'Pricing', confidence: 'official_host',
-      search_provider: null, search_query: null,
-      status: 'pending', linked_source_id: null, existing_source_id: null, identity_version: 1,
-      classification_version: 2, first_discovered_from_url: 'https://example.com/',
-      first_discovery_method: 'homepage',
-      first_seen_at: '2026-09-25T12:00:00Z', last_examined_at: '2026-09-25T12:00:00Z',
-    }] },
-    signals: { signals: [{ id: 'signal-a', state: 'candidate', summary: '3 Issues públicas',
-      source_type: 'github_issues', test_data: false, read_at: null }], alerts: [],
-      reconciliation: { last_at: '2026-09-25T12:00:00Z', pending: 0, failed: 0, reasons: [] } },
-  };
-  const html = renderToStaticMarkup(createElement(Overview, props));
-  assert.match(html, /Empresa A/);
-  assert.match(html, /2<\/strong><span>Fontes associadas/);
-  assert.match(html, /1 URL\(s\) distinta\(s\) em 1 associação\(ões\) candidata\(s\)/);
-  assert.match(html, /Associações não são documentos distintos/);
-  assert.match(html, /coleta parcial por cursor/);
-  assert.match(html, /envio à IA não autorizado ou expirado/);
-  assert.match(html, /1 candidato\(s\) reais e 0 de TESTE aguardam decisão/);
-  assert.doesNotMatch(html, /market share|taxa de reclamações/i);
-
-  const otherTenant = renderToStaticMarkup(createElement(Overview, {
-    ...props, tenantName: 'Empresa B', products: [], sources: [], sourceRuns: [],
-    discovery: { profiles: [], runs: [], candidates: [], search_provider: 'brave_optional' },
-    signals: { signals: [], alerts: [], reconciliation: { last_at: null, pending: 0, failed: 0, reasons: [] } },
-  }));
-  assert.doesNotMatch(otherTenant, /Empresa A|Produto A|3 Issues públicas/);
-  assert.match(otherTenant, /Nenhuma fonte cadastrada/);
+test('normal overview shows an honest empty state and only reviewed evidence', () => {
+  const props: Props = { tenantName: 'Empresa A', data: {
+    products: [], sources: [], discovery: [], suggestions: [], attention: [],
+  } };
+  const empty = renderToStaticMarkup(createElement(NormalOverview, props));
+  assert.match(empty, /Ainda não há concorrentes acompanhados/);
+  assert.match(empty, /Ainda não há evidências coletadas/);
+  assert.doesNotMatch(empty, /Fixture interna|controlled-hash|synthetic/i);
+  const populated = renderToStaticMarkup(createElement(NormalOverview, { tenantName: 'Empresa B', data: {
+    ...props.data,
+    products: [{ id: 'product-a', name: 'Concorrente público', kind: 'competitor', website_url: null,
+      usage_classification: 'real', official_domain: 'example.org', discovery_paused: false }],
+    sources: [{ id: 'source-a', product_id: 'product-a', source_type: 'github_issues', url: 'https://github.com/example/repo',
+      evidence_count: 1, last_observed_at: '2026-10-03T12:00:00Z', partial: true, blocked: false,
+      association_confirmed: false }],
+  } }));
+  assert.match(populated, /Issues públicas/);
+  assert.match(populated, /cobertura parcial/);
+  assert.doesNotMatch(populated, /Empresa A/);
 });
 
 test('discovery review distinguishes an existing index from an individual changelog entry', () => {

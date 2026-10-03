@@ -1,4 +1,4 @@
-import { BadRequestException, ConflictException, Controller, Delete, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
+import { BadRequestException, ConflictException, Controller, Delete, ForbiddenException, Get, HttpCode, Inject, NotFoundException, Param, Patch, Post, Body, Req, UploadedFile, UseInterceptors } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { createHash, randomUUID } from 'node:crypto';
 import { isIP } from 'node:net';
@@ -22,7 +22,9 @@ import { recordDeletionForOperation } from './deletion-journal';
 
 const uuid = z.uuid();
 const httpUrl = z.url().refine(value => /^https?:\/\//i.test(value), 'HTTP(S) URL required');
-const productInput = z.object({ name: z.string().trim().min(1).max(120), kind: z.enum(['own', 'competitor']), website_url: httpUrl.optional() }).strict();
+const classification = z.enum(['unreviewed', 'real', 'test']);
+const classificationInput = z.object({ usage_classification: classification }).strict();
+const productInput = z.object({ name: z.string().trim().min(1).max(120), kind: z.enum(['own', 'competitor']), website_url: httpUrl.optional(), usage_classification: classification.optional() }).strict();
 const sourceInput = z.object({ product_id: uuid, url: httpUrl }).strict();
 const githubSourceInput = z.object({ product_id: uuid, repository: z.string().trim().min(3).max(250) }).strict();
 const steamSourceInput = z.object({ product_id: uuid, app: z.string().trim().min(1).max(300) }).strict();
@@ -90,9 +92,9 @@ function b2bPaidRates(): { input: number; output: number } {
     throw new BadRequestException('Paid B2B analysis is not configured with verified token rates');
   return { input: inputRate, output: outputRate };
 }
-type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null };
+type ProductRow = QueryResultRow & { id: string; name: string; kind: 'own' | 'competitor'; website_url: string | null; usage_classification: string };
 type SourceRow = QueryResultRow & { id: string; product_id: string; source_type: string; url: string; last_checked_at?: Date | null;
-  enabled?: boolean;
+  enabled?: boolean; usage_classification?: string;
   external_product_id?: string | null; access_environment?: string | null; access_status?: string;
   rights_recorded?: boolean; rights_expires_at?: Date | null; storage_permitted?: boolean; external_ai_permitted?: boolean;
   ai_rights_recorded?: boolean; ai_provider?: string | null; ai_rights_expires_at?: Date | null;
@@ -133,8 +135,8 @@ export class ApiController {
     const principal = await this.principal(request, ['owner', 'admin']);
     const data = input(productInput, body);
     try { return await this.db.tenant(principal.tenantId, async client => (await this.db.rows<ProductRow>(client,
-      'INSERT INTO marketrift.products (tenant_id, name, kind, website_url) VALUES ($1, $2, $3, $4) RETURNING id, name, kind, website_url',
-      [principal.tenantId, data.name, data.kind, data.website_url ?? null]))[0]!); }
+      'INSERT INTO marketrift.products (tenant_id, name, kind, website_url, usage_classification) VALUES ($1, $2, $3, $4, $5) RETURNING id, name, kind, website_url, usage_classification',
+      [principal.tenantId, data.name, data.kind, data.website_url ?? null, data.usage_classification ?? 'unreviewed']))[0]!); }
     catch (error) { return conflict(error); }
   }
 
@@ -142,7 +144,38 @@ export class ApiController {
   async products(@Req() request: Request): Promise<ProductRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<ProductRow>(client,
-      'SELECT id, name, kind, website_url FROM marketrift.products ORDER BY created_at, id'));
+      'SELECT id, name, kind, website_url, usage_classification FROM marketrift.products ORDER BY created_at, id'));
+  }
+
+  @Patch('products/:id/classification')
+  async classifyProduct(@Req() request: Request, @Param('id') rawId: string, @Body() body: unknown): Promise<ProductRow> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, rawId);
+    const { usage_classification } = input(classificationInput, body);
+    const rows = await this.db.tenant(principal.tenantId, client => this.db.rows<ProductRow>(client,
+      'UPDATE marketrift.products SET usage_classification=$2 WHERE id=$1 RETURNING id,name,kind,website_url,usage_classification',
+      [id, usage_classification]));
+    if (!rows[0]) throw new NotFoundException('Product not found');
+    return rows[0];
+  }
+
+  @Patch('sources/:id/classification')
+  async classifySource(@Req() request: Request, @Param('id') rawId: string, @Body() body: unknown): Promise<SourceRow> {
+    const principal = await this.principal(request, ['owner', 'admin']);
+    const id = input(uuid, rawId);
+    const { usage_classification } = input(classificationInput, body);
+    return this.db.tenant(principal.tenantId, async client => {
+      const source = (await this.db.rows<SourceRow>(client,
+        'SELECT id,product_id,source_type,url,access_environment FROM marketrift.sources WHERE id=$1 FOR UPDATE', [id]))[0];
+      if (!source) throw new NotFoundException('Source not found');
+      if (usage_classification === 'real' &&
+        (source.access_environment === 'sandbox' || !URL.canParse(source.url) ||
+          isTestHost(new URL(source.url).hostname)))
+        throw new BadRequestException('Sandbox and fictitious URLs cannot be classified for normal use');
+      return (await this.db.rows<SourceRow>(client,
+        'UPDATE marketrift.sources SET usage_classification=$2 WHERE id=$1 RETURNING id,product_id,source_type,url,usage_classification',
+        [id, usage_classification]))[0]!;
+    });
   }
 
   @Post('sources')
@@ -152,8 +185,9 @@ export class ApiController {
     try {
       return await this.db.tenant(principal.tenantId, async client => {
         const rows = await this.db.rows<SourceRow>(client,
-          "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url) SELECT $1, id, 'manual_review', $3 FROM marketrift.products WHERE id = $2 RETURNING id, product_id, source_type, url",
-          [principal.tenantId, data.product_id, data.url]);
+          "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, usage_classification) SELECT $1, id, 'manual_review', $3, $4 FROM marketrift.products WHERE id = $2 RETURNING id, product_id, source_type, url",
+          [principal.tenantId, data.product_id, data.url,
+            isTestHost(new URL(data.url).hostname) ? 'test' : 'unreviewed']);
         if (!rows[0]) throw new NotFoundException('Product not found');
         return rows[0];
       });
@@ -164,7 +198,7 @@ export class ApiController {
   async sources(@Req() request: Request): Promise<SourceRow[]> {
     const principal = await this.principal(request);
     return this.db.tenant(principal.tenantId, client => this.db.rows<SourceRow>(client,
-      'SELECT id, product_id, source_type, url, enabled, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at, b2b_retention_policy, b2b_deletion_status, b2b_deletion_reason, b2b_deletion_error, b2b_deletion_requested_at, b2b_deletion_next_attempt_at, b2b_deletion_attempts, b2b_deletion_completed_at, b2b_deleted_documents, b2b_deleted_import_rows FROM marketrift.sources ORDER BY id'));
+      'SELECT id, product_id, source_type, url, usage_classification, enabled, last_checked_at, external_product_id, access_environment, access_status, (rights_reference IS NOT NULL) AS rights_recorded, rights_expires_at, storage_permitted, external_ai_permitted, (ai_rights_reference IS NOT NULL) AS ai_rights_recorded, ai_provider, ai_rights_expires_at, ai_rights_revoked_at, b2b_retention_policy, b2b_deletion_status, b2b_deletion_reason, b2b_deletion_error, b2b_deletion_requested_at, b2b_deletion_next_attempt_at, b2b_deletion_attempts, b2b_deletion_completed_at, b2b_deleted_documents, b2b_deleted_import_rows FROM marketrift.sources ORDER BY id'));
   }
 
   @Post('sources/b2b-csv/:id/ai-rights')
@@ -214,12 +248,13 @@ export class ApiController {
       throw new BadRequestException('Test URLs cannot be declared real');
     try { return await this.db.tenant(principal.tenantId, async client => {
       const rows = await this.db.rows<SourceRow>(client,
-        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, access_environment, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_attested_at, rights_expires_at, b2b_retention_policy) "
-        + "SELECT $1, id, 'b2b_csv_review', $3, $6, $7, $4, true, $5, now(), $8, $9 FROM marketrift.products WHERE id = $2 "
+        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, access_environment, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_attested_at, rights_expires_at, b2b_retention_policy, usage_classification) "
+        + "SELECT $1, id, 'b2b_csv_review', $3, $6, $7, $4, true, $5, now(), $8, $9, $10 FROM marketrift.products WHERE id = $2 "
         + 'RETURNING id, product_id, source_type, url, access_status, rights_reference, storage_permitted, external_ai_permitted, rights_expires_at',
         [principal.tenantId, data.product_id, data.url, data.rights_reference, data.external_ai_permitted,
           data.synthetic_only ? 'sandbox' : 'production', data.synthetic_only ? 'sandbox_only' : 'not_assessed',
-          data.synthetic_only ? null : data.rights_expires_at, data.retention_policy ?? 'unspecified']);
+          data.synthetic_only ? null : data.rights_expires_at, data.retention_policy ?? 'unspecified',
+          data.synthetic_only ? 'test' : 'unreviewed']);
       if (!rows[0]) throw new NotFoundException('Product not found');
       await client.query(`INSERT INTO marketrift.b2b_rights_events
         (tenant_id,source_id,event_kind,actor_user_id,reference_sha256,retention_policy,rights_expires_at)
@@ -305,10 +340,11 @@ export class ApiController {
     const data = input(g2SourceInput, body);
     try { return await this.db.tenant(principal.tenantId, async client => {
       const rows = await this.db.rows<SourceRow>(client,
-        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, external_product_id, access_environment, access_status) "
-        + "SELECT $1, id, 'g2', $3, $4, $5, 'pending' FROM marketrift.products WHERE id = $2 "
+        "INSERT INTO marketrift.sources (tenant_id, product_id, source_type, url, external_product_id, access_environment, access_status, usage_classification) "
+        + "SELECT $1, id, 'g2', $3, $4, $5, 'pending', $6 FROM marketrift.products WHERE id = $2 "
         + 'RETURNING id, product_id, source_type, url, external_product_id, access_environment, access_status',
-        [principal.tenantId, data.product_id, data.product_url, data.g2_product_id, data.environment]);
+        [principal.tenantId, data.product_id, data.product_url, data.g2_product_id, data.environment,
+          data.environment === 'sandbox' ? 'test' : 'unreviewed']);
       if (!rows[0]) throw new NotFoundException('Product not found');
       return rows[0];
     }); } catch (error) { return conflict(error); }

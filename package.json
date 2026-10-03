@@ -67,7 +67,8 @@
     "db:migrate:feed-scheduler-error-grant": "node --env-file=.env scripts/migrate-feed-scheduler-error-grant.mjs",
     "db:migrate:individual-public-pages": "node --env-file=.env scripts/migrate-individual-public-pages.mjs",
     "db:migrate:individual-page-origin-reviewer": "node --env-file=.env scripts/migrate-individual-page-origin-reviewer.mjs",
-    "db:migrate:rendered-public-page-runs": "node --env-file=.env scripts/migrate-rendered-public-page-runs.mjs"
+    "db:migrate:rendered-public-page-runs": "node --env-file=.env scripts/migrate-rendered-public-page-runs.mjs",
+    "db:migrate:experience-classification": "node --env-file=.env scripts/migrate-experience-classification.mjs"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1142.0",

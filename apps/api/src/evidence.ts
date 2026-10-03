@@ -10,6 +10,7 @@ const sourceType = z.enum(['csv_review', 'b2b_review', 'g2_review', 'steam_revie
   'pricing_page', 'release_notes', 'rss_feed', 'public_page']);
 const date = z.iso.date();
 const filtersSchema = z.object({
+  scope: z.enum(['advanced', 'normal']).default('advanced'),
   product_id: z.uuid().optional(), source_type: sourceType.optional(),
   from: date.optional(), to: date.optional(),
   q: z.string().trim().min(1).max(120).optional(),
@@ -50,7 +51,7 @@ function filters(value: unknown): Filters {
 
 // Each identity is tenant-local. Product associations are calculated before the
 // product filter, so a shared Steam App ID or repository is counted once and flagged.
-const evidenceBase = `WITH raw AS (
+const evidenceBase = (normal: boolean) => `WITH raw AS (
   SELECT d.id AS item_id, d.source_id, s.product_id, p.name AS product_name,
     CASE WHEN d.document_type = 'review' THEN 'csv_review' ELSE d.document_type END AS source_type,
     CASE d.document_type
@@ -67,6 +68,13 @@ const evidenceBase = `WITH raw AS (
   JOIN marketrift.sources s ON s.tenant_id = d.tenant_id AND s.id = d.source_id
   JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
   WHERE d.document_type IN ('review', 'b2b_review', 'g2_review', 'steam_review', 'github_issue', 'github_discussion')
+    ${normal ? `AND p.usage_classification='real' AND s.usage_classification='real'
+    AND s.access_environment IS DISTINCT FROM 'sandbox' AND NOT d.synthetic
+    AND d.document_type <> 'review'
+    AND (d.document_type <> 'b2b_review' OR d.review_data_status='declared_real')
+    AND (d.document_type <> 'g2_review' OR (d.review_data_status='declared_real'
+      AND s.access_environment='production' AND s.access_status='authorized'
+      AND s.storage_permitted AND s.rights_reference IS NOT NULL AND s.rights_expires_at>now()))` : ''}
     AND (d.document_type <> 'b2b_review' OR (s.enabled AND s.storage_permitted
       AND s.rights_reference IS NOT NULL
       AND (s.access_environment = 'sandbox' OR s.rights_expires_at > now())))
@@ -89,6 +97,10 @@ const evidenceBase = `WITH raw AS (
   JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
   WHERE s.source_type IN ('pricing_page', 'release_notes', 'public_page') AND ss.version_no IS NOT NULL
     AND ss.normalized_text IS NOT NULL
+    ${normal ? `AND p.usage_classification='real' AND s.usage_classification='real'
+    AND s.access_environment IS DISTINCT FROM 'sandbox'
+    AND NOT (s.source_type='public_page' AND (ss.interpretation_reason='insufficient_main_content'
+      OR lower(trim(ss.normalized_text))='skip to content'))` : ''}
   UNION ALL
   SELECT e.id,e.source_id,s.product_id,p.name,'rss_feed'::text,
     jsonb_build_array(s.url,e.external_id)::text,e.canonical_url,e.title,
@@ -102,6 +114,8 @@ const evidenceBase = `WITH raw AS (
   LEFT JOIN LATERAL (SELECT scan_complete FROM marketrift.source_runs
     WHERE tenant_id=e.tenant_id AND source_id=e.source_id AND run_kind='feed'
       AND status='succeeded' ORDER BY finished_at DESC,id DESC LIMIT 1) latest ON true
+  ${normal ? `WHERE p.usage_classification='real' AND s.usage_classification='real'
+    AND s.access_environment IS DISTINCT FROM 'sandbox'` : ''}
 ), associations AS (
   SELECT source_type, origin_key, array_agg(DISTINCT product_id) AS product_ids,
     array_agg(DISTINCT product_name) AS product_names,
@@ -210,15 +224,16 @@ export class EvidenceController {
   }> {
     const principal = await this.accounts.principal(request);
     const f = filters(query);
+    const base = evidenceBase(f.scope === 'normal');
     const args = [f.product_id ?? null, f.source_type ?? null, f.from ?? null, f.to ?? null, f.q ?? null];
     return this.db.tenant(principal.tenantId, async client => {
-      const counts = await this.db.rows<CountRow>(client, `${evidenceBase}
+      const counts = await this.db.rows<CountRow>(client, `${base}
         SELECT d.source_type, count(*)::integer AS count,
           count(*) FILTER (WHERE a.association_count > 1)::integer AS ambiguous_count,
           min(d.observed_at) AS first_at, max(d.observed_at) AS last_at
         FROM dedup d JOIN associations a USING (source_type, origin_key)
         GROUP BY d.source_type ORDER BY d.source_type`, args);
-      const items = await this.db.rows<EvidenceRow>(client, `${evidenceBase}
+      const items = await this.db.rows<EvidenceRow>(client, `${base}
         SELECT d.item_id, d.source_id, d.source_type, d.product_id, d.product_name,
           a.product_ids, a.product_names, d.origin_key, d.source_url, d.title, d.excerpt,
           d.observed_at, d.collected_at, a.any_synthetic AS synthetic, d.data_status, d.interpretation_status,
@@ -233,6 +248,7 @@ export class EvidenceController {
         LEFT JOIN marketrift.document_analyses analysis ON d.source_type = 'b2b_review'
           AND analysis.tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid
           AND analysis.document_id = d.item_id AND analysis.extractor_version = $8
+          ${f.scope === 'normal' ? "AND analysis.model_id IS DISTINCT FROM 'controlled-test-fixture-v1'" : ''}
         ORDER BY d.observed_at DESC, d.item_id LIMIT $6 OFFSET $7`,
       [...args, f.limit, f.offset, activeExtractorVersion]);
       const partialSources = await this.db.rows<PartialRow>(client, `WITH latest AS (
@@ -242,6 +258,7 @@ export class EvidenceController {
         JOIN marketrift.sources s ON s.tenant_id = r.tenant_id AND s.id = r.source_id
         JOIN marketrift.products p ON p.tenant_id = s.tenant_id AND p.id = s.product_id
         WHERE r.status = 'succeeded' AND r.scan_complete IS NOT NULL
+          ${f.scope === 'normal' ? "AND p.usage_classification='real' AND s.usage_classification='real' AND s.access_environment IS DISTINCT FROM 'sandbox'" : ''}
           AND ($1::uuid IS NULL OR s.product_id = $1)
           AND ($2::text IS NULL OR s.source_type = CASE $2::text
             WHEN 'csv_review' THEN 'manual_review' WHEN 'steam_review' THEN 'steam_reviews'

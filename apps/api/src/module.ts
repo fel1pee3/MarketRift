@@ -13,8 +13,9 @@ import { ReviewableSignalsController } from './reviewable-signals';
 import { SourceDiscoveryController } from './source-discovery';
 import { ActionHypothesesController } from './action-hypotheses';
 import { FeedsController } from './feeds';
+import { ExperienceController } from './experience';
 
 @Module({ controllers: [ApiController, AccountsController, WebPagesController, EvidenceController, SemanticController,
   EvidenceTimelineController, B2BQualityController, RetrievalReviewController, ReviewableSignalsController, ActionHypothesesController,
-  SourceDiscoveryController, FeedsController], providers: [Db, Jobs, Accounts] })
+  SourceDiscoveryController, FeedsController, ExperienceController], providers: [Db, Jobs, Accounts] })
 export class AppModule {}
